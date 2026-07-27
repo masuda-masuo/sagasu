@@ -1,0 +1,11 @@
+[package]
+name = "proto-crawl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+ignore = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"

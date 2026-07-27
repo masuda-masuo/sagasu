@@ -1,0 +1,12 @@
+[package]
+name = "proto-fulltext"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+ignore = "0.4"
+tantivy = "0.25"
+lindera = "4"
+lindera-tantivy = { version = "4.0", features = ["embed-ipadic"] }
