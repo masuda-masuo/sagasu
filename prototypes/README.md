@@ -21,6 +21,23 @@ Windows 用ビルド済み .exe は GitHub Release(`proto-YYYYMMDD` タグ)に�
 
 ## 自宅 (Windows) での確認手順
 
+### 0. 事前準備 — Defender 誤検知対策
+
+.exe は `Trojan:Win32/Sabsik.fl.a!ml` として隔離されることがある(無署名 + mingw クロスビルド + 大量ファイル列挙という外形による ML 誤検知。#10 参照)。展開前に作業フォルダを除外しておく:
+
+```powershell
+# 管理者 PowerShell で
+Add-MpPreference -ExclusionPath "C:\path\to\sagasu-proto"
+
+# 除外の確認
+Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+
+# 検証が終わったら除外を戻す
+Remove-MpPreference -ExclusionPath "C:\path\to\sagasu-proto"
+```
+
+既に隔離された場合は「Windows セキュリティ → ウイルスと脅威の防止 → 保護の履歴」から復元(要除外設定済み、でないと再隔離される)。
+
 ### 1. proto-crawl — 実データでの走査速度
 
 ```powershell
@@ -63,7 +80,7 @@ Windows 用ビルド済み .exe は GitHub Release(`proto-YYYYMMDD` タグ)に�
 - proto-usn はファイル名しか出さない。FRN→フルパス解決(MFT 列挙 or OpenFileById)は次の検証項目
 - proto-fulltext の live-grep は素朴な部分一致で、索引側のトークナイズ検索と一致条件が違う
 - 結果を `| head` に繋ぐと broken pipe で panic する(SIGPIPE 未処理、実害なし)
-- Windows .exe は gnu ツールチェーンでクロスビルド。本番は msvc を想定
+- Windows .exe は gnu ツールチェーンでクロスビルド。Defender 誤検知の一因でもあり、本番は msvc を想定(#10)
 
 ## ビルド
 
