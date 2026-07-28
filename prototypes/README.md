@@ -3,6 +3,8 @@
 技術リスクの高い要素を個別に検証する使い捨てプロトタイプ群。本体実装とは独立した Cargo ワークスペース。ここでの計測結果は issue #7(ベンチ基盤)の目標値設定に還流する。
 
 Windows 用ビルド済み .exe は GitHub Release(`proto-YYYYMMDD` タグ)に添付してある。ダウンロードすればビルド不要で試せる。
+`.github/workflows/prototypes.yml` が Windows ランナー上でネイティブに MSVC ビルドして添付したもので、手元の
+mingw クロスビルドを人手でアップロードする経路ではない(詳しくは末尾の「ビルド」参照)。
 
 | プロトタイプ | 検証対象 | 対応 issue |
 |---|---|---|
@@ -21,9 +23,12 @@ Windows 用ビルド済み .exe は GitHub Release(`proto-YYYYMMDD` タグ)に�
 
 ## 自宅 (Windows) での確認手順
 
-### 0. 事前準備 — Defender 誤検知対策
+### 0. 事前準備 — Defender に隔離された場合の対処(フォールバック)
 
-.exe は `Trojan:Win32/Sabsik.fl.a!ml` として隔離されることがある(無署名 + mingw クロスビルド + 大量ファイル列挙という外形による ML 誤検知。#10 参照)。展開前に作業フォルダを除外しておく:
+CI がネイティブ MSVC ビルドした .exe にはバージョンリソースとマニフェスト(実行レベル・long path 対応)が
+入っており、無署名ながら以前の mingw クロスビルドよりは Windows Defender の ML 誤検知(`Trojan:Win32/Sabsik.fl.a!ml`、
+#10 参照)が起きにくいはずだが、ゼロにはならない。特に `proto-20260727` より前のタグで配布された資産は mingw
+クロスビルドなので、隔離される前提で臨む。隔離された場合は作業フォルダを除外する:
 
 ```powershell
 # 管理者 PowerShell で
@@ -44,6 +49,9 @@ Remove-MpPreference -ExclusionPath "C:\path\to\sagasu-proto"
 .\proto-crawl.exe C:\Users\<you>\Documents --hash --db crawl.db
 # 見る値: files/s。実ファイル数十万規模でどこまで出るか
 # --no-ignore で .gitignore/隠しファイル無視をやめて全量走査も試す
+# 既定で Windows / Program Files / Program Files (x86) / $Recycle.Bin /
+# System Volume Information / AppData をスキップする(スキップ件数は出力の "skipped dirs" 行)。
+# 以前どおりのフルボリューム計測と比較したいときは --full-volume を付ける
 ```
 
 ### 2. proto-fulltext — 日本語検索と鮮度マージ
@@ -80,12 +88,23 @@ Remove-MpPreference -ExclusionPath "C:\path\to\sagasu-proto"
 - proto-usn はファイル名しか出さない。FRN→フルパス解決(MFT 列挙 or OpenFileById)は次の検証項目
 - proto-fulltext の live-grep は素朴な部分一致で、索引側のトークナイズ検索と一致条件が違う
 - 結果を `| head` に繋ぐと broken pipe で panic する(SIGPIPE 未処理、実害なし)
-- Windows .exe は gnu ツールチェーンでクロスビルド。Defender 誤検知の一因でもあり、本番は msvc を想定(#10)
+- Windows .exe は CI(`.github/workflows/prototypes.yml`)が Windows ランナー上で msvc ネイティブビルドする。
+  ローカルの mingw クロスビルドは本番の生成経路ではなく動作確認用の簡便法(詳しくは末尾の「ビルド」)
+- proto-usn の実行マニフェストは `requireAdministrator`。USN Journal 読み取りに管理者権限が無条件で
+  必要で、asInvoker で起動してから失敗させる意味がないため(詳細は各 build.rs のコメント)
 
 ## ビルド
 
 ```
 cd prototypes && cargo build --release
-# Windows クロスビルド(要 mingw-w64):
+```
+
+公開している Windows 用 .exe はこのコマンドではなく `.github/workflows/prototypes.yml` が Windows
+ランナー上でネイティブに `--target x86_64-pc-windows-msvc` ビルドしたもの(タグ `proto-YYYYMMDD` の push、
+または Actions の手動トリガーで実行)。mingw クロスビルドは本番の生成経路ではなく、Windows 実機なしで
+手元動作確認したいときの簡便法として残してあるだけ(要 mingw-w64、バージョンリソース/マニフェストは
+埋め込まれるが署名は無い):
+
+```
 cargo build --release --target x86_64-pc-windows-gnu
 ```

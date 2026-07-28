@@ -9,3 +9,6 @@ anyhow = { workspace = true }
 ignore = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
