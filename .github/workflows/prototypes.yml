@@ -1,12 +1,13 @@
 name: prototypes
 
-# CI for prototypes/ (see prototypes/README.md). Two jobs:
-#   - check: cheap correctness gate -- workspace compiles and clippy is clean, on both
-#     Linux (mirrors the VM benchmark environment) and Windows.
+# CI for prototypes/ and bench/ (see bench/README.md). Two jobs:
+#   - check: cheap correctness gate -- prototypes and bench compile and clippy
+#     is clean, on both Linux (mirrors the VM benchmark environment) and Windows.
 #   - release-windows: on a tag push (or manual dispatch) builds all three prototype
-#     binaries natively on a Windows runner against x86_64-pc-windows-msvc and attaches
-#     them to the matching GitHub Release. This replaces the hand-built mingw
-#     cross-compile that used to produce the published .exe assets (issue #10).
+#     binaries plus bench.exe natively on a Windows runner against
+#     x86_64-pc-windows-msvc and attaches them to the matching GitHub Release.
+#     This replaces the hand-built mingw cross-compile that used to produce the
+#     published .exe assets (issue #10).
 
 on:
   push:
@@ -48,14 +49,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "prototypes -> target"
+          workspaces: |
+            prototypes -> target
+            bench -> target
 
-      - name: cargo build --release
+      - name: cargo build --release (prototypes)
         working-directory: prototypes
         run: cargo build --release
 
-      - name: cargo clippy -D warnings
+      - name: cargo clippy -D warnings (prototypes)
         working-directory: prototypes
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build --release (bench)
+        working-directory: bench
+        run: cargo build --release
+
+      - name: cargo clippy -D warnings (bench)
+        working-directory: bench
         run: cargo clippy --all-targets -- -D warnings
 
   release-windows:
@@ -74,14 +85,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "prototypes -> target"
+          workspaces: |
+            prototypes -> target
+            bench -> target
 
       # Native build on a Windows runner against the MSVC target: no cross-compiler,
       # no mingw, just the toolchain a windows-latest runner already ships with. The
       # version resource / manifest embedding in each crate's build.rs uses this same
       # toolchain's rc.exe automatically (see prototypes/build-common.rs).
-      - name: cargo build --release --target x86_64-pc-windows-msvc
+      - name: cargo build --release --target x86_64-pc-windows-msvc (prototypes)
         working-directory: prototypes
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: cargo build --release --target x86_64-pc-windows-msvc (bench)
+        working-directory: bench
         run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Stage binaries
@@ -92,6 +109,7 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/proto-crawl.exe dist/
           cp target/x86_64-pc-windows-msvc/release/proto-fulltext.exe dist/
           cp target/x86_64-pc-windows-msvc/release/proto-usn.exe dist/
+          cp ../bench/target/x86_64-pc-windows-msvc/release/bench.exe dist/
 
       # tag は env 経由で bash に渡す: ${{ }} を run に直書きすると、テンプレート展開が
       # シェル解釈より先に走るため、細工した dispatch 入力が $GITHUB_OUTPUT へ行を
@@ -117,12 +135,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: prototypes-windows-msvc
-          path: prototypes/dist/*.exe
+          path: |
+            prototypes/dist/*.exe
 
       - name: Attach to GitHub Release
         if: steps.tag.outputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          files: prototypes/dist/*.exe
+          files: |
+            prototypes/dist/*.exe
           fail_on_unmatched_files: true

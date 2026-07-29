@@ -36,6 +36,18 @@ pub struct TargetDef {
     pub args: Vec<String>,
     /// Number of repeated measurements (including the first, which is "cold").
     pub repeat: u64,
+    /// Optional setup command that runs once before the trials (not timed).
+    /// When present, the work directory is NOT cleaned between trials.
+    #[serde(default)]
+    pub setup: Option<SetupDef>,
+}
+
+/// A setup command that runs once before the timed trials of a target.
+/// Must exit zero for the target to proceed; a non-zero exit aborts the target.
+#[derive(Debug, Deserialize)]
+pub struct SetupDef {
+    pub command: String,
+    pub args: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +90,10 @@ pub struct TargetResult {
     pub cold: TrialStats,
     pub warm: TrialStats,
     pub trials: Vec<TrialRecord>,
+    /// Whether a setup command was defined for this target.
+    pub setup_ran: bool,
+    /// Whether the setup command exited successfully (always true if setup_ran is false).
+    pub setup_succeeded: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,6 +139,11 @@ pub fn load_config(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
         if t.repeat == 0 {
             return Err(format!("target '{}' has repeat=0", t.name).into());
         }
+        if let Some(ref setup) = t.setup {
+            if setup.command.is_empty() {
+                return Err(format!("target '{}' has an empty setup.command", t.name).into());
+            }
+        }
     }
     Ok(cfg)
 }
@@ -156,19 +177,95 @@ pub fn run_benchmarks(
     let mut target_results = Vec::new();
 
     for def in &config.target {
-        let mut trials: Vec<TrialRecord> = Vec::new();
-
         // Create a fresh workdir for this target
         let workdir = root.join(format!(".workdir-{}", sanitise_name(&def.name)));
         let _ = std::fs::remove_dir_all(&workdir);
         std::fs::create_dir_all(&workdir)?;
 
+        // -----------------------------------------------------------------------
+        // Setup phase (optional, once, not timed)
+        // -----------------------------------------------------------------------
+        let mut setup_ran = false;
+        let mut setup_succeeded = true;
+
+        if let Some(setup) = &def.setup {
+            setup_ran = true;
+            let setup_args = resolve_args(&setup.command, &setup.args, &root_str, &workdir);
+            eprintln!(
+                "[bench] target '{}': running setup: {} {}",
+                def.name,
+                setup_args[0],
+                setup_args[1..].join(" ")
+            );
+
+            let output = std::process::Command::new(&setup_args[0])
+                .args(&setup_args[1..])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .current_dir(&workdir)
+                .output();
+
+            match output {
+                Ok(out) => {
+                    if !out.status.success() {
+                        setup_succeeded = false;
+                        let code = out.status.code().unwrap_or(-1);
+                        eprintln!(
+                            "[bench] target '{}': setup failed (exit code {})",
+                            def.name, code
+                        );
+                    }
+                }
+                Err(e) => {
+                    setup_succeeded = false;
+                    eprintln!("[bench] target '{}': setup spawn failed: {}", def.name, e);
+                }
+            }
+        }
+
+        // If setup failed, record the result with no trials and move on
+        if !setup_succeeded {
+            let resolved_all = resolve_args(&def.command, &def.args, &root_str, &workdir);
+            let _ = std::fs::remove_dir_all(&workdir);
+            target_results.push(TargetResult {
+                name: def.name.clone(),
+                command: def.command.clone(),
+                args: def.args.clone(),
+                resolved: resolved_all,
+                cold: TrialStats {
+                    trials: 0,
+                    min_secs: None,
+                    max_secs: None,
+                    p50_secs: None,
+                    p95_secs: None,
+                },
+                warm: TrialStats {
+                    trials: 0,
+                    min_secs: None,
+                    max_secs: None,
+                    p50_secs: None,
+                    p95_secs: None,
+                },
+                trials: vec![],
+                setup_ran,
+                setup_succeeded,
+            });
+            continue;
+        }
+
+        // -----------------------------------------------------------------------
+        // Trials
+        // -----------------------------------------------------------------------
+        let mut trials: Vec<TrialRecord> = Vec::new();
+
         for i in 0..def.repeat {
             // Resolve placeholders
             let resolved = resolve_args(&def.command, &def.args, &root_str, &workdir);
 
-            // Clean workdir between repeats (but keep directory)
-            if i > 0 {
+            // Clean workdir between repeats only when setup is absent.
+            // When setup is present, the workdir holds whatever setup produced
+            // and should persist across all trials.
+            if i > 0 && def.setup.is_none() {
                 let _ = std::fs::remove_dir_all(&workdir);
                 std::fs::create_dir_all(&workdir)?;
             }
@@ -227,6 +324,8 @@ pub fn run_benchmarks(
             cold: cold_stats,
             warm: warm_stats,
             trials,
+            setup_ran,
+            setup_succeeded,
         });
     }
 
@@ -247,8 +346,8 @@ pub fn print_summary(results: &RunResults) {
         human_bytes(results.tree.total_bytes)
     );
     println!();
-    println!("| Target | Cold (s) | Warm p50 (s) | Warm p95 (s) | Trials | Failures |");
-    println!("|--------|----------|--------------|--------------|--------|----------|");
+    println!("| Target | Cold (s) | Warm p50 (s) | Warm p95 (s) | Trials | Failures | Setup |");
+    println!("|--------|----------|--------------|--------------|--------|----------|-------|");
     for t in &results.targets {
         let cold_s = match t.cold.p50_secs {
             Some(v) => format!("{:.4}", v),
@@ -263,14 +362,24 @@ pub fn print_summary(results: &RunResults) {
             None => "—".to_string(),
         };
         let n_fail = t.trials.iter().filter(|tr| tr.failure).count();
+        let setup_status = if t.setup_ran {
+            if t.setup_succeeded {
+                "✅"
+            } else {
+                "❌"
+            }
+        } else {
+            "—"
+        };
         println!(
-            "| {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} |",
             t.name,
             cold_s,
             warm_p50,
             warm_p95,
             t.trials.len(),
-            n_fail
+            n_fail,
+            setup_status
         );
     }
     println!();
@@ -286,6 +395,7 @@ pub fn print_summary(results: &RunResults) {
     println!("* Times include process startup (wall-clock from spawn to exit).");
     println!("* Trial 0 is defined as \"cold\"; remaining trials are \"warm\".");
     println!("* Non-zero exit codes are recorded as failures in the JSON output.");
+    println!("* Setup: ✅ = ran and succeeded, ❌ = ran and failed, — = no setup defined.");
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +660,7 @@ repeat = 0
                 command: "".into(),
                 args: vec![],
                 repeat: 0,
+                setup: None,
             }],
         };
         // We test the validation via load_config which does extra checks
@@ -612,5 +723,148 @@ repeat = 0
             total += days_in(y, mo);
         }
         total + d - 1
+    }
+
+    #[test]
+    fn test_target_def_with_setup() {
+        let toml = r#"
+[[target]]
+name = "search"
+command = "my-search"
+args = ["{root}", "--index", "{workdir}/idx"]
+repeat = 5
+setup = { command = "build-index", args = ["{root}", "--out", "{workdir}/idx"] }
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.target.len(), 1);
+        let t = &cfg.target[0];
+        assert_eq!(t.name, "search");
+        assert!(t.setup.is_some());
+        let s = t.setup.as_ref().unwrap();
+        assert_eq!(s.command, "build-index");
+        assert_eq!(s.args, vec!["{root}", "--out", "{workdir}/idx"]);
+    }
+
+    #[test]
+    fn test_target_def_without_setup_legacy() {
+        let toml = r#"
+[[target]]
+name = "legacy"
+command = "ls"
+args = ["-la", "{root}"]
+repeat = 2
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.target.len(), 1);
+        let t = &cfg.target[0];
+        assert!(t.setup.is_none());
+    }
+
+    #[test]
+    fn test_load_config_valid_with_setup() {
+        let toml = r#"
+[[target]]
+name = "with-setup"
+command = "echo"
+args = ["done"]
+repeat = 3
+setup = { command = "mkdir", args = ["-p", "{workdir}/data"] }
+"#;
+        let dir = std::env::temp_dir().join("bench_cfg_setup_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("good.toml");
+        std::fs::write(&cfg_path, toml).unwrap();
+        let result = load_config(&cfg_path);
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_config_rejects_empty_setup_command() {
+        let toml = r#"
+[[target]]
+name = "bad-setup"
+command = "echo"
+args = ["hi"]
+repeat = 1
+setup = { command = "", args = [] }
+"#;
+        let dir = std::env::temp_dir().join("bench_cfg_bad_setup");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("bad.toml");
+        std::fs::write(&cfg_path, toml).unwrap();
+        let result = load_config(&cfg_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("empty setup.command"), "error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_setup_failure_produces_no_trials() {
+        let result = TargetResult {
+            name: "fail-setup".into(),
+            command: "true".into(),
+            args: vec![],
+            resolved: vec!["true".into()],
+            cold: TrialStats {
+                trials: 0,
+                min_secs: None,
+                max_secs: None,
+                p50_secs: None,
+                p95_secs: None,
+            },
+            warm: TrialStats {
+                trials: 0,
+                min_secs: None,
+                max_secs: None,
+                p50_secs: None,
+                p95_secs: None,
+            },
+            trials: vec![],
+            setup_ran: true,
+            setup_succeeded: false,
+        };
+        assert!(result.setup_ran);
+        assert!(!result.setup_succeeded);
+        assert!(result.trials.is_empty());
+        assert!(result.cold.p50_secs.is_none());
+        assert!(result.warm.p50_secs.is_none());
+    }
+
+    #[test]
+    fn test_target_with_setup_serialization() {
+        let tr = TargetResult {
+            name: "with-setup".into(),
+            command: "search".into(),
+            args: vec!["query".into()],
+            resolved: vec!["search".into(), "query".into()],
+            cold: TrialStats {
+                trials: 1,
+                min_secs: Some(0.5),
+                max_secs: Some(0.5),
+                p50_secs: Some(0.5),
+                p95_secs: Some(0.5),
+            },
+            warm: TrialStats {
+                trials: 0,
+                min_secs: None,
+                max_secs: None,
+                p50_secs: None,
+                p95_secs: None,
+            },
+            trials: vec![TrialRecord {
+                index: 0,
+                cold: true,
+                elapsed_secs: 0.5,
+                exit_code: 0,
+                failure: false,
+            }],
+            setup_ran: true,
+            setup_succeeded: true,
+        };
+        let json = serde_json::to_string(&tr).unwrap();
+        assert!(json.contains("\"setup_ran\":true"), "json: {json}");
+        assert!(json.contains("\"setup_succeeded\":true"), "json: {json}");
     }
 }

@@ -1,0 +1,49 @@
+# Configuration for measuring the three sagasu prototypes on Linux.
+#
+# Binary location
+# ---------------
+# On Linux, `std::process::Command` searches PATH but does NOT search the
+# current directory.  The `./` prefix tells the harness to use a relative path
+# from the working directory.  Run from the repository root, or adjust the
+# prefix to match your setup.
+#
+#   ./proto-crawl     — expects proto-crawl in the current directory
+#   ./proto-fulltext  — expects proto-fulltext in the current directory
+#
+# Repeat counts
+# -------------
+# Crawl and index are I/O-bound and slow (seconds to minutes), so their repeat
+# count is low.  Search is CPU-bound and fast (milliseconds), so a larger
+# repeat gives meaningful p50/p95 numbers.
+
+[[target]]
+name = "crawl-metadata"
+command = "./proto-crawl"
+args = ["{root}", "--no-ignore", "--full-volume", "--db", "{workdir}/crawl.db"]
+repeat = 3
+
+[[target]]
+name = "crawl-hash"
+command = "./proto-crawl"
+args = ["{root}", "--no-ignore", "--full-volume", "--hash", "--db", "{workdir}/crawl.db"]
+repeat = 3
+
+[[target]]
+name = "fulltext-index"
+command = "./proto-fulltext"
+args = ["index", "{root}", "--index-dir", "{workdir}/ft-index"]
+repeat = 3
+
+[[target]]
+name = "fulltext-search-ja"
+command = "./proto-fulltext"
+args = ["search", "全文検索", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = { command = "./proto-fulltext", args = ["index", "{root}", "--index-dir", "{workdir}/ft-index"] }
+
+[[target]]
+name = "fulltext-search-en"
+command = "./proto-fulltext"
+args = ["search", "benchmark", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = { command = "./proto-fulltext", args = ["index", "{root}", "--index-dir", "{workdir}/ft-index"] }
