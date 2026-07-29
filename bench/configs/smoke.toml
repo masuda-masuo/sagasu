@@ -1,0 +1,16 @@
+# Smoke-test configuration for bench run.
+# Uses commands guaranteed to be present on any POSIX system (find, wc).
+# The harness must not depend on any prototype binary being built.
+# Repeat counts are kept small (2–3) so the smoke stays fast.
+
+[[target]]
+name = "list-files"
+command = "find"
+args = ["{root}", "-type", "f"]
+repeat = 2
+
+[[target]]
+name = "count-manifest"
+command = "wc"
+args = ["-l", "{root}/.bench-manifest.json"]
+repeat = 2
