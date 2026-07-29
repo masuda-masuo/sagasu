@@ -142,12 +142,47 @@ name    = "my-measurement"
 command = "find"
 args    = ["{root}", "-type", "f"]
 repeat  = 3
+
+[[target]]
+name    = "with-setup"
+command = "search"
+args    = ["query", "--index", "{workdir}/index"]
+repeat  = 10
+setup   = { command = "build-index", args = ["{root}", "--out", "{workdir}/index"] }
 ```
 
 `{root}` is replaced with the `--root` value.  `{workdir}` is replaced with a
 scratch directory that the harness creates per target (and cleans between
-trials).  The harness never knows about any specific prototype — targets are
-declared entirely in the TOML file.
+trials, unless a `setup` is defined).  The harness never knows about any
+specific prototype — targets are declared entirely in the TOML file.
+
+#### `setup` key (optional)
+
+A target may declare a `setup` command that runs once, **before the timed
+trials, and is not timed itself**.  This is useful when a command needs an
+index or database already in place before the measured command can run:
+
+```toml
+[[target]]
+name = "fulltext-search"
+command = "search"
+args = ["query", "--index", "{workdir}/index"]
+repeat = 10
+setup = { command = "build-index", args = ["{root}", "--out", "{workdir}/index"] }
+```
+
+Behaviour:
+
+- **When `setup` is present**, the work directory is **not** cleaned between
+  trials — it holds whatever `setup` produced.  The same `{workdir}`
+  substitution works in both `setup` and the command.
+- **When `setup` is absent**, current behaviour is unchanged (the work
+  directory is cleaned before each trial after the first).
+- **A non-zero exit from `setup`** aborts the target: no trials run, the
+  target is recorded as a setup failure in the results, and timing fields are
+  `null`.  The harness does not fall through and produce meaningless timings.
+- The results JSON per target includes `setup_ran` (bool) and
+  `setup_succeeded` (bool).
 
 #### What is measured
 
@@ -214,6 +249,72 @@ Everything builds and runs on both Linux and Windows.  Memory detection is
 currently Linux-only (`/proc/meminfo`); other platforms report 0 for memory
 total.  No shelling out to `sh -c`.
 
+On Windows, `std::process::Command` searches the current directory by default;
+on Linux it does not.  The prototype configs handle this difference (see below).
+
+## Prototype measurement configs
+
+Two pre-built configs are provided under `bench/configs/`:
+
+| Config | Platform | Binary prefix |
+|---|---|---|
+| `prototypes-linux.toml` | Linux | `./proto-crawl`, `./proto-fulltext` |
+| `prototypes-windows.toml` | Windows | `proto-crawl`, `proto-fulltext` |
+
+### Targets covered
+
+| Target | What it measures |
+|---|---|
+| `crawl-metadata` | `proto-crawl {root} --no-ignore --full-volume --db {workdir}/crawl.db` |
+| `crawl-hash` | Same plus `--hash` |
+| `fulltext-index` | `proto-fulltext index {root} --index-dir {workdir}/ft-index` |
+| `fulltext-search-ja` | `proto-fulltext search 全文検索 --index-dir {workdir}/ft-index` (with setup) |
+| `fulltext-search-en` | `proto-fulltext search benchmark --index-dir {workdir}/ft-index` (with setup) |
+
+The search terms (`全文検索`, `benchmark`) are from the planted-terms set that
+`bench gen` embeds into every generated tree, so queries are guaranteed to hit.
+
+### Where the binaries must be
+
+- **Linux (`prototypes-linux.toml`)**: expects `./proto-crawl` and
+  `./proto-fulltext` in the current working directory.  Run `bench` from the
+  directory containing the prototypes, or use a symlink.  (On Linux,
+  `std::process::Command` does not search `.` by default.)
+- **Windows (`prototypes-windows.toml`)**: expects `proto-crawl` and
+  `proto-fulltext` (without `.exe` or `./`) on `PATH` or in the current
+  directory.  Windows `CreateProcess` searches the current directory implicitly.
+
+### Repeat counts
+
+Crawl and index targets are I/O-bound and slow (seconds to minutes), so they
+use `repeat = 3`.  Search targets are CPU-bound and fast (milliseconds), so
+they use `repeat = 10` to give meaningful p50/p95.
+
+### What is **not** covered
+
+`proto-usn` is deliberately absent from both configs:
+
+- It is Windows-only (NTFS USN journal).
+- It requires administrator rights unconditionally (the manifest requests
+  `requireAdministrator`).
+- Its input is a USN journal number, not a file tree, so `bench gen` cannot
+  produce the data it needs.
+
+Running `proto-usn` against a synthetic tree is therefore not meaningful.
+
+## CI integration
+
+The `.github/workflows/prototypes.yml` workflow builds and checks `bench`
+alongside the prototypes on every push and PR:
+
+- **`check`** (Linux + Windows): builds `bench` with `cargo build --release`
+  and runs `cargo clippy --all-targets -- -D warnings`.
+- **`release-windows`**: builds `bench.exe` targeting
+  `x86_64-pc-windows-msvc` and stages it alongside the three prototype
+  binaries.  The Release attachment for every `proto-*` tag therefore
+  includes four Windows executables: `proto-crawl.exe`, `proto-fulltext.exe`,
+  `proto-usn.exe`, and `bench.exe`.
+
 ## Non-goals
 
 This harness does *not*:
@@ -222,6 +323,7 @@ This harness does *not*:
 - Include comparisons between tantivy and SQLite FTS5.
 - Generate a 1,000,000-file tree as part of any smoke test.
 - Measure resident memory (no persistent sagasu process exists yet).
-- Wire itself to the prototypes (the config format makes it possible; doing so
-  is a separate step).
-- Integrate with CI.
+- Run the prototype configs automatically in CI (they require actual
+  prototype binaries and a file tree; building and measuring is a separate
+  step on real hardware).
+- Sign binaries or add code-signing steps.

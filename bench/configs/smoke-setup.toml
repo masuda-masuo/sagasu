@@ -1,0 +1,22 @@
+# Smoke-test configuration that exercises the setup feature.
+# Uses commands guaranteed to be present on any POSIX system.
+#
+# setup-and-count: runs `touch` once (setup), then `ls` twice (trials).
+#   Because setup is present, the workdir is NOT cleaned between trials,
+#   so the file created by setup is visible to both trials.
+#
+# no-setup-count: a target without setup for comparison — behaves exactly
+#   as before, with workdir cleaned between trials.
+
+[[target]]
+name = "setup-and-count"
+command = "ls"
+args = ["-la", "{workdir}/.setup-ran"]
+repeat = 2
+setup = { command = "touch", args = ["{workdir}/.setup-ran"] }
+
+[[target]]
+name = "no-setup-count"
+command = "ls"
+args = ["-la", "{root}/."]
+repeat = 2
