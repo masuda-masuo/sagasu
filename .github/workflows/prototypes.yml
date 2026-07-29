@@ -24,6 +24,13 @@ on:
         required: false
         default: ""
 
+# Default for jobs that do not declare their own: check only builds and tests
+# (CodeQL actions/missing-workflow-permissions). release-windows declares
+# `contents: write` for itself, and a job-level block replaces this one
+# entirely, so attaching binaries to a Release is unaffected.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: check / ${{ matrix.os }}
