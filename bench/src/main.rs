@@ -51,8 +51,10 @@ enum Command {
     /// Run benchmark targets defined in a TOML config.
     Run {
         /// Path to the TOML configuration file.
+        /// When omitted, the embedded default config (prototypes-windows.toml on
+        /// Windows, prototypes-linux.toml elsewhere) is used.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
 
         /// Root directory of the generated tree (substituted for {root}).
         #[arg(long)]
@@ -62,6 +64,11 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Write the embedded default TOML config file to stdout.
+    ///
+    /// This is useful when you want to customise the benchmark targets:
+    /// redirect the output to a file, edit it, and pass it to `bench run --config`.
+    DumpDefaultConfig,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -103,7 +110,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Run { config, root, out } => {
-            let cfg = run::load_config(&config)?;
+            let cfg = match config {
+                Some(path) => run::load_config(&path)?,
+                None => {
+                    eprintln!(
+                        "[bench] using embedded default config ({}): {}",
+                        if cfg!(target_os = "windows") {
+                            "Windows"
+                        } else {
+                            "Linux"
+                        },
+                        run::EMBEDDED_CONFIG_NAME,
+                    );
+                    run::parse_config_text(run::EMBEDDED_CONFIG)?
+                }
+            };
 
             // Try to read the tree manifest for metadata
             let manifest_path = root.join(".bench-manifest.json");
@@ -122,13 +143,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Write JSON output
             let json = serde_json::to_string_pretty(&results)?;
-            std::fs::write(&out, &json)?;
+            std::fs::write(&out, &json).map_err(|e| {
+                format!(
+                    "failed to write results '{}': {} (os error {})",
+                    out.display(),
+                    e.kind(),
+                    e.raw_os_error().unwrap_or(0),
+                )
+            })?;
             println!("Wrote results to {}", out.display());
             println!();
 
             // Print human-readable summary
             run::print_summary(&results);
 
+            Ok(())
+        }
+        Command::DumpDefaultConfig => {
+            print!("{}", run::EMBEDDED_CONFIG);
             Ok(())
         }
     }

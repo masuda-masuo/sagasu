@@ -19,6 +19,21 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// Embedded default configs
+// ---------------------------------------------------------------------------
+
+/// Default config shipped with the release binary (Windows).
+#[cfg(target_os = "windows")]
+pub const EMBEDDED_CONFIG: &str = include_str!("../configs/prototypes-windows.toml");
+
+/// Default config shipped with the release binary (non-Windows).
+#[cfg(not(target_os = "windows"))]
+pub const EMBEDDED_CONFIG: &str = include_str!("../configs/prototypes-linux.toml");
+
+/// Name used when the embedded config is the source (not suitable for I/O — informational only).
+pub const EMBEDDED_CONFIG_NAME: &str = "<embedded default config>";
+
+// ---------------------------------------------------------------------------
 // Config types
 // ---------------------------------------------------------------------------
 
@@ -69,7 +84,9 @@ pub struct Environment {
     pub os: String,
     pub arch: String,
     pub cpus: u64,
-    pub memory_total_bytes: u64,
+    /// Total physical memory in bytes.  `null` in JSON / "unknown" in footer
+    /// when the value could not be determined.
+    pub memory_total_bytes: Option<u64>,
     pub memory_total_human: String,
 }
 
@@ -124,8 +141,23 @@ pub struct TrialRecord {
 
 /// Load and validate a TOML config file.
 pub fn load_config(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
-    let text = std::fs::read_to_string(path)?;
-    let cfg: Config = toml::from_str(&text)?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read config '{}': {}", path.display(), e))?;
+    parse_config_text(&text).map_err(|e| {
+        format!(
+            "failed to parse config '{}': {}",
+            path.display(),
+            e
+        )
+        .into()
+    })
+}
+
+/// Parse and validate TOML config text, stripping a leading UTF-8 BOM if present.
+pub fn parse_config_text(text: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    // Strip UTF-8 BOM if present (bytes EF BB BF → U+FEFF)
+    let text = text.trim_start_matches('\u{feff}');
+    let cfg: Config = toml::from_str(text)?;
     if cfg.target.is_empty() {
         return Err("config must define at least one [[target]]".into());
     }
@@ -180,7 +212,14 @@ pub fn run_benchmarks(
         // Create a fresh workdir for this target
         let workdir = root.join(format!(".workdir-{}", sanitise_name(&def.name)));
         let _ = std::fs::remove_dir_all(&workdir);
-        std::fs::create_dir_all(&workdir)?;
+        std::fs::create_dir_all(&workdir).map_err(|e| {
+            format!(
+                "failed to create work directory '{}': {} (os error {})",
+                workdir.display(),
+                e.kind(),
+                e.raw_os_error().unwrap_or(0),
+            )
+        })?;
 
         // -----------------------------------------------------------------------
         // Setup phase (optional, once, not timed)
@@ -203,7 +242,15 @@ pub fn run_benchmarks(
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .current_dir(&workdir)
-                .output();
+                .output()
+                .map_err(|e| {
+                    format!(
+                        "failed to spawn setup command '{}': {} (os error {})",
+                        setup_args[0],
+                        e.kind(),
+                        e.raw_os_error().unwrap_or(0),
+                    )
+                });
 
             match output {
                 Ok(out) => {
@@ -218,7 +265,10 @@ pub fn run_benchmarks(
                 }
                 Err(e) => {
                     setup_succeeded = false;
-                    eprintln!("[bench] target '{}': setup spawn failed: {}", def.name, e);
+                    eprintln!(
+                        "[bench] target '{}': setup command {}: {}",
+                        def.name, setup_args[0], e
+                    );
                 }
             }
         }
@@ -267,7 +317,14 @@ pub fn run_benchmarks(
             // and should persist across all trials.
             if i > 0 && def.setup.is_none() {
                 let _ = std::fs::remove_dir_all(&workdir);
-                std::fs::create_dir_all(&workdir)?;
+                std::fs::create_dir_all(&workdir).map_err(|e| {
+                    format!(
+                        "failed to recreate work directory '{}': {} (os error {})",
+                        workdir.display(),
+                        e.kind(),
+                        e.raw_os_error().unwrap_or(0),
+                    )
+                })?;
             }
 
             let is_cold = i == 0;
@@ -277,7 +334,15 @@ pub fn run_benchmarks(
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .current_dir(&workdir)
-                .output();
+                .output()
+                .map_err(|e| {
+                    format!(
+                        "failed to spawn command '{}': {} (os error {})",
+                        resolved[0],
+                        e.kind(),
+                        e.raw_os_error().unwrap_or(0),
+                    )
+                });
             let elapsed = t0.elapsed();
 
             match output {
@@ -301,8 +366,8 @@ pub fn run_benchmarks(
                         failure: true,
                     });
                     eprintln!(
-                        "[bench] target '{}' trial {}: spawn failed: {}",
-                        def.name, i, e
+                        "[bench] target '{}' trial {}: command '{}': {}",
+                        def.name, i, resolved[0], e
                     );
                 }
             }
@@ -476,7 +541,7 @@ fn collect_environment() -> Environment {
         .unwrap_or(1);
 
     let mem = total_memory_bytes();
-    let human = human_bytes(mem);
+    let human = human_bytes_or_unknown(mem);
     Environment {
         os,
         arch,
@@ -486,9 +551,10 @@ fn collect_environment() -> Environment {
     }
 }
 
-/// Attempt to read total physical memory.
+/// Attempt to read total physical memory in bytes.
+/// Returns `None` when the value cannot be determined.
 #[cfg(target_os = "linux")]
-fn total_memory_bytes() -> u64 {
+fn total_memory_bytes() -> Option<u64> {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|s| {
@@ -502,14 +568,54 @@ fn total_memory_bytes() -> u64 {
                         .map(|kb| kb * 1024)
                 })
         })
-        .unwrap_or(0)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn total_memory_bytes() -> u64 {
-    // On non-Linux platforms, we return 0 ("unknown").
-    // Future: add macOS (sysctl hw.memsize) and Windows (GlobalMemoryStatusEx).
-    0
+/// Attempt to read total physical memory in bytes via `GlobalMemoryStatusEx`.
+#[cfg(target_os = "windows")]
+fn total_memory_bytes() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    extern "system" {
+        fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+
+    // SAFETY: GlobalMemoryStatusEx is a well-known Windows API.  The struct
+    // is correctly sized and initialised with length before the call.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok != 0 && status.total_phys > 0 {
+        Some(status.total_phys)
+    } else {
+        None
+    }
+}
+
+/// Fallback for platforms without a known memory API.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn total_memory_bytes() -> Option<u64> {
+    None
 }
 
 /// Format bytes in a human-friendly way.
@@ -528,6 +634,16 @@ fn human_bytes(b: u64) -> String {
         format!("{:.0} {}", size, UNITS[unit_idx])
     } else {
         format!("{:.1} {}", size, UNITS[unit_idx])
+    }
+}
+
+/// Format bytes or produce "unknown" when the value is absent.
+/// This ensures `0 B` (an actual zero-byte measurement) is distinct from
+/// `unknown` (the value could not be determined).
+fn human_bytes_or_unknown(b: Option<u64>) -> String {
+    match b {
+        Some(v) => human_bytes(v),
+        None => "unknown".into(),
     }
 }
 
@@ -866,5 +982,94 @@ setup = { command = "", args = [] }
         let json = serde_json::to_string(&tr).unwrap();
         assert!(json.contains("\"setup_ran\":true"), "json: {json}");
         assert!(json.contains("\"setup_succeeded\":true"), "json: {json}");
+    }
+
+    #[test]
+    fn test_parse_config_text_strips_bom() {
+        let toml = r#"
+[[target]]
+name = "test"
+command = "echo"
+args = ["hello"]
+repeat = 3
+"#;
+        // Parse without BOM
+        let cfg1 = parse_config_text(toml).unwrap();
+        assert_eq!(cfg1.target[0].name, "test");
+
+        // Parse with BOM prefix
+        let bom_toml = format!("\u{feff}{}", toml);
+        let cfg2 = parse_config_text(&bom_toml).unwrap();
+        assert_eq!(cfg2.target[0].name, "test");
+        assert_eq!(cfg2.target.len(), cfg1.target.len());
+    }
+
+    #[test]
+    fn test_parse_config_text_rejects_empty() {
+        let result = parse_config_text("");
+        assert!(result.is_err());
+        // An empty string fails TOML parsing with "missing field `target`"
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("missing field"), "error: {err}");
+    }
+
+    #[test]
+    fn test_human_bytes_or_unknown() {
+        assert_eq!(human_bytes_or_unknown(Some(0)), "0 B");
+        assert_eq!(human_bytes_or_unknown(Some(500)), "500 B");
+        assert_eq!(human_bytes_or_unknown(Some(1536)), "1.5 KiB");
+        assert_eq!(human_bytes_or_unknown(None), "unknown");
+    }
+
+    #[test]
+    fn test_environment_memory_none_serializes_as_null() {
+        let env = Environment {
+            os: "test-os".into(),
+            arch: "x86_64".into(),
+            cpus: 4,
+            memory_total_bytes: None,
+            memory_total_human: "unknown".into(),
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(
+            json.contains("\"memory_total_bytes\":null"),
+            "expected null in json: {json}"
+        );
+        assert!(
+            json.contains("\"memory_total_human\":\"unknown\""),
+            "expected unknown in json: {json}"
+        );
+    }
+
+    #[test]
+    fn test_environment_memory_some_serializes_as_number() {
+        let env = Environment {
+            os: "test-os".into(),
+            arch: "x86_64".into(),
+            cpus: 4,
+            memory_total_bytes: Some(8589934592),
+            memory_total_human: "8.0 GiB".into(),
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(
+            json.contains("\"memory_total_bytes\":8589934592"),
+            "expected value in json: {json}"
+        );
+        assert!(
+            json.contains("\"memory_total_human\":\"8.0 GiB\""),
+            "expected 8.0 GiB in json: {json}"
+        );
+    }
+
+    #[test]
+    fn test_load_config_missing_path_reports_filename() {
+        let missing = Path::new("/tmp/__this_path_does_not_exist__bench_cfg_test__.toml");
+        let result = load_config(missing);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("__this_path_does_not_exist__bench_cfg_test__"),
+            "error should contain the path, got: {err}"
+        );
     }
 }
