@@ -18,7 +18,7 @@ cargo build --release --manifest-path bench/Cargo.toml
 ./bench/target/release/bench gen --out /tmp/bt-b --files 200 --seed 42
 diff -r /tmp/bt-a /tmp/bt-b
 
-# Run the smoke-test config
+# Run the smoke-test config (or omit --config to use the embedded default)
 ./bench/target/release/bench run \
     --config bench/configs/smoke.toml \
     --root /tmp/bt-a \
@@ -26,6 +26,21 @@ diff -r /tmp/bt-a /tmp/bt-b
 ```
 
 ## Subcommands
+
+### `bench dump-default-config` — print embedded config
+
+```
+bench dump-default-config
+```
+
+Prints the platform-appropriate default config (`prototypes-windows.toml` on
+Windows, `prototypes-linux.toml` elsewhere) to stdout.  Redirect to a file to
+obtain a customisable copy:
+
+```
+bench dump-default-config > my-config.toml
+bench run --config my-config.toml --root /tmp/tree --out results.json
+```
 
 ### `bench gen` — deterministic tree generator
 
@@ -128,11 +143,21 @@ real-machine numbers; the file-count proportions are what this tree reproduces.
 ### `bench run` — measurement harness
 
 ```
-bench run --config <toml> --root <tree-dir> --out <results.json>
+bench run [--config <toml>] --root <tree-dir> --out <results.json>
 ```
 
 Runs every target defined in the TOML config file against the tree at `<root>`
 and writes a JSON results file and a Markdown summary to stdout.
+
+`--config` is optional.  When omitted, the harness uses an embedded default
+config appropriate for the platform:
+- **Windows**: `prototypes-windows.toml` (expects `proto-crawl` and
+  `proto-fulltext` on `PATH` or in the current directory).
+- **Linux / other**: `prototypes-linux.toml` (expects `./proto-crawl` and
+  `./proto-fulltext` in the working directory).
+
+Use `bench dump-default-config` to print the embedded config to stdout
+(e.g. `bench dump-default-config > my-config.toml`) for customisation.
 
 #### Config format
 
@@ -245,9 +270,13 @@ processes.
 
 ## Portability
 
-Everything builds and runs on both Linux and Windows.  Memory detection is
-currently Linux-only (`/proc/meminfo`); other platforms report 0 for memory
-total.  No shelling out to `sh -c`.
+Everything builds and runs on both Linux and Windows.  Total physical memory
+is detected on:
+- **Linux**: via `/proc/meminfo`
+- **Windows**: via `GlobalMemoryStatusEx`
+- **Other platforms**: reported as `null` in JSON / `unknown` in the footer.
+
+No shelling out to `sh -c`.
 
 On Windows, `std::process::Command` searches the current directory by default;
 on Linux it does not.  The prototype configs handle this difference (see below).

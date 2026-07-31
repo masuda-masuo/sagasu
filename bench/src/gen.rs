@@ -537,9 +537,23 @@ pub fn generate_tree(
 
     // Ensure output directory exists and is empty
     if out.exists() {
-        std::fs::remove_dir_all(out)?;
+        std::fs::remove_dir_all(out).map_err(|e| {
+            format!(
+                "failed to remove existing output directory '{}': {} (os error {})",
+                out.display(),
+                e.kind(),
+                e.raw_os_error().unwrap_or(0),
+            )
+        })?;
     }
-    std::fs::create_dir_all(out)?;
+    std::fs::create_dir_all(out).map_err(|e| {
+        format!(
+            "failed to create output directory '{}': {} (os error {})",
+            out.display(),
+            e.kind(),
+            e.raw_os_error().unwrap_or(0),
+        )
+    })?;
 
     // ── Tree structure ──────────────────────────────────────────────
     // No directory holds more than 1000 files.  Directories are named
@@ -563,7 +577,14 @@ pub fn generate_tree(
     for di in 0..num_dirs {
         let dir_name = format!("d{:04}", di);
         let dir_path = out.join(&dir_name);
-        std::fs::create_dir_all(&dir_path)?;
+        std::fs::create_dir_all(&dir_path).map_err(|e| {
+            format!(
+                "failed to create directory '{}': {} (os error {})",
+                dir_path.display(),
+                e.kind(),
+                e.raw_os_error().unwrap_or(0),
+            )
+        })?;
 
         let start = di * files_per_dir;
         let end = files.min(start + files_per_dir);
@@ -591,7 +612,14 @@ pub fn generate_tree(
                 }
             }
 
-            std::fs::write(&file_path, &body)?;
+            std::fs::write(&file_path, &body).map_err(|e| {
+                format!(
+                    "failed to write file '{}': {} (os error {})",
+                    file_path.display(),
+                    e.kind(),
+                    e.raw_os_error().unwrap_or(0),
+                )
+            })?;
             let actual_size = body.len() as u64;
 
             // Bucket
@@ -636,7 +664,14 @@ pub fn generate_tree(
 
     let manifest_path = out.join(".bench-manifest.json");
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(&manifest_path, manifest_json)?;
+    std::fs::write(&manifest_path, manifest_json).map_err(|e| {
+        format!(
+            "failed to write manifest '{}': {} (os error {})",
+            manifest_path.display(),
+            e.kind(),
+            e.raw_os_error().unwrap_or(0),
+        )
+    })?;
 
     Ok(GeneratedTree {
         root: out.to_path_buf(),
