@@ -411,8 +411,8 @@ pub fn print_summary(results: &RunResults) {
         human_bytes(results.tree.total_bytes)
     );
     println!();
-    println!("| Target | Cold (s) | Warm p50 (s) | Warm p95 (s) | Trials | Failures | Setup |");
-    println!("|--------|----------|--------------|--------------|--------|----------|-------|");
+    println!("| Target | Trial 0 (s) | Warm p50 (s) | Warm p95 (s) | Trials | Failures | Setup |");
+    println!("|--------|-------------|--------------|--------------|--------|----------|-------|");
     for t in &results.targets {
         let cold_s = match t.cold.p50_secs {
             Some(v) => format!("{:.4}", v),
@@ -449,18 +449,32 @@ pub fn print_summary(results: &RunResults) {
     }
     println!();
     println!(
-        "Environment: {} {} · {} CPUs · {} · {}",
+        "Tree: {} files · {} · Memory: {}",
+        results.tree.files,
+        human_bytes(results.tree.total_bytes),
+        results.environment.memory_total_human,
+    );
+    println!(
+        "Environment: {} {} · {} CPUs · {}",
         results.environment.os,
         results.environment.arch,
         results.environment.cpus,
-        results.environment.memory_total_human,
         results.timestamp,
     );
     println!("Harness version: {}", results.harness_version);
     println!("* Times include process startup (wall-clock from spawn to exit).");
-    println!("* Trial 0 is defined as \"cold\"; remaining trials are \"warm\".");
+    println!(
+        "* Trial 0 is the first trial; remaining trials are \"warm\".  No OS cache is ever dropped, so \"cold\" only means \"first\" — the page cache may already hold the tree."
+    );
     println!("* Non-zero exit codes are recorded as failures in the JSON output.");
     println!("* Setup: ✅ = ran and succeeded, ❌ = ran and failed, — = no setup defined.");
+    println!(
+        "{}",
+        cache_fit_note(
+            results.tree.total_bytes,
+            results.environment.memory_total_bytes
+        )
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +707,72 @@ fn sanitise_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Cache-fit judgment
+// ---------------------------------------------------------------------------
+
+/// Verdict on whether the generated tree can sit entirely in the OS page cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheFit {
+    /// Tree size is known, memory is known, and the tree fits (`<=`): the whole
+    /// tree can sit in the page cache, so trial 0 does not measure cold I/O.
+    Fits,
+    /// Tree size is known, memory is known, and the tree exceeds memory: the
+    /// tree cannot be fully cached, so trial 0 includes a cold-I/O component.
+    DoesNotFit,
+    /// Tree size is zero (no manifest data) or total memory is unknown: no
+    /// judgment is possible and none is claimed.
+    Unknown,
+}
+
+/// Judge whether the tree fits in the OS page cache, given the tree's total
+/// bytes and the machine's total physical memory.
+///
+/// Never claims fit or no-fit without data: when `tree_bytes` is 0 (no
+/// manifest) or `memory_total_bytes` is `None` (could not be determined), the
+/// verdict is [`CacheFit::Unknown`].
+pub fn judge_cache_fit(tree_bytes: u64, memory_total_bytes: Option<u64>) -> CacheFit {
+    match memory_total_bytes {
+        Some(mem) if tree_bytes > 0 => {
+            if tree_bytes <= mem {
+                CacheFit::Fits
+            } else {
+                CacheFit::DoesNotFit
+            }
+        }
+        _ => CacheFit::Unknown,
+    }
+}
+
+/// Human-readable footer note for the cache-fit judgment.
+fn cache_fit_note(tree_bytes: u64, memory_total_bytes: Option<u64>) -> String {
+    match judge_cache_fit(tree_bytes, memory_total_bytes) {
+        CacheFit::Fits => format!(
+            "* WARNING: the tree ({}) fits in total memory ({}), so the whole tree can sit in the OS page cache; trial 0 does not measure cold I/O and I/O-bound indicators (especially hashing) will not reproduce real-machine ratios.",
+            human_bytes(tree_bytes),
+            human_bytes(memory_total_bytes.unwrap_or(0)),
+        ),
+        CacheFit::DoesNotFit => format!(
+            "* The tree ({}) exceeds total memory ({}), so it cannot be fully cached; trial 0 includes a genuine cold-I/O component.",
+            human_bytes(tree_bytes),
+            human_bytes(memory_total_bytes.unwrap_or(0)),
+        ),
+        CacheFit::Unknown => format!(
+            "* Cache fit cannot be judged ({}): neither \"fits\" nor \"does not fit\" is claimed.",
+            cache_fit_unknown_reason(tree_bytes, memory_total_bytes)
+        ),
+    }
+}
+
+/// Why the cache fit could not be judged (for the "cannot be judged" note).
+fn cache_fit_unknown_reason(tree_bytes: u64, memory_total_bytes: Option<u64>) -> &'static str {
+    match (tree_bytes, memory_total_bytes) {
+        (0, _) => "tree size is unknown (no manifest data)",
+        (_, None) => "total memory is unknown",
+        _ => "insufficient data",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,5 +1151,77 @@ repeat = 3
             err.contains("__this_path_does_not_exist__bench_cfg_test__"),
             "error should contain the path, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache-fit judgment
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_judge_cache_fit_fits() {
+        // 10k-file tree (~1.8 GiB) on a 16 GiB machine: fits.
+        assert_eq!(
+            judge_cache_fit(1_879_953_005, Some(16 * 1024 * 1024 * 1024)),
+            CacheFit::Fits
+        );
+        // Exact equality still fits (the whole tree could be cached).
+        assert_eq!(judge_cache_fit(1024, Some(1024)), CacheFit::Fits);
+    }
+
+    #[test]
+    fn test_judge_cache_fit_does_not_fit() {
+        // 100k-file tree (~17 GiB) on a 16 GiB machine: does not fit.
+        assert_eq!(
+            judge_cache_fit(17 * 1024 * 1024 * 1024, Some(16 * 1024 * 1024 * 1024)),
+            CacheFit::DoesNotFit
+        );
+    }
+
+    #[test]
+    fn test_judge_cache_fit_memory_unknown() {
+        assert_eq!(judge_cache_fit(1_879_953_005, None), CacheFit::Unknown);
+    }
+
+    #[test]
+    fn test_judge_cache_fit_tree_bytes_zero() {
+        // Zero tree bytes (no manifest data) -> unknown, even with known memory.
+        assert_eq!(
+            judge_cache_fit(0, Some(16 * 1024 * 1024 * 1024)),
+            CacheFit::Unknown
+        );
+        assert_eq!(judge_cache_fit(0, None), CacheFit::Unknown);
+    }
+
+    #[test]
+    fn test_cache_fit_note_warns_when_fits() {
+        let note = cache_fit_note(1_879_953_005, Some(16 * 1024 * 1024 * 1024));
+        assert!(note.contains("WARNING"), "note: {note}");
+        assert!(note.contains("fits in total memory"), "note: {note}");
+        assert!(note.contains("does not measure cold I/O"), "note: {note}");
+    }
+
+    #[test]
+    fn test_cache_fit_note_does_not_fit() {
+        let note = cache_fit_note(17 * 1024 * 1024 * 1024, Some(16 * 1024 * 1024 * 1024));
+        assert!(note.contains("exceeds total memory"), "note: {note}");
+        assert!(note.contains("cold-I/O"), "note: {note}");
+        assert!(!note.contains("WARNING"), "note: {note}");
+    }
+
+    #[test]
+    fn test_cache_fit_note_unknown_is_not_a_warning() {
+        // Memory unknown: "cannot judge", not a warning and not an all-clear.
+        let note = cache_fit_note(1_879_953_005, None);
+        assert!(note.contains("cannot be judged"), "note: {note}");
+        assert!(note.contains("total memory is unknown"), "note: {note}");
+        assert!(!note.contains("WARNING"), "note: {note}");
+        assert!(!note.contains("exceeds"), "note: {note}");
+
+        // Tree bytes zero: also "cannot judge", never fit/no-fit.
+        let note0 = cache_fit_note(0, Some(16 * 1024 * 1024 * 1024));
+        assert!(note0.contains("cannot be judged"), "note: {note0}");
+        assert!(note0.contains("no manifest data"), "note: {note0}");
+        assert!(!note0.contains("WARNING"), "note: {note0}");
+        assert!(!note0.contains("exceeds"), "note: {note0}");
     }
 }

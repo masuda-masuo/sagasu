@@ -140,6 +140,37 @@ average here against ~2.2 MB on the machine measured (325 GiB across 151,675
 files). Throughput figures in bytes/second are therefore not comparable to
 real-machine numbers; the file-count proportions are what this tree reproduces.
 
+## Minimum valid scale
+
+**A 10,000-file (~1.8 GiB) tree is a wiring check, not a measurement.**  The
+minimum valid scale is **100,000 files (~17 GiB)** — the smallest generated
+tree that exceeds a typical page cache.
+
+Why: `bench run` is usually invoked right after `bench gen`, so a tree that
+fits in RAM is left entirely in the OS page cache.  Trial 0 then does
+**not** measure cold I/O, and I/O-bound indicators — especially hashing
+throughput — silently look better than they are.  Observed with `--seed 42`:
+
+| Tree | Approx. size | Hash/metadata throughput ratio | Meaning |
+|---|---|---|---|
+| 10,000 files | 1.8 GiB | 5.7x | Fits in the page cache; trial 0 is not cold. Wiring check only. |
+| 100,000 files | ~17 GiB | 123x | Exceeds the page cache; reproduces the cold-I/O phenomenon. |
+| Real machine (2026-07-29) | 325 GiB / 151,675 files | 59.9x | Reference ratio. |
+
+The 5.7x ratio from a cache-fit tree is not a real-machine result and must
+not become the basis of performance targets — the real-machine ratio is
+59.9x, and only a tree that exceeds the cache (100k files, 123x) reproduces
+the effect.
+
+Because this trap is silent, `bench run` now prints a cache-fit judgment in
+its summary: the tree's total bytes and the machine's total memory side by
+side, plus an explicit **WARNING** when the tree fits in memory — trial 0
+does not measure cold I/O, and I/O-bound indicators (especially hashing)
+will not reproduce real-machine ratios.  When total memory is unknown or the
+tree manifest is missing, the summary states that the fit **cannot be
+judged**; it never claims fit or no-fit without data.  The warning is
+advisory only — the harness still does not drop or control the OS page cache.
+
 ### `bench run` — measurement harness
 
 ```
@@ -224,10 +255,13 @@ This is intentional: a real-user measurement begins when they press Enter and
 ends when the prompt returns.  Treat the numbers accordingly when comparing
 with profiler-internal timings.
 
-#### Cold vs warm
+#### Trial 0 vs warm trials
 
-- **Trial 0** is always labelled `cold`.  The first trial runs with whatever
-  state the OS has (cold caches, no page cache).
+- **Trial 0** is the first trial.  In the JSON output it is labelled
+  `cold: true` and in the Markdown summary it appears in the **Trial 0**
+  column — but the label means "first", not "cold I/O": the harness never
+  drops OS caches, so the page cache may already hold the whole tree and
+  trial 0 may not measure cold I/O at all (see *Minimum valid scale* above).
 - **Trials 1..N** are labelled `warm`.  No attempt is made to drop OS caches
   between trials.
 
