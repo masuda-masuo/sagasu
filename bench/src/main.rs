@@ -110,6 +110,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Run { config, root, out } => {
+            // A relative --root would otherwise be re-resolved against each
+            // target's workdir (<root>/.workdir-<name>/) when substituted for
+            // {root}, making every spawn fail while bench still exits 0 (#29).
+            // Resolve it up front; a missing root is a hard error here, not a
+            // per-trial failure.
+            let root = resolve_root(&root)?;
+
             let cfg = match config {
                 Some(path) => run::load_config(&path)?,
                 None => {
@@ -181,5 +188,86 @@ fn human_bytes(b: u64) -> String {
         format!("{:.0} {}", size, UNITS[unit_idx])
     } else {
         format!("{:.1} {}", size, UNITS[unit_idx])
+    }
+}
+
+/// Resolve `--root` to an absolute path, or fail with the offending path.
+///
+/// `bench run` executes targets with their workdir *inside* the root, so a
+/// relative root passed through to `{root}` substitution points at a
+/// nonexistent path and every trial fails while the exit code stays 0 (#29).
+fn resolve_root(root: &std::path::Path) -> Result<PathBuf, String> {
+    let canon = std::fs::canonicalize(root).map_err(|e| {
+        format!(
+            "failed to resolve --root '{}': {} (os error {})",
+            root.display(),
+            e.kind(),
+            e.raw_os_error().unwrap_or(0),
+        )
+    })?;
+    Ok(strip_verbatim_prefix(canon))
+}
+
+/// Strip Windows verbatim prefixes: `\\?\C:\x` → `C:\x`,
+/// `\\?\UNC\srv\share` → `\\srv\share`.  Anything else passes through.
+///
+/// On Windows `std::fs::canonicalize` returns verbatim (`\\?\`) paths; some
+/// child processes mishandle them, and Windows is the primary measurement
+/// platform, so the prefix must not leak into `{root}` substitution.  Kept
+/// free of `#[cfg(windows)]` so it compiles and is tested on every platform.
+fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", rest));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest.to_string());
+    }
+    p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_verbatim_drive_path() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\bench\tree")),
+            PathBuf::from(r"C:\bench\tree")
+        );
+    }
+
+    #[test]
+    fn strip_verbatim_unc_path() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\srv\share\tree")),
+            PathBuf::from(r"\\srv\share\tree")
+        );
+    }
+
+    #[test]
+    fn strip_verbatim_leaves_plain_paths_alone() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from("/tmp/tree")),
+            PathBuf::from("/tmp/tree")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"C:\tree")),
+            PathBuf::from(r"C:\tree")
+        );
+    }
+
+    #[test]
+    fn resolve_root_missing_path_names_it() {
+        let err = resolve_root(std::path::Path::new("no-such-dir-29")).unwrap_err();
+        assert!(err.contains("no-such-dir-29"), "error was: {err}");
+        assert!(err.contains("failed to resolve --root"), "error was: {err}");
+    }
+
+    #[test]
+    fn resolve_root_existing_path_is_absolute() {
+        let resolved = resolve_root(&std::env::temp_dir()).unwrap();
+        assert!(resolved.is_absolute());
     }
 }
