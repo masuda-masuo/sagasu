@@ -1,16 +1,38 @@
 # Smoke-test configuration for bench run.
-# Uses commands guaranteed to be present on any POSIX system (find, wc).
+# Uses commands guaranteed to be present on any POSIX system (true, find, wc).
 # The harness must not depend on any prototype binary being built.
 # Repeat counts are kept small (2–3) so the smoke stays fast.
+#
+# The floor mechanism (fixed-cost separation) is exercised here too:
+#
+#   * `proc-start-floor` is a tiny floor pair: `true` does nothing, so its
+#     warm p50 is ~pure process startup.
+#   * `list-files` declares `floor = "proc-start-floor"`, so its row shows
+#     raw warm times plus a net-of-floor column (find minus true), which
+#     is reliably positive.
+#   * `count-manifest` declares `floor = "list-files"`, so its net is wc
+#     minus find — the floor is the slower of the pair, which exercises the
+#     clamped-at-0 label when the raw value falls below the floor.
+#
+# What matters is that the mechanism prints labelled raw + net rows with no
+# prototype binary involved.
+
+[[target]]
+name = "proc-start-floor"
+command = "true"
+args = []
+repeat = 2
 
 [[target]]
 name = "list-files"
 command = "find"
 args = ["{root}", "-type", "f"]
 repeat = 2
+floor = "proc-start-floor"
 
 [[target]]
 name = "count-manifest"
 command = "wc"
 args = ["-l", "{root}/.bench-manifest.json"]
 repeat = 2
+floor = "list-files"
