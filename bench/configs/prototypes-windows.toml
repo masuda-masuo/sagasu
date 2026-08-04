@@ -14,6 +14,15 @@
 # Crawl and index are I/O-bound and slow (seconds to minutes), so their repeat
 # count is low.  Search is CPU-bound and fast (milliseconds), so a larger
 # repeat gives meaningful p50/p95 numbers.
+#
+# Floor target
+# ------------
+# Every `bench run` trial includes a fixed cost: process startup + tantivy
+# index open + Lindera dictionary load.  `fulltext-search-floor` measures that
+# fixed cost directly with a query token that `bench gen` never plants
+# (`qzxv9floorprobe`), so it matches nothing.  The search targets below
+# declare `floor = "fulltext-search-floor"`, and the harness subtracts the
+# floor's warm p50 to report net-of-floor times (see bench/README.md).
 
 [[target]]
 name = "crawl-metadata"
@@ -34,11 +43,19 @@ args = ["index", "{root}", "--index-dir", "{workdir}/ft-index"]
 repeat = 3
 
 [[target]]
+name = "fulltext-search-floor"
+command = "proto-fulltext"
+args = ["search", "qzxv9floorprobe", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = { command = "proto-fulltext", args = ["index", "{root}", "--index-dir", "{workdir}/ft-index"] }
+
+[[target]]
 name = "fulltext-search-ja"
 command = "proto-fulltext"
 args = ["search", "全文検索", "--index-dir", "{workdir}/ft-index"]
 repeat = 10
 setup = { command = "proto-fulltext", args = ["index", "{root}", "--index-dir", "{workdir}/ft-index"] }
+floor = "fulltext-search-floor"
 
 [[target]]
 name = "fulltext-search-en"
@@ -46,3 +63,4 @@ command = "proto-fulltext"
 args = ["search", "benchmark", "--index-dir", "{workdir}/ft-index"]
 repeat = 10
 setup = { command = "proto-fulltext", args = ["index", "{root}", "--index-dir", "{workdir}/ft-index"] }
+floor = "fulltext-search-floor"

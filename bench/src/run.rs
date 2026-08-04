@@ -55,6 +55,12 @@ pub struct TargetDef {
     /// When present, the work directory is NOT cleaned between trials.
     #[serde(default)]
     pub setup: Option<SetupDef>,
+    /// Optional name of a "floor" target defined in the same config.  The
+    /// floor target's warm p50 (the fixed cost: process startup, index open,
+    /// and dictionary load) is subtracted from this target's raw warm times
+    /// to derive the net-of-floor values shown in the summary and JSON.
+    #[serde(default)]
+    pub floor: Option<String>,
 }
 
 /// A setup command that runs once before the timed trials of a target.
@@ -111,6 +117,14 @@ pub struct TargetResult {
     pub setup_ran: bool,
     /// Whether the setup command exited successfully (always true if setup_ran is false).
     pub setup_succeeded: bool,
+    /// Name of the floor target this target's net values are derived from
+    /// (absent when the target declares no floor).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub floor: Option<String>,
+    /// Net-of-floor statistics: raw warm stats minus the floor target's warm
+    /// p50 (the fixed cost).  Absent when the target declares no floor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net: Option<NetStats>,
 }
 
 #[derive(Debug, Serialize)]
@@ -133,6 +147,26 @@ pub struct TrialRecord {
     pub elapsed_secs: f64,
     pub exit_code: i32,
     pub failure: bool,
+}
+
+/// Derived net-of-floor statistics for a target that declares a `floor`.
+///
+/// Net p50/p95 = raw warm p50/p95 minus the floor target's warm p50 (the
+/// fixed cost: process startup + index open + dictionary load).  A negative
+/// result is clamped to 0 and flagged with `clamped`; when derivation is
+/// impossible (no warm stats on either side) the values are `null` and
+/// `cannot_derive_reason` explains why.  A net value is never silently wrong.
+#[derive(Debug, Serialize)]
+pub struct NetStats {
+    /// Net-of-floor warm p50 in seconds (None when derivation was impossible).
+    pub p50_secs: Option<f64>,
+    /// Net-of-floor warm p95 in seconds (None when derivation was impossible).
+    pub p95_secs: Option<f64>,
+    /// True when a negative net value was clamped to 0.
+    pub clamped: bool,
+    /// Why the net values could not be derived (null stats), when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cannot_derive_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +208,35 @@ pub fn parse_config_text(text: &str) -> Result<Config, Box<dyn std::error::Error
         if let Some(ref setup) = t.setup {
             if setup.command.is_empty() {
                 return Err(format!("target '{}' has an empty setup.command", t.name).into());
+            }
+        }
+    }
+    // Target names must be unique: floor references bind by name, so a
+    // duplicate would silently bind to one of the definitions.
+    let mut seen = std::collections::HashSet::new();
+    for t in &cfg.target {
+        if !seen.insert(t.name.as_str()) {
+            return Err(format!("duplicate target name '{}'", t.name).into());
+        }
+    }
+    // A `floor` reference must name a target defined in the same config, and
+    // cannot be the target itself (its own fixed cost would be meaningless).
+    let names: Vec<&str> = cfg.target.iter().map(|t| t.name.as_str()).collect();
+    for t in &cfg.target {
+        if let Some(floor) = &t.floor {
+            if !names.contains(&floor.as_str()) {
+                return Err(format!(
+                    "target '{}' declares floor = \"{}\", but no target named '{}' is defined in this config",
+                    t.name, floor, floor
+                )
+                .into());
+            }
+            if floor == &t.name {
+                return Err(format!(
+                    "target '{}' cannot be its own floor",
+                    t.name
+                )
+                .into());
             }
         }
     }
@@ -299,6 +362,8 @@ pub fn run_benchmarks(
                 trials: vec![],
                 setup_ran,
                 setup_succeeded,
+                floor: def.floor.clone(),
+                net: None,
             });
             continue;
         }
@@ -391,7 +456,49 @@ pub fn run_benchmarks(
             trials,
             setup_ran,
             setup_succeeded,
+            floor: def.floor.clone(),
+            net: None,
         });
+    }
+
+    // Second pass: derive net-of-floor stats for every target that declares a
+    // floor.  Config validation guarantees the referenced name exists; the
+    // lookup is still guarded so a broken reference can never produce a
+    // silently wrong number.
+    let by_index: std::collections::HashMap<&str, usize> = target_results
+        .iter()
+        .enumerate()
+        .map(|(i, tr)| (tr.name.as_str(), i))
+        .collect();
+    let mut nets: Vec<Option<NetStats>> = Vec::with_capacity(target_results.len());
+    for tr in &target_results {
+        if let Some(floor_name) = &tr.floor {
+            match by_index.get(floor_name.as_str()) {
+                Some(&floor_idx) => {
+                    nets.push(Some(derive_net_stats(
+                        &tr.warm,
+                        &target_results[floor_idx].warm,
+                        floor_name,
+                    )));
+                }
+                None => {
+                    nets.push(Some(NetStats {
+                        p50_secs: None,
+                        p95_secs: None,
+                        clamped: false,
+                        cannot_derive_reason: Some(format!(
+                            "floor target '{}' is not defined in this config",
+                            floor_name
+                        )),
+                    }));
+                }
+            }
+        } else {
+            nets.push(None);
+        }
+    }
+    for (tr, net) in target_results.iter_mut().zip(nets) {
+        tr.net = net;
     }
 
     Ok(RunResults {
@@ -411,8 +518,12 @@ pub fn print_summary(results: &RunResults) {
         human_bytes(results.tree.total_bytes)
     );
     println!();
-    println!("| Target | Trial 0 (s) | Warm p50 (s) | Warm p95 (s) | Trials | Failures | Setup |");
-    println!("|--------|-------------|--------------|--------------|--------|----------|-------|");
+    println!(
+        "| Target | Trial 0 (s) | Warm p50 (s)¹ | Warm p95 (s)¹ | Net p50 (s)² | Net p95 (s)² | Trials | Failures | Setup |"
+    );
+    println!(
+        "|--------|-------------|---------------|---------------|--------------|--------------|--------|----------|-------|"
+    );
     for t in &results.targets {
         let cold_s = match t.cold.p50_secs {
             Some(v) => format!("{:.4}", v),
@@ -426,6 +537,32 @@ pub fn print_summary(results: &RunResults) {
             Some(v) => format!("{:.4}", v),
             None => "—".to_string(),
         };
+        let net_p50 = match &t.net {
+            Some(net) => match net.p50_secs {
+                Some(v) => {
+                    if net.clamped {
+                        format!("{:.4} (clamped)", v)
+                    } else {
+                        format!("{:.4}", v)
+                    }
+                }
+                None => "cannot derive".to_string(),
+            },
+            None => "—".to_string(),
+        };
+        let net_p95 = match &t.net {
+            Some(net) => match net.p95_secs {
+                Some(v) => {
+                    if net.clamped {
+                        format!("{:.4} (clamped)", v)
+                    } else {
+                        format!("{:.4}", v)
+                    }
+                }
+                None => "cannot derive".to_string(),
+            },
+            None => "—".to_string(),
+        };
         let n_fail = t.trials.iter().filter(|tr| tr.failure).count();
         let setup_status = if t.setup_ran {
             if t.setup_succeeded {
@@ -437,16 +574,25 @@ pub fn print_summary(results: &RunResults) {
             "—"
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             t.name,
             cold_s,
             warm_p50,
             warm_p95,
+            net_p50,
+            net_p95,
             t.trials.len(),
             n_fail,
             setup_status
         );
     }
+    println!();
+    println!(
+        "¹ Warm columns are raw times: they include process startup + fixed cost (wall-clock from spawn to exit)."
+    );
+    println!(
+        "² Net columns are net of floor: the declared floor target's warm p50 (the fixed cost) is subtracted, so they exclude fixed cost. \"—\" = no floor declared; \"cannot derive\" = the floor target or this target has no warm stats; \"clamped\" = the raw value fell below the floor and was clamped to 0."
+    );
     println!();
     println!(
         "Tree: {} files · {} · Memory: {}",
@@ -462,7 +608,10 @@ pub fn print_summary(results: &RunResults) {
         results.timestamp,
     );
     println!("Harness version: {}", results.harness_version);
-    println!("* Times include process startup (wall-clock from spawn to exit).");
+    println!("* All raw times include process startup + fixed cost (wall-clock from spawn to exit).");
+    println!(
+        "* Net rows subtract the declared floor target's warm p50, so they exclude the fixed cost."
+    );
     println!(
         "* Trial 0 is the first trial; remaining trials are \"warm\".  No OS cache is ever dropped, so \"cold\" only means \"first\" — the page cache may already hold the tree."
     );
@@ -490,6 +639,46 @@ fn resolve_args(cmd: &str, args: &[String], root: &str, workdir: &Path) -> Vec<S
                 .map(|a| a.replace("{root}", root).replace("{workdir}", &workdir_str)),
         )
         .collect()
+}
+
+/// Derive net-of-floor statistics for a target: its raw warm p50/p95 minus
+/// the floor target's warm p50 (the fixed cost).
+///
+/// A negative result is clamped to 0 and flagged via `clamped`.  When either
+/// side has no warm stats, the outcome is a clearly-labelled "cannot derive"
+/// (null values plus a reason) — never a silently wrong number.
+fn derive_net_stats(
+    target_warm: &TrialStats,
+    floor_warm: &TrialStats,
+    floor_name: &str,
+) -> NetStats {
+    let cannot = |reason: String| NetStats {
+        p50_secs: None,
+        p95_secs: None,
+        clamped: false,
+        cannot_derive_reason: Some(reason),
+    };
+    let Some(target_p50) = target_warm.p50_secs else {
+        return cannot("target has no warm stats (repeat=1 or all warm trials failed)".into());
+    };
+    let Some(target_p95) = target_warm.p95_secs else {
+        return cannot("target has no warm stats (repeat=1 or all warm trials failed)".into());
+    };
+    let Some(floor_p50) = floor_warm.p50_secs else {
+        return cannot(format!(
+            "floor target '{}' has no warm stats (repeat=1 or all warm trials failed)",
+            floor_name
+        ));
+    };
+    let raw_p50 = target_p50 - floor_p50;
+    let raw_p95 = target_p95 - floor_p50;
+    let clamped = raw_p50 < 0.0 || raw_p95 < 0.0;
+    NetStats {
+        p50_secs: Some(raw_p50.max(0.0)),
+        p95_secs: Some(raw_p95.max(0.0)),
+        clamped,
+        cannot_derive_reason: None,
+    }
 }
 
 /// Compute min/max/P50/P95 over a subset of trial records.
@@ -857,6 +1046,7 @@ repeat = 0
                 args: vec![],
                 repeat: 0,
                 setup: None,
+                floor: None,
             }],
         };
         // We test the validation via load_config which does extra checks
@@ -1020,6 +1210,8 @@ setup = { command = "", args = [] }
             trials: vec![],
             setup_ran: true,
             setup_succeeded: false,
+            floor: None,
+            net: None,
         };
         assert!(result.setup_ran);
         assert!(!result.setup_succeeded);
@@ -1058,6 +1250,8 @@ setup = { command = "", args = [] }
             }],
             setup_ran: true,
             setup_succeeded: true,
+            floor: None,
+            net: None,
         };
         let json = serde_json::to_string(&tr).unwrap();
         assert!(json.contains("\"setup_ran\":true"), "json: {json}");
@@ -1223,5 +1417,222 @@ repeat = 3
         assert!(note0.contains("no manifest data"), "note: {note0}");
         assert!(!note0.contains("WARNING"), "note: {note0}");
         assert!(!note0.contains("exceeds"), "note: {note0}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Floor targets (fixed-cost separation)
+    // -----------------------------------------------------------------------
+
+    fn stats(p50: Option<f64>, p95: Option<f64>) -> TrialStats {
+        TrialStats {
+            trials: 10,
+            min_secs: p50,
+            max_secs: p95,
+            p50_secs: p50,
+            p95_secs: p95,
+        }
+    }
+
+    #[test]
+    fn test_derive_net_stats_normal() {
+        // T raw warm p50/p95 minus F's warm p50 (the fixed cost).
+        let target = stats(Some(0.0580), Some(0.0630));
+        let floor = stats(Some(0.0320), Some(0.0330));
+        let net = derive_net_stats(&target, &floor, "fulltext-search-floor");
+        let p50 = net.p50_secs.expect("p50 must derive");
+        let p95 = net.p95_secs.expect("p95 must derive");
+        assert!((p50 - 0.0260).abs() < 1e-9, "p50: {p50}");
+        assert!((p95 - 0.0310).abs() < 1e-9, "p95: {p95}");
+        assert!(!net.clamped);
+        assert!(net.cannot_derive_reason.is_none());
+    }
+
+    #[test]
+    fn test_derive_net_stats_floor_missing_stats() {
+        // Floor target failed: no warm stats -> clearly-labelled cannot derive,
+        // never a silently wrong number.
+        let target = stats(Some(0.0580), Some(0.0630));
+        let floor = stats(None, None);
+        let net = derive_net_stats(&target, &floor, "fulltext-search-floor");
+        assert!(net.p50_secs.is_none());
+        assert!(net.p95_secs.is_none());
+        assert!(!net.clamped);
+        let reason = net.cannot_derive_reason.expect("reason must be present");
+        assert!(reason.contains("fulltext-search-floor"), "reason: {reason}");
+        assert!(reason.contains("no warm stats"), "reason: {reason}");
+    }
+
+    #[test]
+    fn test_derive_net_stats_target_missing_stats() {
+        // Target itself failed: cannot derive, with a reason naming the side.
+        let target = stats(None, None);
+        let floor = stats(Some(0.0320), Some(0.0330));
+        let net = derive_net_stats(&target, &floor, "fulltext-search-floor");
+        assert!(net.p50_secs.is_none());
+        let reason = net.cannot_derive_reason.expect("reason must be present");
+        assert!(reason.contains("no warm stats"), "reason: {reason}");
+    }
+
+    #[test]
+    fn test_derive_net_stats_negative_clamped() {
+        // T slower-to-start than its floor: net would be negative -> clamped to
+        // 0 and flagged, never presented as a valid negative time.
+        let target = stats(Some(0.0200), Some(0.0250));
+        let floor = stats(Some(0.0320), Some(0.0330));
+        let net = derive_net_stats(&target, &floor, "fulltext-search-floor");
+        assert_eq!(net.p50_secs, Some(0.0));
+        assert_eq!(net.p95_secs, Some(0.0));
+        assert!(net.clamped);
+        assert!(net.cannot_derive_reason.is_none());
+    }
+
+    #[test]
+    fn test_derive_net_stats_partial_clamp() {
+        // p50 above the floor but p95 below it: only the negative side clamps.
+        let target = stats(Some(0.0400), Some(0.0300));
+        let floor = stats(Some(0.0320), Some(0.0330));
+        let net = derive_net_stats(&target, &floor, "fulltext-search-floor");
+        assert_eq!(net.p50_secs, Some(0.0080));
+        assert_eq!(net.p95_secs, Some(0.0));
+        assert!(net.clamped);
+    }
+
+    #[test]
+    fn test_floor_config_validation_unknown_name_rejected() {
+        let toml = r#"
+[[target]]
+name = "floor"
+command = "true"
+args = []
+repeat = 2
+
+[[target]]
+name = "search"
+command = "true"
+args = []
+repeat = 2
+floor = "nonexistent"
+"#;
+        let result = parse_config_text(toml);
+        assert!(result.is_err(), "expected rejection, got: {:?}", result);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nonexistent"),
+            "error must name the bad reference, got: {err}"
+        );
+        assert!(err.contains("'search'"), "error must name the target, got: {err}");
+    }
+
+    #[test]
+    fn test_floor_config_validation_valid_reference_accepted() {
+        let toml = r#"
+[[target]]
+name = "floor"
+command = "true"
+args = []
+repeat = 2
+
+[[target]]
+name = "search"
+command = "true"
+args = []
+repeat = 2
+floor = "floor"
+"#;
+        let cfg = parse_config_text(toml).expect("valid floor reference must parse");
+        assert_eq!(cfg.target[1].floor.as_deref(), Some("floor"));
+    }
+
+    #[test]
+    fn test_floor_config_validation_self_reference_rejected() {
+        let toml = r#"
+[[target]]
+name = "search"
+command = "true"
+args = []
+repeat = 2
+floor = "search"
+"#;
+        let result = parse_config_text(toml);
+        assert!(result.is_err(), "self-floor must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("own floor"), "error: {err}");
+    }
+
+    #[test]
+    fn test_duplicate_target_names_rejected() {
+        // Floor references bind by name; a duplicate name would silently bind
+        // to one of the definitions, so duplicates are rejected outright.
+        let toml = r#"
+[[target]]
+name = "search"
+command = "true"
+args = []
+repeat = 2
+
+[[target]]
+name = "search"
+command = "false"
+args = []
+repeat = 2
+"#;
+        let result = parse_config_text(toml);
+        assert!(result.is_err(), "duplicate names must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("duplicate target name"), "error: {err}");
+        assert!(err.contains("'search'"), "error: {err}");
+    }
+
+    #[test]
+    fn test_floor_absent_by_default() {
+        // Legacy configs without a floor key still parse (serde default).
+        let toml = r#"
+[[target]]
+name = "legacy"
+command = "true"
+args = []
+repeat = 2
+"#;
+        let cfg = parse_config_text(toml).unwrap();
+        assert!(cfg.target[0].floor.is_none());
+    }
+
+    #[test]
+    fn test_net_stats_serialization_is_additive() {
+        // A target without a floor must serialize exactly as before: no
+        // floor/net keys appear.  A floored target adds them without touching
+        // existing fields.
+        let bare = TargetResult {
+            name: "bare".into(),
+            command: "true".into(),
+            args: vec![],
+            resolved: vec!["true".into()],
+            cold: stats(Some(0.1), Some(0.2)),
+            warm: stats(Some(0.1), Some(0.2)),
+            trials: vec![],
+            setup_ran: false,
+            setup_succeeded: true,
+            floor: None,
+            net: None,
+        };
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(!json.contains("\"floor\""), "json: {json}");
+        assert!(!json.contains("\"net\""), "json: {json}");
+        assert!(json.contains("\"setup_succeeded\":true"), "json: {json}");
+
+        let floored = TargetResult {
+            floor: Some("floor".into()),
+            net: Some(NetStats {
+                p50_secs: Some(0.0260),
+                p95_secs: Some(0.0310),
+                clamped: false,
+                cannot_derive_reason: None,
+            }),
+            ..bare
+        };
+        let json = serde_json::to_string(&floored).unwrap();
+        assert!(json.contains("\"floor\":\"floor\""), "json: {json}");
+        assert!(json.contains("\"p50_secs\":0.026"), "json: {json}");
+        assert!(json.contains("\"setup_succeeded\":true"), "json: {json}");
     }
 }

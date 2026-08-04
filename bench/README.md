@@ -255,6 +255,63 @@ This is intentional: a real-user measurement begins when they press Enter and
 ends when the prompt returns.  Treat the numbers accordingly when comparing
 with profiler-internal timings.
 
+For search targets, the measured duration also includes a **fixed cost** that
+every fresh process pays before doing any query work: process startup, tantivy
+index open, and Lindera dictionary load.  Because that fixed cost is included,
+raw times alone cannot answer "what does one keystroke cost".  The `floor`
+mechanism (next section) separates the two.
+
+#### `floor` key — separating the fixed cost
+
+A target may declare a **floor target**: another target in the same config
+whose warm p50 is treated as the fixed cost (process startup + index open +
+dictionary load).  The harness then reports the target's raw times **and**
+derived net times (raw minus the floor's warm p50):
+
+```toml
+[[target]]
+name = "fulltext-search-floor"
+command = "search"
+args = ["qzxv9floorprobe", "--index", "{workdir}/index"]
+repeat = 10
+setup = { command = "build-index", args = ["{root}", "--out", "{workdir}/index"] }
+
+[[target]]
+name = "fulltext-search"
+command = "search"
+args = ["query", "--index", "{workdir}/index"]
+repeat = 10
+setup = { command = "build-index", args = ["{root}", "--out", "{workdir}/index"] }
+floor = "fulltext-search-floor"
+```
+
+- **What the floor measures.**  The floor target runs the *same* invocation and
+  setup as the search targets (same binary, same index open), but with a query
+  string guaranteed to match nothing in the generated tree — e.g.
+  `qzxv9floorprobe`, an ASCII token `bench gen` never plants.  Its wall time is
+  therefore the fixed cost with ~zero query work: process startup + index open
+  + dictionary load.
+- **How net values are derived.**  Net warm p50/p95 = the target's raw warm
+  p50/p95 **minus the floor target's warm p50**.  Both raw and net numbers are
+  always labelled: in the Markdown summary, the `Warm p50/p95` columns are
+  marked "includes process startup + fixed cost" and the `Net p50/p95` columns
+  are marked "net of floor"; in the JSON, floored targets carry a `floor` field
+  (the referenced name) and a `net` object (`p50_secs`, `p95_secs`,
+  `clamped`).
+- **Never a silently wrong number.**  If the floor target failed or has no warm
+  stats, the net columns show `cannot derive` (JSON: `p50_secs`/`p95_secs`
+  `null` plus a `cannot_derive_reason`); if a raw value falls below the floor
+  (noisy measurement, or a floor that is not actually a floor), the negative
+  result is clamped to 0 and labelled `(clamped)` (JSON: `clamped: true`).
+- **Validation.**  A `floor` reference must name a target defined in the same
+  config and cannot be the target itself; a bad reference is rejected at load
+  time with an error naming it.
+- **GUI implication.**  Every number in this harness measures a *fresh* process
+  (the harness is an outside-in stopwatch and never reuses one).  A long-lived
+  GUI process pays the fixed cost **once** at startup, not per keystroke, so
+  the per-keystroke cost of incremental search is much closer to the **net**
+  value than to the raw value.
+
 #### Trial 0 vs warm trials
 
 - **Trial 0** is the first trial.  In the JSON output it is labelled
@@ -276,11 +333,22 @@ metadata:
 - ISO-8601 UTC timestamp
 - Resolved command line of each target
 - Tree manifest info (file count, total bytes, manifest path)
+- For targets with a `floor`: the `floor` field (referenced target name) and a
+  `net` object (`p50_secs`, `p95_secs`, `clamped`, and
+  `cannot_derive_reason` when derivation was impossible)
+
+These fields are purely **additive**: result files from older harness versions
+remain structurally identical except for the extra `floor`/`net` keys on
+floored targets.
 
 A result file that cannot answer "what was measured, on what, with which
 settings" is a defect — and this JSON always can.
 
 **Stdout**:  A Markdown table in the style of the prototypes' summary blocks.
+The `Warm p50/p95` columns are raw (include process startup + fixed cost) and
+the `Net p50/p95` columns are net of the declared floor (exclude the fixed
+cost); the footnote under the table defines every marker (—, `cannot
+derive`, `(clamped)`).
 
 #### Failure handling
 
@@ -331,11 +399,14 @@ Two pre-built configs are provided under `bench/configs/`:
 | `crawl-metadata` | `proto-crawl {root} --no-ignore --full-volume --db {workdir}/crawl.db` |
 | `crawl-hash` | Same plus `--hash` |
 | `fulltext-index` | `proto-fulltext index {root} --index-dir {workdir}/ft-index` |
-| `fulltext-search-ja` | `proto-fulltext search 全文検索 --index-dir {workdir}/ft-index` (with setup) |
-| `fulltext-search-en` | `proto-fulltext search benchmark --index-dir {workdir}/ft-index` (with setup) |
+| `fulltext-search-floor` | `proto-fulltext search qzxv9floorprobe --index-dir {workdir}/ft-index` (with setup) — the floor: same invocation, query matches nothing, so it measures the fixed cost (process startup + index open + dictionary load) |
+| `fulltext-search-ja` | `proto-fulltext search 全文検索 --index-dir {workdir}/ft-index` (with setup), `floor = "fulltext-search-floor"` |
+| `fulltext-search-en` | `proto-fulltext search benchmark --index-dir {workdir}/ft-index` (with setup), `floor = "fulltext-search-floor"` |
 
 The search terms (`全文検索`, `benchmark`) are from the planted-terms set that
 `bench gen` embeds into every generated tree, so queries are guaranteed to hit.
+The floor term (`qzxv9floorprobe`) is deliberately **not** in any pool or
+planted set, so its query is guaranteed to match nothing.
 
 ### Where the binaries must be
 
