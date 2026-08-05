@@ -3,7 +3,7 @@ name: prototypes
 # CI for prototypes/ and bench/ (see bench/README.md). Two jobs:
 #   - check: cheap correctness gate -- prototypes and bench compile and clippy
 #     is clean, on both Linux (mirrors the VM benchmark environment) and Windows.
-#   - release-windows: on a tag push (or manual dispatch) builds all three prototype
+#   - release-windows: on a tag push (or manual dispatch) builds all four prototype
 #     binaries plus bench.exe natively on a Windows runner against
 #     x86_64-pc-windows-msvc and attaches them to the matching GitHub Release.
 #     This replaces the hand-built mingw cross-compile that used to produce the
@@ -61,6 +61,16 @@ jobs:
         working-directory: prototypes
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: cargo build --release -p proto-gui (Windows only)
+        if: matrix.os == 'windows-latest'
+        working-directory: prototypes
+        run: cargo build --release -p proto-gui
+
+      - name: cargo clippy -p proto-gui (Windows only)
+        if: matrix.os == 'windows-latest'
+        working-directory: prototypes
+        run: cargo clippy -p proto-gui --all-targets -- -D warnings
+
       - name: cargo build --release (bench)
         working-directory: bench
         run: cargo build --release
@@ -101,6 +111,10 @@ jobs:
         working-directory: bench
         run: cargo build --release --target x86_64-pc-windows-msvc
 
+      - name: cargo build --release --target x86_64-pc-windows-msvc -p proto-gui
+        working-directory: prototypes
+        run: cargo build --release --target x86_64-pc-windows-msvc -p proto-gui
+
       - name: Stage binaries
         shell: bash
         working-directory: prototypes
@@ -109,6 +123,7 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/proto-crawl.exe dist/
           cp target/x86_64-pc-windows-msvc/release/proto-fulltext.exe dist/
           cp target/x86_64-pc-windows-msvc/release/proto-usn.exe dist/
+          cp target/x86_64-pc-windows-msvc/release/proto-gui.exe dist/
           cp ../bench/target/x86_64-pc-windows-msvc/release/bench.exe dist/
 
       # tag は env 経由で bash に渡す: ${{ }} を run に直書きすると、テンプレート展開が

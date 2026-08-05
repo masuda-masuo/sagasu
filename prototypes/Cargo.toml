@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["proto-crawl", "proto-fulltext", "proto-usn"]
+members = ["proto-crawl", "proto-fulltext", "proto-usn", "proto-gui-core", "proto-gui"]
+default-members = ["proto-crawl", "proto-fulltext", "proto-usn", "proto-gui-core"]
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
