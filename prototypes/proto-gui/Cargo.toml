@@ -15,5 +15,13 @@ serde_json = "1"
 proto-gui-core = { path = "../proto-gui-core" }
 tauri = { version = "2", features = [] }
 
+# We build with plain `cargo build`, not the tauri CLI. `tauri build` enables
+# tauri/custom-protocol; without that feature tauri compiles in dev mode
+# (cfg(dev)) and the window loads build.devUrl instead of the embedded
+# frontendDist assets — the shipped exe showed ERR_CONNECTION_REFUSED on
+# localhost:1420. Default it on so every cargo build embeds the assets.
+[features]
+default = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
