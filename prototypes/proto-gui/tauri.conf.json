@@ -9,6 +9,9 @@
     "beforeDevCommand": "",
     "beforeBuildCommand": ""
   },
+  "bundle": {
+    "icon": ["icons/icon.ico"]
+  },
   "app": {
     "withGlobalTauri": true,
     "windows": [
