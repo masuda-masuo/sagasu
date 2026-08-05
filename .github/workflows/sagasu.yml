@@ -1,0 +1,47 @@
+name: sagasu
+
+# CI for the production sagasu workspace (crates/sagasu-core, crates/sagasu-cli).
+# Runs `cargo test --workspace` on ubuntu and windows-latest.
+# The ubuntu job provides the Linux integration-test coverage; the windows job
+# is a compile gate for any `#[cfg(windows)]` branches (M0: fs_id stays NULL).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/sagasu-core/**"
+      - "crates/sagasu-cli/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/sagasu-core/**"
+      - "crates/sagasu-cli/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
