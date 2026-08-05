@@ -1,0 +1,19 @@
+[package]
+name = "proto-gui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "proto-gui"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = "1"
+serde_json = "1"
+proto-gui-core = { path = "../proto-gui-core" }
+tauri = { version = "2", features = [] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicedoc/tauri-docs/main/src/schemas/config.schema.json",
+  "productName": "sagasu proto-gui",
+  "version": "0.1.0",
+  "identifier": "dev.sagasu.proto-gui",
+  "build": {
+    "frontendDist": "ui",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "bundle": {
+    "icon": ["icons/icon.ico"]
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "sagasu proto-gui — M2 measurement instrument",
+        "width": 1024,
+        "height": 768
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}

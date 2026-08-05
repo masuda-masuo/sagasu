@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sagasu proto-gui — M2 measurement instrument</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; font-size: 14px; background: #1e1e2e; color: #cdd6f4; }
+  #app { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 18px; margin-bottom: 8px; color: #cba6f7; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .controls input[type="text"] { flex: 1; min-width: 200px; }
+  .controls input, .controls select, .controls button {
+    padding: 6px 10px; border: 1px solid #45475a; border-radius: 4px;
+    background: #313244; color: #cdd6f4; font-size: 14px;
+  }
+  .controls button { cursor: pointer; background: #585b70; border-color: #6c7086; }
+  .controls button:hover { background: #6c7086; }
+  #timing-panel { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 8px; margin-bottom: 12px; font-size: 13px; }
+  .timing-card { background: #313244; border: 1px solid #45475a; border-radius: 6px; padding: 8px; }
+  .timing-card .label { color: #a6adc8; font-size: 11px; text-transform: uppercase; }
+  .timing-card .value { font-size: 18px; font-weight: bold; color: #89b4fa; }
+  .timing-card .pct { font-size: 11px; color: #a6adc8; margin-top: 2px; }
+  #results { border: 1px solid #45475a; border-radius: 6px; max-height: 60vh; overflow-y: auto; }
+  .hit { padding: 6px 10px; border-bottom: 1px solid #313244; display: flex; gap: 8px; }
+  .hit .src { width: 50px; font-size: 11px; color: #a6adc8; text-transform: uppercase; }
+  .hit .path { flex: 1; word-break: break-all; }
+  .hit .score { width: 60px; text-align: right; color: #f9e2af; font-variant-numeric: tabular-nums; }
+  .empty { padding: 20px; text-align: center; color: #585b70; }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>sagasu proto-gui</h1>
+  <div class="controls">
+    <input type="text" id="query" placeholder="Enter query (fired on every keystroke)..." autofocus>
+    <select id="mode">
+      <option value="DeltaEveryQuery">Δ every query</option>
+      <option value="DeltaCached">Δ cached</option>
+      <option value="IndexOnly">index only</option>
+    </select>
+    <input type="number" id="ttl" value="5000" style="width:70px" title="Cache TTL (ms)">
+    <select id="limit">
+      <option value="10" selected>10</option>
+      <option value="100">100</option>
+      <option value="1000">1000</option>
+      <option value="10000">10000</option>
+    </select>
+    <button id="refresh">↻ refresh</button>
+    <button id="export">📤 export log</button>
+  </div>
+  <div id="timing-panel">
+    <div class="timing-card"><div class="label">search</div><div class="value" id="t-search">—</div></div>
+    <div class="timing-card"><div class="label">δ-walk</div><div class="value" id="t-delta">—</div></div>
+    <div class="timing-card"><div class="label">live-grep</div><div class="value" id="t-grep">—</div></div>
+    <div class="timing-card"><div class="label">merge</div><div class="value" id="t-merge">—</div></div>
+    <div class="timing-card"><div class="label">total server</div><div class="value" id="t-total">—</div></div>
+    <div class="timing-card"><div class="label">IPC</div><div class="value" id="t-ipc">—</div></div>
+    <div class="timing-card"><div class="label">render</div><div class="value" id="t-render">—</div></div>
+    <div class="timing-card"><div class="label">total client</div><div class="value" id="t-client">—</div></div>
+  </div>
+  <div id="results"><div class="empty">Type a query to begin.</div></div>
+</div>
+
+<script>
+const { invoke } = window.__TAURI__.core;
+
+let queryId = 0;
+const stats = { search: [], delta: [], grep: [], merge: [], total: [], ipc: [], render: [] };
+const WINDOW = 100;
+
+function pct(arr) {
+  const n = arr.length;
+  if (n === 0) return [NaN, NaN];
+  const s = [...arr].sort((a, b) => a - b);
+  const rank = (p) => { const r = (p / 100) * (n - 1); const lo = Math.floor(r), hi = Math.ceil(r);
+    return lo === hi ? s[lo] : s[lo] + (r - lo) * (s[hi] - s[lo]); };
+  return [rank(50), rank(95)];
+}
+
+function fmt(v) { return isNaN(v) ? '—' : v.toFixed(1); }
+
+async function doSearch() {
+  const myId = ++queryId;
+  const q = document.getElementById('query').value;
+  if (!q) { document.getElementById('results').innerHTML = '<div class="empty">Type a query to begin.</div>'; return; }
+
+  const mode = document.getElementById('mode').value;
+  const ttl = parseInt(document.getElementById('ttl').value) || 5000;
+  const limit = parseInt(document.getElementById('limit').value) || 10;
+
+  const t0 = performance.now();
+  let resp;
+  try {
+    resp = await invoke('search', { query: q, limit, mode, ttlMs: ttl, maxSize: 2 * 1024 * 1024 });
+  } catch (e) {
+    if (myId !== queryId) return;
+    document.getElementById('results').innerHTML = `<div class="empty">error: ${e}</div>`;
+    return;
+  }
+  // IPC = webview round-trip overhead, i.e. wall-clock minus server-side total.
+  const ipcMs = (performance.now() - t0) - resp.timings.total_ms;
+
+  // stale-query guard: superseded queries still record their IPC cost
+  // (render_ms 0 marks "never rendered"), but must not touch the DOM.
+  if (myId !== queryId) {
+    invoke('record_client_timing', { recordId: resp.record_id, ipcMs, renderMs: 0 }).catch(() => {});
+    return;
+  }
+
+  // render results
+  const tRender0 = performance.now();
+  const resultsEl = document.getElementById('results');
+  if (resp.hits.length === 0) {
+    resultsEl.innerHTML = '<div class="empty">no results</div>';
+  } else {
+    let html = '';
+    for (const h of resp.hits) {
+      html += `<div class="hit"><span class="src">${h.source}</span><span class="path">${h.path}</span><span class="score">${h.score_or_count.toFixed(3)}</span></div>`;
+    }
+    resultsEl.innerHTML = html;
+  }
+
+  // measure render via double rAF, then record client timings
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      const renderMs = performance.now() - tRender0;
+
+      // Patch timings on the server response for display.
+      resp.timings.ipc_ms = ipcMs;
+      resp.timings.render_ms = renderMs;
+
+      // Record client timings for JSONL export.
+      invoke('record_client_timing', { recordId: resp.record_id, ipcMs, renderMs }).catch(() => {});
+
+      // Update timing display
+      updateTiming(resp);
+    });
+  });
+}
+
+function updateTiming(resp) {
+  const t = resp.timings;
+  document.getElementById('t-search').textContent = fmt(t.search_ms) + 'ms';
+  document.getElementById('t-delta').textContent = fmt(t.delta_walk_ms) + 'ms';
+  document.getElementById('t-grep').textContent = fmt(t.live_grep_ms) + 'ms';
+  document.getElementById('t-merge').textContent = fmt(t.merge_ms) + 'ms';
+  document.getElementById('t-total').textContent = fmt(t.total_ms) + 'ms';
+  document.getElementById('t-ipc').textContent = fmt(t.ipc_ms) + 'ms';
+  document.getElementById('t-render').textContent = fmt(t.render_ms) + 'ms';
+  document.getElementById('t-client').textContent = fmt(t.total_ms + t.ipc_ms + t.render_ms) + 'ms';
+
+  // update rolling stats
+  pushStats('search', t.search_ms);
+  pushStats('delta', t.delta_walk_ms);
+  pushStats('grep', t.live_grep_ms);
+  pushStats('merge', t.merge_ms);
+  pushStats('total', t.total_ms);
+  pushStats('ipc', t.ipc_ms);
+  pushStats('render', t.render_ms);
+  updatePctCards();
+}
+
+function pushStats(key, v) {
+  if (stats[key].length >= WINDOW) stats[key].shift();
+  stats[key].push(v);
+}
+
+function updatePctCards() {
+  for (const [key, arr] of Object.entries(stats)) {
+    const [p50, p95] = pct(arr);
+    const el = document.getElementById('t-' + key);
+    const card = el ? el.parentElement : null;
+    if (card) {
+      let pctEl = card.querySelector('.pct');
+      if (!pctEl) { pctEl = document.createElement('div'); pctEl.className = 'pct'; card.appendChild(pctEl); }
+      pctEl.textContent = `p50 ${fmt(p50)}ms / p95 ${fmt(p95)}ms`;
+    }
+  }
+}
+
+document.getElementById('query').addEventListener('input', doSearch);
+document.getElementById('mode').addEventListener('change', doSearch);
+document.getElementById('ttl').addEventListener('change', doSearch);
+document.getElementById('limit').addEventListener('change', doSearch);
+
+document.getElementById('refresh').addEventListener('click', async () => {
+  await invoke('refresh_delta');
+  doSearch();
+});
+
+document.getElementById('export').addEventListener('click', async () => {
+  const path = prompt('Export path:', 'proto-gui-log.jsonl');
+  if (path) { await invoke('export_log', { path }); alert('Exported to ' + path); }
+});
+</script>
+</body>
+</html>
