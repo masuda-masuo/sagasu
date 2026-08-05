@@ -181,7 +181,8 @@ fn move_to_different_dir_keeps_file_id() {
         )
         .unwrap();
     assert_eq!(new_id, old_id, "file_id must survive move");
-    assert!(path.contains("other/movable.txt"));
+    assert!(std::path::Path::new(&path)
+        .ends_with(std::path::Path::new("other").join("movable.txt")));
 }
 
 // ── 4. Size+mtime fallback when fs_id is NULL ──────────────────────────────
@@ -730,6 +731,10 @@ fn venv_excluded() {
 
 // ── 26. Rename + content modification → changed, hash nulled (fs_id path) ──
 
+// fs_id-dependent: without fs_id (Windows M0) a rename+modify legitimately
+// becomes add+delete — that path is covered by
+// `rename_with_content_change_fs_id_null_is_new_file`.
+#[cfg(unix)]
 #[test]
 fn rename_with_content_change_counts_as_changed_and_nulls_hash() {
     let (d, db) = tmp_dir("ren_mod");
