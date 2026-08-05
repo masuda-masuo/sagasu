@@ -1,0 +1,11 @@
+[package]
+name = "sagasu-core"
+version = "0.1.0"
+edition = "2021"
+description = "sagasu core library: parallel metadata crawl, SQLite index, rescan diff"
+
+[dependencies]
+anyhow = { workspace = true }
+ignore = { workspace = true }
+rusqlite = { workspace = true }
+blake3 = { workspace = true }

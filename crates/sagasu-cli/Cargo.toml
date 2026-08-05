@@ -1,0 +1,14 @@
+[package]
+name = "sagasu-cli"
+version = "0.1.0"
+edition = "2021"
+description = "sagasu CLI: index, hash, status"
+
+[[bin]]
+name = "sagasu"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+sagasu-core = { path = "../sagasu-core" }
