@@ -15,11 +15,20 @@
 //! - [`fresh`]: the delta merge — the index result overlaid with a live scan of
 //!   whatever changed since the marker, so a stale index still gives a fresh
 //!   answer (design.md §5).
+//! - [`tags`]: the rule-based semantic layer — a *pure* generator of
+//!   deterministic `namespace:value` tags from format, path and naming
+//!   conventions (design.md §6).
+//! - [`tagindex`]: the stateful half of that layer — building it into SQLite,
+//!   measuring its coverage, and querying it back.
+//! - [`tagrules`]: the declarative user rule file that feeds [`tags`].
 
 pub mod delta;
 pub mod fresh;
 pub mod fulltext;
 pub mod store;
+pub mod tagindex;
+pub mod tagrules;
+pub mod tags;
 pub mod text;
 #[cfg(windows)]
 pub mod usn;
@@ -29,4 +38,7 @@ pub use delta::{DeltaCache, DeltaSet, DeltaSource, DeltaStatus, ScanMarker};
 pub use fresh::{FreshConfig, FreshHit, FreshOutcome};
 pub use fulltext::{FulltextConfig, FulltextSummary, SearchConfig, SearchHit, SearchOutcome};
 pub use store::Store;
+pub use tagindex::{TagConfig, TagSummary};
+pub use tagrules::RuleSet;
+pub use tags::{Tag, TagSet, TagSource};
 pub use walk::{crawl, hash_backfill, CrawlConfig, CrawlSummary, ExcludeSet, HashSummary};

@@ -1,0 +1,76 @@
+# sagasu タグルールの例
+#
+#   sagasu tag --db index.db --rules docs/examples/sagasu-tags.toml
+#
+# `--rules` を省略すると、カレントディレクトリの `sagasu-tags.toml` が
+# 使われる(見つかったかどうかは実行時に必ず表示される)。
+#
+# 規則:
+#   - 1つのルール内の条件(`path` / `file` / `ext`)は AND
+#   - ルール間は順不同。ファイルはマッチした全ルールのタグの和集合を受け取る
+#   - glob は大文字小文字を区別せず、パスは常にルート相対・'/' 区切り
+#   - 詳細は docs/tag_rules.md
+
+# ── 案件・プロジェクト ──────────────────────────────────────────────────
+[[rule]]
+name = "顧客案件"
+path = "clients/**"
+tags = ["project:client-work"]
+
+[[rule]]
+name = "acme 案件"
+path = "clients/acme/**"
+tags = ["client:acme", "billing:billable"]
+
+[[rule]]
+name = "社内プロジェクト"
+path = "projects/*/**"
+tags = ["project:internal"]
+
+# ── 作成者 ───────────────────────────────────────────────────────────────
+# 埋め込みメタデータ(Office プロパティ / PDF info)からの `author:` は未実装。
+# それまでは、置き場所が作成者を表しているならこの形で書ける。
+[[rule]]
+name = "masuda の作業ディレクトリ"
+path = "**/masuda/**"
+tags = ["author:masuda"]
+
+# ── 部門・保存義務 ───────────────────────────────────────────────────────
+[[rule]]
+name = "経理の証憑"
+path = "**/keiri/**"
+ext  = ["pdf", "xlsx", "xls", "csv"]
+tags = ["dept:accounting", "retention:7y"]
+
+[[rule]]
+name = "人事"
+path = "**/{jinji,人事}/**"
+tags = ["dept:hr", "confidential:yes"]
+
+# ── 文書の種類 ───────────────────────────────────────────────────────────
+[[rule]]
+name = "契約書"
+path = "**/{contracts,契約}/**"
+tags = ["doc-type:contract", "confidential:yes"]
+
+[[rule]]
+name = "請求書"
+file = "*{invoice,請求}*"
+tags = ["doc-type:invoice"]
+
+[[rule]]
+name = "議事録"
+file = "*{minutes,議事録}*"
+tags = ["doc-type:minutes"]
+
+# ── アプリケーション ─────────────────────────────────────────────────────
+[[rule]]
+name = "Photoshop 作業ファイル"
+file = "*.psd"
+tags = ["app:photoshop", "stage:working"]
+
+[[rule]]
+name = "書き出し済み素材"
+path = "**/export/**"
+ext  = ["png", "jpg", "jpeg", "pdf"]
+tags = ["stage:delivered"]

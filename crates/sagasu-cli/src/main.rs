@@ -7,12 +7,15 @@
 //!   (Lindera) full-text index.
 //! - `search`:   keyword search over the full-text index, score-ordered.
 //! - `find`:     path search over the metadata index.
+//! - `tag`:      generate the rule-based semantic tag layer (design.md §6).
+//! - `tags`:     browse tags, filter files by them, explain one file's tags.
 //! - `status`:   print index statistics.
 //!
-//! The pipeline order is `index` → (`hash`) → `fulltext` → `search`:
-//! `fulltext` reads the live rows of the metadata index rather than walking the
-//! filesystem again, so both stages share one exclusion set and one set of
-//! stable file IDs.
+//! The pipeline order is `index` → (`hash`) → `fulltext` → `search`, with `tag`
+//! hanging off `index` as an independent stage (`index` → `tag` → `tags`):
+//! `fulltext` and `tag` both read the live rows of the metadata index rather
+//! than walking the filesystem again, so every stage shares one exclusion set
+//! and one set of stable file IDs.
 //!
 //! ## Freshness
 //!
@@ -35,6 +38,8 @@ use sagasu_core::fresh::{self, FreshConfig, FreshOutcome, HitOrigin};
 use sagasu_core::fulltext::{self, FulltextConfig, SearchConfig};
 use sagasu_core::{self, CrawlConfig, Store};
 
+mod tag;
+
 #[derive(Parser)]
 #[command(name = "sagasu", about = "Local file search engine")]
 struct Cli {
@@ -54,6 +59,10 @@ enum Command {
     Search(SearchArgs),
     /// Find files by path substring over the metadata index.
     Find(FindArgs),
+    /// Generate the rule-based semantic tag layer over the metadata index.
+    Tag(tag::TagArgs),
+    /// Browse tags, filter files by them, or explain one file's tags.
+    Tags(tag::TagsArgs),
     /// Print index statistics.
     Status(StatusArgs),
 }
@@ -624,6 +633,30 @@ fn cmd_status(args: StatusArgs) -> Result<()> {
         None => println!("full-text index: (not built)"),
     }
 
+    // Tag layer state. Same reasoning as the full-text index above: a tag layer
+    // built two crawls ago answers as if the files added since do not exist,
+    // and nothing else in the output would reveal that.
+    match stats.tag_scan_generation {
+        Some(tag_gen) => {
+            println!("tags           : {} rows", stats.tag_rows);
+            println!("  tagged files : {}", stats.tag_files.unwrap_or(0));
+            println!("  distinct     : {}", stats.distinct_tags);
+            let behind = stats.scan_generation - tag_gen;
+            if behind > 0 {
+                println!(
+                    "  built at gen : {tag_gen} ({behind} scan(s) behind — re-run `sagasu tag`)"
+                );
+            } else {
+                println!("  built at gen : {tag_gen} (current)");
+            }
+            match stats.tag_rules.as_deref() {
+                Some(rules) if !rules.is_empty() => println!("  rules        : {rules}"),
+                _ => println!("  rules        : (none)"),
+            }
+        }
+        None => println!("tags           : (not built)"),
+    }
+
     Ok(())
 }
 
@@ -638,6 +671,8 @@ fn main() {
         Command::Fulltext(args) => cmd_fulltext(args),
         Command::Search(args) => cmd_search(args),
         Command::Find(args) => cmd_find(args),
+        Command::Tag(args) => tag::cmd_tag(args),
+        Command::Tags(args) => tag::cmd_tags(args),
         Command::Status(args) => cmd_status(args),
     };
 
