@@ -50,8 +50,13 @@ pub struct TagConfig {
     /// User rule file. `None` = built-in generators only.
     pub rules_path: Option<PathBuf>,
     /// Read the leading bytes of files whose `magic` column is still NULL.
+    ///
+    /// On by default ([`TagConfig::new`]). `magic` is nulled whenever a crawl
+    /// sees a content change, so a build that does not re-read it silently
+    /// demotes `format:` back to an extension guess for exactly the files that
+    /// were most recently worked on.
     pub read_magic: bool,
-    /// Skip `--read-magic` for files larger than this. Reading the head of a
+    /// Skip the head read for files larger than this. Reading the head of a
     /// huge file is cheap, but seeking into a cold archive is not free either.
     pub magic_max_size: u64,
 }
@@ -62,7 +67,7 @@ impl TagConfig {
         Self {
             db_path: db_path.into(),
             rules_path: None,
-            read_magic: false,
+            read_magic: true,
             magic_max_size: u64::MAX,
         }
     }
@@ -100,9 +105,9 @@ pub struct TagSummary {
     /// the extension alone. Reported because "the format axis is weaker than it
     /// looks" is exactly the kind of gap that must not stay invisible.
     pub magic_missing: u64,
-    /// Files whose leading bytes this pass read (`--read-magic`).
+    /// Files whose leading bytes this pass read.
     pub magic_read: u64,
-    /// Files `--read-magic` could not open.
+    /// Files the head read could not open.
     pub magic_unreadable: u64,
     /// Files that hit [`tags::MAX_TAGS_PER_FILE`].
     pub capped: u64,

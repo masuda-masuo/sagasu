@@ -66,6 +66,12 @@ fn tag(db_dir: &Path, read_magic: bool) -> tagindex::TagSummary {
     .unwrap()
 }
 
+/// A build with the *documented defaults* — what `sagasu tag` with no flags
+/// does. Tests that go through here are testing the path users actually take.
+fn tag_default(db_dir: &Path) -> tagindex::TagSummary {
+    tagindex::build(&TagConfig::new(db_path(db_dir))).unwrap()
+}
+
 fn tag_with_rules(db_dir: &Path, rules: &Path, read_magic: bool) -> tagindex::TagSummary {
     tagindex::build(&TagConfig {
         db_path: db_path(db_dir),
@@ -163,6 +169,49 @@ fn editing_a_files_content_does_not_disturb_its_tags() {
     tag(&db, true);
 
     assert_eq!(before, snapshot(&d, &db));
+}
+
+#[test]
+fn editing_a_files_content_does_not_disturb_its_tags_on_the_default_path() {
+    let (d, db) = tmp_dirs("edit_default");
+    build_corpus(&d);
+    // A real PNG in a file called `.jpg`: `format:png` plus the anomaly is the
+    // *correct* answer, and it is only reachable from the file's bytes.
+    let png = |trailer: &str| {
+        let mut b = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01".to_vec();
+        b.extend_from_slice(trailer.as_bytes());
+        b
+    };
+    write_bytes(&d, "docs/photo.jpg", &png(""));
+
+    crawl(&d, &db);
+    tag_default(&db);
+    let before = snapshot(&d, &db);
+    assert!(
+        before["docs/photo.jpg"].contains(&"format:png".to_string())
+            && before["docs/photo.jpg"].contains(&"anomaly:format-mismatch".to_string()),
+        "the default build must read content, not trust the extension: {:?}",
+        before["docs/photo.jpg"]
+    );
+
+    // Edit the content. The crawl nulls `magic` on a change, so a build that
+    // does not re-read it falls back to the extension — and the correct
+    // `format:png` + `anomaly:format-mismatch` silently becomes a wrong
+    // `format:jpg`. Nothing the engine actually looks at has changed.
+    write_bytes(&d, "docs/photo.jpg", &png("more pixels here"));
+    write(
+        &d,
+        "clients/beta/notes.txt",
+        "hello, a good deal more text now",
+    );
+    crawl(&d, &db);
+    tag_default(&db);
+
+    assert_eq!(
+        before,
+        snapshot(&d, &db),
+        "a content edit must not move a single tag on the default path"
+    );
 }
 
 #[test]

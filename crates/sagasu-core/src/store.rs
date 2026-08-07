@@ -600,7 +600,7 @@ impl Store {
     ///
     /// The tag engine needs the leading bytes to identify a format, but not the
     /// content hash — reading 512 bytes is orders of magnitude cheaper than
-    /// hashing the file, so `sagasu tag --read-magic` backfills just this column
+    /// hashing the file, so `sagasu tag` backfills just this column by default
     /// rather than forcing a full `sagasu hash` pass first. `blake3 IS NULL`
     /// still means "not hashed", so a later `sagasu hash` picks the file up
     /// exactly as before.

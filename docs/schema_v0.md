@@ -81,7 +81,7 @@ database carrying structures it never wrote.
 |--------|------|----------------|
 | `file_id` | `INTEGER PK AUTOINCREMENT` | Stable, never-reused identifier. Survives rename/move; persists after deletion (tombstone). |
 | `blake3` | `BLOB NULL` | `NULL` = not yet computed. Non-`NULL` = BLAKE3 hash (32 bytes). Filled only by `sagasu hash`. |
-| `magic` | `BLOB NULL` | `NULL` = not yet read. Non-`NULL` = first 512 bytes of file content. Filled by `sagasu hash`, or by `sagasu tag --read-magic` (which reads only those 512 bytes and leaves `blake3` NULL, so a later `hash` still picks the file up). |
+| `magic` | `BLOB NULL` | `NULL` = not yet read. Non-`NULL` = first 512 bytes of file content. Filled by `sagasu hash`, or by `sagasu tag` (which by default reads only those 512 bytes and leaves `blake3` NULL, so a later `hash` still picks the file up). |
 | `fs_id` | `BLOB NULL` | Platform file identity. Unix: 16-byte `(dev_be, ino_be)`. Windows M0: `NULL`. Primary key for rename/move detection. |
 
 ## `meta` keys
@@ -191,7 +191,7 @@ Deleted files become tombstones (`deleted_at` set to the scan generation in whic
 - `deleted_at IS NULL` → file is live.
 - `deleted_at IS NOT NULL` → file was deleted (tombstone).
 
-Crawl (`sagasu index`) never opens files, so `blake3` and `magic` are always `NULL` immediately after indexing. Content hashes are backfilled by `sagasu hash`; `magic` alone can also be backfilled by `sagasu tag --read-magic`, which is what the `format:` tag axis is built on.
+Crawl (`sagasu index`) never opens files, so `blake3` and `magic` are always `NULL` immediately after indexing. Content hashes are backfilled by `sagasu hash`; `magic` alone is also backfilled by `sagasu tag`, which does so by default because the `format:` tag axis is built on it.
 
 ## Database placement
 

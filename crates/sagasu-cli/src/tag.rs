@@ -31,13 +31,19 @@ pub struct TagArgs {
     #[arg(long)]
     rules: Option<PathBuf>,
 
-    /// Read the first 512 bytes of files whose `magic` column is still NULL, so
-    /// format tags come from content rather than from the extension alone.
-    /// The bytes are stored, so the next pass needs no I/O.
+    /// Do **not** read the leading bytes of files whose `magic` column is NULL.
+    ///
+    /// Reading them is the default: `format:` is otherwise the extension's own
+    /// word for itself, and — worse — a file whose content was edited since the
+    /// last crawl has had `magic` nulled, so the default would *lose* a correct
+    /// `format:png` + `anomaly:format-mismatch` and replace it with a wrong
+    /// `format:jpg`. 512 bytes per file is cheap enough (measured at 1.85s →
+    /// 3.65s over 63,901 files) that paying it always beats being quietly wrong.
     #[arg(long)]
-    read_magic: bool,
+    no_read_magic: bool,
 
-    /// With `--read-magic`, skip files larger than this (bytes).
+    /// Unless `--no-read-magic`, skip reading the head of files larger than
+    /// this (bytes).
     #[arg(long, default_value_t = u64::MAX)]
     magic_max_size: u64,
 }
@@ -80,7 +86,7 @@ pub fn cmd_tag(args: TagArgs) -> Result<()> {
     let config = TagConfig {
         db_path: args.db,
         rules_path,
-        read_magic: args.read_magic,
+        read_magic: !args.no_read_magic,
         magic_max_size: args.magic_max_size,
     };
 
@@ -114,7 +120,11 @@ pub fn cmd_tag(args: TagArgs) -> Result<()> {
         summary.magic_present, summary.magic_missing, summary.magic_read, summary.magic_unreadable
     );
     if summary.magic_missing > 0 && !config.read_magic {
-        println!("               (run `sagasu tag --read-magic`, or `sagasu hash`, to fill them)");
+        println!(
+            "               (--no-read-magic was passed: `format:` is the extension's \
+             own word for itself, and a file edited since the last crawl has lost \
+             the bytes that contradicted it)"
+        );
     }
 
     // A cap that is only visible as "N files were capped" is a silent omission
