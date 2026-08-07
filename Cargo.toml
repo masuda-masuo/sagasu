@@ -9,6 +9,9 @@ anyhow = "1"
 ignore = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
+tantivy = "0.25"
+lindera = "4"
+lindera-tantivy = { version = "4.0", features = ["embed-ipadic"] }
 
 [profile.release]
 lto = "thin"

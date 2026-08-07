@@ -2,3 +2,5 @@
 *.db
 *.db-wal
 *.db-shm
+# Default --index-dir of `sagasu fulltext`
+/fulltext-index/
