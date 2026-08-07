@@ -63,6 +63,11 @@ pub struct SearchArgs {
     /// edit to such a file drops out of the result instead of being refreshed.
     #[arg(long = "ext")]
     ext: Vec<String>,
+
+    /// Text config file for the live scan (default: ./sagasu-text.toml when
+    /// present). Same reasoning as `--ext`: it must match the build.
+    #[arg(long = "text-config")]
+    text_config: Option<PathBuf>,
 }
 
 pub fn cmd_search(args: SearchArgs) -> Result<()> {
@@ -85,7 +90,7 @@ pub fn cmd_search(args: SearchArgs) -> Result<()> {
         no_delta: args.no_fresh,
         snippet_chars: args.snippet_chars,
         max_size: fulltext::DEFAULT_MAX_SIZE,
-        extra_exts: args.ext.clone(),
+        text_policy: crate::index::load_text_policy(args.text_config.as_deref(), &args.ext)?,
     };
 
     // One query per process: a cache would only ever miss. `DeltaCache` is for

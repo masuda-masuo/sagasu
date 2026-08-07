@@ -453,7 +453,7 @@ fn the_live_grep_uses_the_same_extension_policy_as_the_index_build() {
     let mut build = FulltextConfig::new(db_path(&db), &ft);
     build.heap_bytes = 16 * 1024 * 1024;
     build.threads = 2;
-    build.extra_exts = vec!["obj".to_string()];
+    build.text_policy.add_text_exts(&["obj".to_string()]);
     fulltext::build(&build).unwrap();
     tick();
 
@@ -467,7 +467,7 @@ fn the_live_grep_uses_the_same_extension_policy_as_the_index_build() {
 
     // Told the same thing the build was told, the live side refreshes it.
     let mut aware = search_config(&db, &ft, "索引");
-    aware.extra_exts = vec!["obj".to_string()];
+    aware.text_policy.add_text_exts(&["obj".to_string()]);
     let aware = fresh::search(&aware, None).unwrap();
     assert_eq!(names(&aware), vec!["custom.obj".to_string()]);
     assert_eq!(aware.hits[0].origin, HitOrigin::Live);

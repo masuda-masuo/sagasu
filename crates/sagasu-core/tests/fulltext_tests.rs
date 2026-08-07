@@ -72,7 +72,7 @@ fn ft_config(db_dir: &Path, index_dir: &Path) -> FulltextConfig {
         db_path: db_path(db_dir),
         index_dir: index_dir.to_path_buf(),
         max_size: fulltext::DEFAULT_MAX_SIZE,
-        extra_exts: vec![],
+        text_policy: Default::default(),
         no_sniff: false,
         threads: 2,
         heap_bytes: 16 * 1024 * 1024,
@@ -622,7 +622,7 @@ fn extra_extensions_extend_the_allowlist() {
     );
 
     let mut config = ft_config(&db, &index);
-    config.extra_exts = vec!["obj".to_string()];
+    config.text_policy.add_text_exts(&["obj".to_string()]);
     let extended = fulltext::build(&config).unwrap();
     assert_eq!(extended.indexed, 1, "--ext must win over the denylist");
     assert_eq!(
@@ -799,4 +799,100 @@ fn summary_reports_text_and_index_sizes() {
         "the index directory should have a size"
     );
     assert!(summary.elapsed_secs >= 0.0);
+}
+
+// ── 27. A plain-text file off the allowlist still gets indexed (#15) ───────
+
+#[test]
+fn plain_text_off_the_allowlist_is_indexed_by_sniffing_not_dropped() {
+    let (data, db, index) = tmp_dirs("off_allowlist");
+    // `mjs` used to be missing from a shorter allowlist and 41 files vanished
+    // without a word (issue #15). It is on the list now, so it is accepted
+    // without opening the file…
+    write_file(&data, "app.mjs", "export const 見出し = 'タラバガニ';\n");
+    // …and the extensions nobody thought of are still indexed, because the
+    // extension is an entrance and the content is the decision.
+    write_file(&data, "page.tmpl", "{{ タラバガニ }}\n");
+    write_file(&data, "Makefile", "all:\n\techo タラバガニ\n");
+
+    let summary = index_all(&data, &db, &index);
+    assert_eq!(summary.indexed, 3, "{:?}", summary.skipped);
+    assert_eq!(summary.accepted_by_ext, 1, "only .mjs is on the allowlist");
+    assert_eq!(summary.accepted_by_sniff, 2);
+    assert!(summary.skipped.is_empty(), "{:?}", summary.skipped);
+
+    // Asserted through the document count rather than a query: whether these
+    // three files got a *body* is the claim issue #15 is about, and the
+    // Lindera-dependent query path is already covered by the tests above.
+    assert_eq!(search(&index, "タラバガニ").total_docs, 3);
+}
+
+// ── 28. The skip report names the extensions behind it (#15) ──────────────
+
+#[test]
+fn format_skips_are_broken_down_by_extension() {
+    let (data, db, index) = tmp_dirs("skip_breakdown");
+    write_file(&data, "keep.md", "本文\n");
+    for n in 0..3 {
+        write_bytes(&data, &format!("a{n}.pdf"), b"%PDF-1.7 not really");
+    }
+    write_bytes(&data, "photo.png", b"\x89PNG\r\n\x1a\n");
+    write_bytes(&data, "blob", &[0x00, 0x01, 0x02, 0xFF]);
+
+    let summary = index_all(&data, &db, &index);
+    assert_eq!(summary.indexed, 1);
+    assert_eq!(summary.skipped_total(), 5);
+
+    // "5 files skipped" is not actionable; ".pdf: 3" is. Most frequent first,
+    // ties by extension, and `""` for a file with no extension at all.
+    assert_eq!(
+        summary.skipped_exts,
+        vec![
+            ("pdf".to_string(), 3),
+            (String::new(), 1),
+            ("png".to_string(), 1),
+        ]
+    );
+}
+
+// ── 29. A text config file extends the lists the same way --ext does (#15) ─
+
+#[test]
+fn a_text_config_file_extends_the_allowlist() {
+    use sagasu_core::text::TextPolicy;
+
+    let (data, db, index) = tmp_dirs("text_config");
+    // `.obj` is denylisted and `.dat` is unknown-and-binary-looking; the config
+    // file has to be able to move both.
+    write_bytes(&data, "model.obj", "v 0.0\n# タラバガニ\n".as_bytes());
+    write_file(&data, "notes.dat", "タラバガニのメモ\n");
+    crawl(&data, &db);
+
+    let config_path = db.join("sagasu-text.toml");
+    fs::write(
+        &config_path,
+        "text_ext   = [\"obj\"]\nbinary_ext = [\"dat\"]\n",
+    )
+    .unwrap();
+
+    let mut config = ft_config(&db, &index);
+    config.text_policy = TextPolicy::load(&config_path).unwrap();
+    let summary = fulltext::build(&config).unwrap();
+
+    assert_eq!(
+        summary.indexed, 1,
+        "the config moved .obj onto the allowlist"
+    );
+    assert_eq!(summary.accepted_by_ext, 1);
+    assert_eq!(
+        summary.skipped.get(&SkipReason::UnsupportedExt).copied(),
+        Some(1),
+        "the config moved .dat onto the denylist: {:?}",
+        summary.skipped
+    );
+    assert_eq!(search(&index, "タラバガニ").total_docs, 1);
+    assert!(
+        config.text_policy.digest().is_some(),
+        "the file is digested"
+    );
 }

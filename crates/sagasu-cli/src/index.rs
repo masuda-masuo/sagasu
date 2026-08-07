@@ -15,11 +15,15 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use sagasu_core::fulltext::{self, FulltextConfig};
+use sagasu_core::text::{TextPolicy, DEFAULT_TEXT_CONFIG_FILE};
 use sagasu_core::walk::{ExcludeSet, HiddenPolicy};
 use sagasu_core::CrawlConfig;
 
 use crate::output::mib;
 use crate::DEFAULT_INDEX_DIR;
+
+/// How many entries of the skipped-extension breakdown to print.
+const SKIPPED_EXT_ROWS: usize = 8;
 
 // ── index ───────────────────────────────────────────────────────────────────
 
@@ -219,6 +223,11 @@ pub struct FulltextArgs {
     #[arg(long = "ext")]
     ext: Vec<String>,
 
+    /// Text config file extending the extension lists (default:
+    /// ./sagasu-text.toml when present).
+    #[arg(long = "text-config")]
+    text_config: Option<PathBuf>,
+
     /// Only trust the extension allowlist; do not sniff unknown formats.
     #[arg(long)]
     no_sniff: bool,
@@ -232,16 +241,37 @@ pub struct FulltextArgs {
     heap_mb: u64,
 }
 
+/// Assemble the extension policy from the config file and the `--ext` flags.
+///
+/// The command line is applied last so it wins over the file. `explicit` is an
+/// error when missing (the user named it); the default file is only used when
+/// it exists, because "no config" is the normal case, not a mistake.
+pub(crate) fn load_text_policy(explicit: Option<&Path>, exts: &[String]) -> Result<TextPolicy> {
+    let mut policy = match explicit {
+        Some(path) => TextPolicy::load(path)?,
+        None if Path::new(DEFAULT_TEXT_CONFIG_FILE).is_file() => {
+            TextPolicy::load(DEFAULT_TEXT_CONFIG_FILE)?
+        }
+        None => TextPolicy::empty(),
+    };
+    policy.add_text_exts(exts);
+    Ok(policy)
+}
+
 pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
+    let text_policy = load_text_policy(args.text_config.as_deref(), &args.ext)?;
+
     let config = FulltextConfig {
         db_path: args.db,
         index_dir: args.index_dir,
         max_size: args.max_size,
-        extra_exts: args.ext,
+        text_policy,
         no_sniff: args.no_sniff,
         threads: args.threads,
         heap_bytes: (args.heap_mb as usize) * 1024 * 1024,
     };
+
+    print_text_policy(&config.text_policy);
 
     let summary = fulltext::build(&config)?;
 
@@ -256,6 +286,27 @@ pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
         println!("skipped      : {}", summary.skipped_total());
         for (reason, count) in &summary.skipped {
             println!("  {}: {count}", reason.as_str());
+        }
+    }
+
+    // …and the format skips are broken down by extension, because that is the
+    // form the user can act on: `--ext mjs`, or a line in the text config.
+    if !summary.skipped_exts.is_empty() {
+        println!("  by extension:");
+        for (ext, count) in summary.skipped_exts.iter().take(SKIPPED_EXT_ROWS) {
+            let label = if ext.is_empty() {
+                "(no extension)".to_string()
+            } else {
+                format!(".{ext}")
+            };
+            println!("    {label}: {count}");
+        }
+        let shown = SKIPPED_EXT_ROWS.min(summary.skipped_exts.len());
+        if summary.skipped_exts.len() > shown {
+            println!(
+                "    ({} more extension(s))",
+                summary.skipped_exts.len() - shown
+            );
         }
     }
 
@@ -287,4 +338,22 @@ pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Say which extension policy the build ran under.
+///
+/// Printed even when it is empty. The lists are the reason a file is or is not
+/// in the index, and "I added `.tmpl` to a config file the tool never read" is
+/// otherwise indistinguishable from "sagasu ignored my `.tmpl` files".
+fn print_text_policy(policy: &TextPolicy) {
+    match policy.source() {
+        Some(path) => println!("text config  : {}", path.display()),
+        None => println!("text config  : (none)"),
+    }
+    if !policy.text_exts().is_empty() {
+        println!("  +text      : {}", policy.text_exts().join(", "));
+    }
+    if !policy.binary_exts().is_empty() {
+        println!("  +binary    : {}", policy.binary_exts().join(", "));
+    }
 }

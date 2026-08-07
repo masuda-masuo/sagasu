@@ -87,13 +87,14 @@ pub struct FreshConfig {
     pub snippet_chars: usize,
     /// Body-extraction size limit for the live grep ([`search`] only).
     pub max_size: u64,
-    /// Extra extensions the live grep treats as text ([`search`] only).
+    /// The extension policy the live grep judges changed files by ([`search`]
+    /// only).
     ///
-    /// Must match what `sagasu fulltext --ext` was built with. If the index
-    /// contains `.foo` files because the user asked for them, but the live grep
-    /// does not know about `.foo`, then editing one makes it vanish from the
-    /// result: the index hit is dropped as changed and no live hit replaces it.
-    pub extra_exts: Vec<String>,
+    /// Must match what `sagasu fulltext` was built with. If the index contains
+    /// `.foo` files because the user asked for them, but the live grep does not
+    /// know about `.foo`, then editing one makes it vanish from the result: the
+    /// index hit is dropped as changed and no live hit replaces it.
+    pub text_policy: text::TextPolicy,
 }
 
 impl FreshConfig {
@@ -108,7 +109,7 @@ impl FreshConfig {
             no_delta: false,
             snippet_chars: 160,
             max_size: fulltext::DEFAULT_MAX_SIZE,
-            extra_exts: Vec::new(),
+            text_policy: text::TextPolicy::empty(),
         }
     }
 }
@@ -404,8 +405,12 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
         if !entry.exists {
             continue;
         }
-        let Some(body) = read_body(&entry.path, entry.size, config.max_size, &config.extra_exts)
-        else {
+        let Some(body) = read_body(
+            &entry.path,
+            entry.size,
+            config.max_size,
+            &config.text_policy,
+        ) else {
             continue;
         };
         live_read += 1;
@@ -702,17 +707,16 @@ fn order_and_truncate(
 /// Returning `None` (too large, binary, unreadable) is not a failure: it means
 /// the file has no body the full-text index would have contained either, so
 /// leaving it out of the live result keeps both sides of the merge consistent.
-fn read_body(path: &str, size: i64, max_size: u64, extra_exts: &[String]) -> Option<String> {
+fn read_body(path: &str, size: i64, max_size: u64, policy: &text::TextPolicy) -> Option<String> {
     if size <= 0 || size as u64 > max_size {
         return None;
     }
-    match text::classify_ext(
+    match policy.classify_ext(
         Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_lowercase)
             .as_deref(),
-        extra_exts,
     ) {
         ExtVerdict::Binary => None,
         ExtVerdict::Text => std::fs::read(path).ok().map(|b| text::decode(&b)),
