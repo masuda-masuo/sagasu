@@ -321,6 +321,7 @@ pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
     println!("indexed      : {}", summary.indexed);
     println!("  by ext     : {}", summary.accepted_by_ext);
     println!("  by sniff   : {}", summary.accepted_by_sniff);
+    println!("  by extract : {}", summary.accepted_by_extract);
 
     // Nothing is dropped silently: every candidate is either indexed or shows
     // up here with a reason.
@@ -328,6 +329,25 @@ pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
         println!("skipped      : {}", summary.skipped_total());
         for (reason, count) in &summary.skipped {
             println!("  {}: {count}", reason.as_str());
+        }
+    }
+
+    // An extraction failure is the one skip reason that names a *file* rather
+    // than a class of files, and it is the one where the reason is the whole
+    // information: "3 documents failed" is not actionable, "this PDF has no
+    // page tree" is.
+    if !summary.extract_errors.is_empty() {
+        println!("  extraction failures:");
+        for (path, reason) in &summary.extract_errors {
+            println!("    {path}: {reason}");
+        }
+        let failed = summary
+            .skipped
+            .get(&fulltext::SkipReason::ExtractFailed)
+            .copied()
+            .unwrap_or(0) as usize;
+        if failed > summary.extract_errors.len() {
+            println!("    (… and {} more)", failed - summary.extract_errors.len());
         }
     }
 

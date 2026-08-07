@@ -272,6 +272,7 @@ mod tests {
                 root: Some("/root"),
                 ext: Some("png"),
                 magic: Some(&sample),
+                embedded: None,
             },
             &RuleSet::empty(),
         );
@@ -288,6 +289,7 @@ mod tests {
                 root: Some("/root"),
                 ext: Some("docx"),
                 magic: Some(b"PK\x03\x04\x14\x00\x06\x00"),
+                embedded: None,
             },
             &RuleSet::empty(),
         );

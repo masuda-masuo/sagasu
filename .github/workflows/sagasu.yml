@@ -45,3 +45,24 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace
+
+  # The `office` / `pdf` / `exif` features are on by default, so the default job
+  # above never builds the code path where they are off — the one that has to
+  # keep degrading to `unsupported format` instead of failing to compile
+  # (issue #40). Tests, not just a build: the degradation is asserted in
+  # `fulltext_tests`, and a compile check would not run those assertions.
+  no-default-features:
+    name: no-default-features / ubuntu-latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: cargo test -p sagasu-core --no-default-features
+        run: cargo test -p sagasu-core --no-default-features

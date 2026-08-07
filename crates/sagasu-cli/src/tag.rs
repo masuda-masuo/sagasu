@@ -51,6 +51,22 @@ pub struct TagArgs {
     /// this (bytes).
     #[arg(long, default_value_t = u64::MAX)]
     magic_max_size: u64,
+
+    /// Do **not** read embedded metadata (Office document properties, PDF info,
+    /// EXIF) from the formats that carry it.
+    ///
+    /// Reading it is the default: `author:` / `title:` / `camera:` have no
+    /// other source, and a person looking for "the deck 山田 wrote" cannot get
+    /// there from the file name. Unlike the 512-byte head read this one opens
+    /// and parses the container, so it is the flag to reach for when a pass
+    /// over a document-heavy tree is too slow.
+    #[arg(long)]
+    no_read_embedded: bool,
+
+    /// Unless `--no-read-embedded`, skip embedded metadata for files larger
+    /// than this (bytes).
+    #[arg(long, default_value_t = tagindex::DEFAULT_EMBEDDED_MAX_SIZE)]
+    embedded_max_size: u64,
 }
 
 /// Resolve the rule file: explicit flag, else the conventional file in the
@@ -93,6 +109,8 @@ pub fn cmd_tag(args: TagArgs) -> Result<()> {
         rules_path,
         read_magic: !args.no_read_magic,
         magic_max_size: args.magic_max_size,
+        read_embedded: !args.no_read_embedded,
+        embedded_max_size: args.embedded_max_size,
     };
 
     let summary = tagindex::build(&config)?;
@@ -130,6 +148,32 @@ pub fn cmd_tag(args: TagArgs) -> Result<()> {
              own word for itself, and a file edited since the last crawl has lost \
              the bytes that contradicted it)"
         );
+    }
+
+    // Same discipline as the magic line: the `author:` / `title:` / `camera:`
+    // axes are only as complete as the documents that were actually opened, so
+    // the denominator and the failures are printed next to the successes rather
+    // than left for the user to infer from a tag count.
+    if summary.embedded_candidates > 0 {
+        println!(
+            "embedded meta: {} candidates, {} with metadata, {} failed",
+            summary.embedded_candidates, summary.embedded_read, summary.embedded_failed
+        );
+        if !config.read_embedded {
+            println!(
+                "               (--no-read-embedded was passed: author:/title:/camera: \
+                 have no other source)"
+            );
+        }
+        for (path, reason) in &summary.embedded_errors {
+            println!("               ! {path}: {reason}");
+        }
+        if summary.embedded_failed as usize > summary.embedded_errors.len() {
+            println!(
+                "               … and {} more",
+                summary.embedded_failed as usize - summary.embedded_errors.len()
+            );
+        }
     }
 
     // A cap that is only visible as "N files were capped" is a silent omission

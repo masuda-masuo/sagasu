@@ -8,6 +8,9 @@
 //!   built-in directory exclusion and rescan-diff against an existing store.
 //! - [`text`]: body-extraction target decision (extension allowlist as an
 //!   entrance, content sniffing as the fallback) and decoding.
+//! - [`docmeta`]: the document formats that need a parser — `docx` / `xlsx` /
+//!   `pptx` / `pdf` bodies, and the embedded metadata (OOXML properties, PDF
+//!   info, EXIF) that feeds the tag engine (issue #40).
 //! - [`fulltext`]: tantivy index build + search, keyed by the schema-v0
 //!   `file_id` so full-text hits resolve back to metadata rows.
 //! - [`delta`]: the search-time delta sources (USN Journal on Windows, `stat`
@@ -28,6 +31,7 @@
 
 pub mod browse;
 pub mod delta;
+pub mod docmeta;
 pub mod fresh;
 pub mod fulltext;
 pub mod store;
@@ -41,6 +45,7 @@ pub mod walk;
 
 pub use browse::{BrowseQuery, BrowseView, FacetAxis, FacetValue, LabelTerm, NextStep};
 pub use delta::{DeltaCache, DeltaSet, DeltaSource, DeltaStatus, ScanMarker};
+pub use docmeta::{BodyFormat, EmbeddedMeta, MetaFormat};
 pub use fresh::{FreshConfig, FreshHit, FreshOutcome};
 pub use fulltext::{FulltextConfig, FulltextSummary, SearchConfig, SearchHit, SearchOutcome};
 pub use store::Store;
