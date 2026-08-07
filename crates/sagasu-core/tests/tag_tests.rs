@@ -399,7 +399,7 @@ fn user_rules_add_tags_and_the_result_does_not_depend_on_rule_order() {
 }
 
 #[test]
-fn a_broken_rule_file_leaves_the_existing_tags_untouched() {
+fn a_broken_rule_file_is_rejected_before_the_build_touches_anything() {
     let (d, db) = tmp_dirs("rules_broken");
     build_corpus(&d);
     crawl(&d, &db);
@@ -429,11 +429,83 @@ fn a_broken_rule_file_leaves_the_existing_tags_untouched() {
         "unexpected error: {err:#}"
     );
 
+    // `RuleSet::load` runs before the transaction is opened, so this is argument
+    // validation, not rollback — nothing was ever written to undo. The
+    // transaction's actual atomicity is what the next test is for.
     assert_eq!(
         before,
         snapshot(&d, &db),
-        "a failed pass must not half-tag the corpus"
+        "a rule file that does not load must not start a pass at all"
     );
+}
+
+#[test]
+fn a_failure_part_way_through_a_build_rolls_the_whole_layer_back() {
+    let (d, db) = tmp_dirs("rollback");
+    build_corpus(&d);
+    crawl(&d, &db);
+    tag(&db, true);
+    let before = snapshot(&d, &db);
+    let (rows_before, generation_before) = {
+        let stats = Store::open(db_path(&db)).unwrap().get_stats().unwrap();
+        (stats.tag_rows, stats.tag_scan_generation)
+    };
+    assert!(
+        rows_before > 3,
+        "the corpus must outlast the injected failure"
+    );
+
+    // The failure is injected at a real boundary — the database refuses a write
+    // part way through — rather than by mocking anything in `tagindex`. The
+    // build runs exactly as it does in production; SQLite aborts the fourth
+    // `file_tags` insert, which is precisely the "died half way" case the
+    // single-transaction design exists for.
+    {
+        let store = Store::open(db_path(&db)).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER sagasu_test_fail_midway BEFORE INSERT ON file_tags
+                 WHEN (SELECT COUNT(*) FROM file_tags) >= 3
+                 BEGIN SELECT RAISE(ABORT, 'injected mid-build failure'); END;",
+            )
+            .unwrap();
+    }
+
+    let err = tagindex::build(&TagConfig::new(db_path(&db))).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("injected mid-build failure"),
+        "unexpected error: {err:#}"
+    );
+
+    {
+        let store = Store::open(db_path(&db)).unwrap();
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER sagasu_test_fail_midway;")
+            .unwrap();
+    }
+
+    // Half the corpus carrying this pass's tags and half the last pass's would
+    // be a set of facet counts that mean nothing, and no error message can undo
+    // that afterwards.
+    assert_eq!(
+        before,
+        snapshot(&d, &db),
+        "a build that died half way must leave the previous layer intact"
+    );
+    // The descriptors are cleared at the *start* of the transaction, so they are
+    // part of what has to come back.
+    let stats = Store::open(db_path(&db)).unwrap().get_stats().unwrap();
+    assert_eq!(stats.tag_rows, rows_before);
+    assert_eq!(
+        stats.tag_scan_generation, generation_before,
+        "meta must not be left describing a build that did not finish"
+    );
+
+    // And the database is still usable: the next build succeeds normally.
+    assert!(tag_default(&db).rows > 0);
+    assert_eq!(before, snapshot(&d, &db));
 }
 
 #[test]
