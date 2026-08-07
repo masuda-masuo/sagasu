@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
+use sagasu_core::walk::{self, ExcludeSet};
 use sagasu_core::Store;
 
 use crate::output::mib;
@@ -69,6 +70,29 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
         None => println!("delta marker   : (none — searches cannot merge changes)"),
     }
 
+    // The exclusion policy the crawl ran under, replayed from what it stored.
+    // Every query replays this too (design.md §5-1), so a surprising file count
+    // is explainable from this report alone rather than from shell history.
+    let root = PathBuf::from(stats.root_path.clone().unwrap_or_default());
+    match store.meta_get(walk::EXCLUDE_POLICY_KEY)? {
+        Some(encoded) => match ExcludeSet::decode(&encoded, &root) {
+            Ok(excludes) => {
+                println!("exclusion      : {} dir name(s)", excludes.names().len());
+                println!("  hidden       : {}", excludes.hidden_policy().as_str());
+                println!(
+                    "  gitignore    : {}",
+                    if excludes.uses_gitignore() {
+                        format!("{} rule(s), directories only", excludes.gitignore_rules())
+                    } else {
+                        "not applied".to_string()
+                    }
+                );
+            }
+            Err(e) => println!("exclusion      : (unreadable policy: {e:#})"),
+        },
+        None => println!("exclusion      : (not recorded — crawled before policies were stored)"),
+    }
+
     println!("scan generation: {}", stats.scan_generation);
     println!("live files     : {}", stats.live_count);
     println!("tombstones     : {}", stats.tombstone_count);
@@ -76,10 +100,12 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
 
     // Full-text index state. Showing the generation it was built from makes a
     // stale full-text index visible instead of leaving it to guesswork.
-    match stats.fulltext_dir {
+    let fulltext_built = stats.fulltext_dir.is_some();
+    let fulltext_docs = stats.fulltext_docs.unwrap_or(0);
+    match &stats.fulltext_dir {
         Some(dir) => {
             println!("full-text index: {dir}");
-            println!("  documents    : {}", stats.fulltext_docs.unwrap_or(0));
+            println!("  documents    : {fulltext_docs}");
             let ft_gen = stats.fulltext_scan_generation.unwrap_or(0);
             let behind = stats.scan_generation - ft_gen;
             if behind > 0 {
@@ -115,6 +141,29 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
             }
         }
         None => println!("tags           : (not built)"),
+    }
+
+    // ── The empty index ─────────────────────────────────────────────────────
+    //
+    // A stage that indexed nothing reports a perfectly healthy-looking zero,
+    // and at query time "indexed but not findable" and "never indexed" are
+    // indistinguishable. `index` and `fulltext` warn at build time, but the
+    // build scrolls away and this report is what someone comes back to
+    // (issue #15). Warnings go to stderr so the report itself stays parseable.
+    if stats.root_path.is_none() {
+        eprintln!("WARNING: this database holds no crawl — run `sagasu index <root>` first.");
+    } else if stats.live_count == 0 {
+        eprintln!(
+            "WARNING: the metadata index contains zero live files. The root may be \
+             wrong, or the exclusion policy above may cover all of it — re-run \
+             `sagasu index <root>` and read the `skipped` breakdown."
+        );
+    } else if fulltext_built && fulltext_docs == 0 {
+        eprintln!(
+            "WARNING: the full-text index exists but holds zero documents, so every \
+             `sagasu search` answers empty. Re-run `sagasu fulltext` and read the \
+             `skipped` breakdown — `--ext <EXT>` or a text config file may be needed."
+        );
     }
 
     Ok(())

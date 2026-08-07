@@ -142,9 +142,14 @@ impl UsnDeltaSource {
     }
 
     /// True when a resolved path belongs to the indexed set.
+    ///
+    /// The full crawl policy, not just the name list: the journal is
+    /// volume-wide, so anything the crawl declined to index — a hidden tree, a
+    /// gitignored build directory — arrives here too and must be dropped by the
+    /// same rule that dropped it there.
     fn accepts(&self, path: &Path) -> bool {
         crate::delta::path_under(&self.root, path)
-            && self.excludes.matched_dir(path, &self.root).is_none()
+            && self.excludes.reason_for_path(path, &self.root).is_none()
             && !self
                 .skip_paths
                 .iter()

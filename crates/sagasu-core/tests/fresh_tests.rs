@@ -57,6 +57,8 @@ fn crawl(data: &Path, db_dir: &Path) {
         db_path: db_path(db_dir),
         exclude: vec![],
         no_default_excludes: false,
+        hidden: Default::default(),
+        use_gitignore: false,
         threads: 1,
     })
     .unwrap();
@@ -615,6 +617,8 @@ fn the_delta_set_never_contains_our_own_database() {
         db_path: inner_db.clone(),
         exclude: vec![],
         no_default_excludes: false,
+        hidden: Default::default(),
+        use_gitignore: false,
         threads: 1,
     })
     .unwrap();

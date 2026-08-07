@@ -8,13 +8,14 @@
 //! work was performed", which is the failure that is otherwise invisible until
 //! query time.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
 use sagasu_core::fulltext::{self, FulltextConfig};
+use sagasu_core::walk::{ExcludeSet, HiddenPolicy};
 use sagasu_core::CrawlConfig;
 
 use crate::output::mib;
@@ -38,6 +39,17 @@ pub struct IndexArgs {
     /// Drop the built-in exclusion list (node_modules, target, .git, ...).
     #[arg(long)]
     no_default_excludes: bool,
+
+    /// Skip entries the OS marks hidden. Windows only in effect: a leading dot
+    /// is a naming convention, not a hidden attribute, and `.github/` and
+    /// `.config/` stay indexed on every platform.
+    #[arg(long)]
+    skip_hidden: bool,
+
+    /// Also apply the crawl root's .gitignore — directory rules only. Off by
+    /// default: "do not commit this" is not "do not find this".
+    #[arg(long)]
+    use_gitignore: bool,
 
     /// Number of walker threads (0 = auto).
     #[arg(long, default_value_t = 0)]
@@ -64,13 +76,26 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
         );
     }
 
+    let hidden = if args.skip_hidden {
+        HiddenPolicy::SkipOsHidden
+    } else {
+        HiddenPolicy::Include
+    };
+
     let config = CrawlConfig {
-        root,
+        root: root.clone(),
         db_path: args.db,
-        exclude: args.exclude,
+        exclude: args.exclude.clone(),
         no_default_excludes: args.no_default_excludes,
+        hidden,
+        use_gitignore: args.use_gitignore,
         threads: args.threads,
     };
+
+    // What the crawl is about to consider out of scope, before it says how much
+    // that came to. A count of exclusions without the rule that produced them
+    // cannot be argued with; the rule without the count cannot be believed.
+    print_scope(&config, &root)?;
 
     let summary = sagasu_core::walk::crawl(config)?;
 
@@ -82,13 +107,20 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
     println!("  renamed    : {}", summary.renamed);
     println!("  deleted    : {}", summary.deleted);
 
-    if !summary.skipped.is_empty() {
+    let skipped_total = summary.skipped_total();
+    if skipped_total > 0 {
+        println!("skipped      : {skipped_total}");
         // Sort by count descending, then by name.
         let mut skips: Vec<_> = summary.skipped.iter().collect();
         skips.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        println!("skipped      :");
         for (name, count) in skips {
             println!("  {name}: {count}");
+        }
+        if summary.skipped_hidden > 0 {
+            println!("  (os hidden): {}", summary.skipped_hidden);
+        }
+        if summary.skipped_gitignore > 0 {
+            println!("  (gitignore): {}", summary.skipped_gitignore);
         }
     }
 
@@ -103,6 +135,44 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
         process::exit(1);
     }
 
+    Ok(())
+}
+
+/// Print the exclusion policy the crawl is about to run under.
+///
+/// Rebuilding the [`ExcludeSet`] here rather than having `crawl` hand one back
+/// costs a `.gitignore` read; the alternative is printing the *arguments* and
+/// hoping they describe the same thing the core assembled. It also surfaces a
+/// broken `.gitignore` before the walk instead of after it.
+fn print_scope(config: &CrawlConfig, root: &Path) -> Result<()> {
+    let excludes = ExcludeSet::new(&config.exclude, config.no_default_excludes)
+        .with_hidden(config.hidden)
+        .with_gitignore(root, config.use_gitignore)?;
+
+    println!("root         : {}", root.display());
+    if excludes.names().is_empty() {
+        println!("excluded dirs: (none)");
+    } else {
+        println!("excluded dirs: {}", excludes.names().join(", "));
+    }
+    println!(
+        "hidden       : {}",
+        match excludes.hidden_policy() {
+            HiddenPolicy::Include => "indexed (dot-directories are content)",
+            HiddenPolicy::SkipOsHidden => "skipped when the OS marks them hidden",
+        }
+    );
+    println!(
+        "gitignore    : {}",
+        if excludes.uses_gitignore() {
+            format!(
+                "{} rule(s) from the root .gitignore, directories only",
+                excludes.gitignore_rules()
+            )
+        } else {
+            "not applied".to_string()
+        }
+    );
     Ok(())
 }
 

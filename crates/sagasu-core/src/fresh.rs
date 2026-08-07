@@ -61,7 +61,6 @@ use crate::delta::{self, DeltaCache, DeltaSet, DeltaSourceKind, DeltaStatus, Res
 use crate::fulltext::{self, SearchConfig};
 use crate::store::{FileRow, Store};
 use crate::text::{self, ExtVerdict};
-use crate::walk::{self, ExcludeSet};
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -522,21 +521,14 @@ impl DeltaContext {
                 missing_marker: true,
             });
         };
-        let Some(root) = store.meta_get("root_path")? else {
+        // The crawl's own exclusion policy, replayed exactly — including
+        // `--exclude`, `--skip-hidden` and `--use-gitignore` (design.md §5-1).
+        let Some(delta_config) = delta::DeltaConfig::from_index(store, &config.db_path)? else {
             return Ok(Self {
                 set: None,
                 cached: false,
                 missing_marker: true,
             });
-        };
-
-        let delta_config = delta::DeltaConfig {
-            root: PathBuf::from(root),
-            // The crawl's own exclusion set. `sagasu index --exclude` is not
-            // replayed here yet — see the note in docs/design.md §5.
-            excludes: ExcludeSet::new(&[], false),
-            skip_paths: walk::db_sibling_paths(&config.db_path),
-            threads: 0,
         };
         let source = delta::source_for(&delta_config);
 

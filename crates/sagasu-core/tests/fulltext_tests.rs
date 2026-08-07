@@ -57,6 +57,8 @@ fn crawl(data: &Path, db_dir: &Path) {
         db_path: db_path(db_dir),
         exclude: vec![],
         no_default_excludes: false,
+        hidden: Default::default(),
+        use_gitignore: false,
         threads: 1,
     })
     .unwrap();

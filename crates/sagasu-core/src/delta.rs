@@ -424,12 +424,71 @@ impl DeltaConfig {
         }
     }
 
-    /// True when `path` belongs to the indexed set: under the root, not under an
-    /// excluded directory, and not one of our own database files.
-    pub(crate) fn accepts(&self, path: &Path) -> bool {
-        path_under(&self.root, path)
-            && self.excludes.matched_dir(path, &self.root).is_none()
-            && !self.skip_paths.iter().any(|p| walk::same_path(p, path))
+    /// Config that replays what the crawl recorded in `db_path`'s index.
+    ///
+    /// This is the only supported way to build a delta config for an existing
+    /// index. Reconstructing "the defaults" instead is what let `sagasu index
+    /// --exclude` disagree with every later query (design.md §5-2): the crawl
+    /// never saw those files, the delta scan did, and a live hit appeared for a
+    /// path with no index row behind it. An index written before the policy was
+    /// persisted has no row, and falls back to the defaults — which is what it
+    /// was crawled with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index records no root, or if the stored policy
+    /// cannot be parsed (see [`ExcludeSet::decode`]).
+    pub fn from_index(store: &crate::Store, db_path: &Path) -> Result<Option<Self>> {
+        let Some(root) = store.meta_get("root_path")? else {
+            return Ok(None);
+        };
+        let root = PathBuf::from(root);
+        let excludes = match store.meta_get(walk::EXCLUDE_POLICY_KEY)? {
+            Some(encoded) => ExcludeSet::decode(&encoded, &root)?,
+            None => ExcludeSet::new(&[], false),
+        };
+        Ok(Some(Self {
+            root,
+            excludes,
+            skip_paths: walk::db_sibling_paths(db_path),
+            threads: 0,
+        }))
+    }
+
+    /// Why `path` is not part of the indexed set, if it is not.
+    pub(crate) fn rejection(&self, path: &Path) -> Option<Rejection> {
+        if !path_under(&self.root, path) {
+            return Some(Rejection::OutOfScope);
+        }
+        if let Some(reason) = self.excludes.reason_for_path(path, &self.root) {
+            return Some(Rejection::Excluded(reason));
+        }
+        if self.skip_paths.iter().any(|p| walk::same_path(p, path)) {
+            return Some(Rejection::OutOfScope);
+        }
+        None
+    }
+}
+
+/// Why a candidate path did not make it into a delta set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Rejection {
+    /// Dropped by the crawl's exclusion policy.
+    Excluded(walk::ExcludeReason),
+    /// Outside the crawl root, or one of our own database files. A single path,
+    /// not a rule about a subtree.
+    OutOfScope,
+}
+
+impl Rejection {
+    /// Whether the whole directory the path sits in can be abandoned, or only
+    /// this one entry. A name or gitignore rule is a statement about the
+    /// directory; a hidden *file* and a database sibling are not.
+    pub(crate) fn prunes_directory(&self) -> bool {
+        matches!(
+            self,
+            Rejection::Excluded(walk::ExcludeReason::Name(_) | walk::ExcludeReason::Gitignore)
+        )
     }
 }
 
@@ -620,13 +679,14 @@ impl DeltaSource for MtimeDeltaSource {
 
                 scanned.fetch_add(1, Ordering::Relaxed);
 
-                if !config.accepts(entry.path()) {
+                if let Some(rejection) = config.rejection(entry.path()) {
                     excluded.fetch_add(1, Ordering::Relaxed);
-                    // Skipping the whole directory is only safe for the exclude
-                    // rule; a database sibling is a single file.
-                    return match config.excludes.matched_dir(entry.path(), &config.root) {
-                        Some(_) => WalkState::Skip,
-                        None => WalkState::Continue,
+                    // Abandoning the whole directory is only safe for a rule
+                    // that is about the directory; a database sibling or a
+                    // hidden file is a single entry.
+                    return match rejection.prunes_directory() {
+                        true => WalkState::Skip,
+                        false => WalkState::Continue,
                     };
                 }
 
