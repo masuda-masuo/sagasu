@@ -389,9 +389,10 @@ fn intern_tag(tx: &rusqlite::Transaction<'_>, tag: &Tag) -> Result<i64> {
 /// answered `1 of 1 files`. A facet bucket that promises three and delivers one
 /// is worse than one that was never offered.
 ///
-/// Shared as one string so the aggregate queries and [`files_with_tags`] cannot
-/// drift apart on what "live" means.
-const LIVE_FILES_JOIN: &str = "JOIN files f ON f.file_id = ft.file_id AND f.deleted_at IS NULL";
+/// Shared as one string so the aggregate queries, [`files_with_tags`] and the
+/// drill-down in [`crate::browse`] cannot drift apart on what "live" means.
+pub(crate) const LIVE_FILES_JOIN: &str =
+    "JOIN files f ON f.file_id = ft.file_id AND f.deleted_at IS NULL";
 
 /// A tag and the number of live files carrying it.
 #[derive(Debug, Clone)]
@@ -479,7 +480,7 @@ pub fn tag_counts(store: &Store, namespace: Option<&str>, limit: i64) -> Result<
 /// makes the condition permanently unreachable and the answer a confident
 /// `hits: 0`. Removing the duplicate at the door is the only place the two
 /// numbers can be brought back into agreement.
-fn dedup_tags(tags: &[Tag]) -> Vec<Tag> {
+pub(crate) fn dedup_tags(tags: &[Tag]) -> Vec<Tag> {
     let mut seen: std::collections::HashSet<&Tag> = std::collections::HashSet::new();
     tags.iter()
         .filter(|t| seen.insert(t))
@@ -514,17 +515,35 @@ fn all_tags_subquery(tags: &[Tag]) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     (sql, values)
 }
 
-/// Live files carrying **all** of `tags`, ordered by `file_id`, at most `limit`.
+/// The `file_id`s a facet selection covers, as a subquery and its bound values.
 ///
-/// Pair this with [`count_files_with_tags`]: the length of what comes back is
-/// the size of the *page*, and reporting that as the number of matches is the
-/// same silent-omission failure the freshness design exists to prevent.
-pub fn files_with_tags(store: &Store, tags: &[Tag], limit: i64) -> Result<Vec<FileRow>> {
+/// The same thing [`all_tags_subquery`] produces, except that an **empty**
+/// selection is the whole live index rather than an error. That distinction is
+/// the root of the drill-down in [`crate::browse`]: "nothing chosen yet" is a
+/// legitimate place to stand, and it has to mean the same "live" as every step
+/// below it — which is why it goes through this function and not a second,
+/// separately-written `WHERE deleted_at IS NULL` somewhere else.
+///
+/// Parameters are numbered `1..=values.len()`; a caller binding its own (a
+/// `LIMIT`, say) continues from `values.len() + 1`.
+pub(crate) fn selection_subquery(tags: &[Tag]) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     if tags.is_empty() {
-        bail!("no tags given");
+        return (
+            "SELECT lf.file_id FROM files lf WHERE lf.deleted_at IS NULL".to_string(),
+            Vec::new(),
+        );
     }
-    let tags = dedup_tags(tags);
-    let (sub, mut values) = all_tags_subquery(&tags);
+    all_tags_subquery(&dedup_tags(tags))
+}
+
+/// Live files matching a selection, ordered by `file_id`, at most `limit`.
+///
+/// An empty selection means the whole live index — see [`selection_subquery`].
+/// Pair this with [`count_selection`]: the length of what comes back is the size
+/// of the *page*, and reporting that as the number of matches is the same
+/// silent-omission failure the freshness design exists to prevent.
+pub fn files_in_selection(store: &Store, tags: &[Tag], limit: i64) -> Result<Vec<FileRow>> {
+    let (sub, mut values) = selection_subquery(tags);
     let sql = format!(
         "SELECT f.file_id, f.path, f.ext, f.size, f.mtime_ns, f.ctime_ns, f.magic, f.blake3,
                 f.fs_id, f.last_seen_scan, f.deleted_at
@@ -532,7 +551,7 @@ pub fn files_with_tags(store: &Store, tags: &[Tag], limit: i64) -> Result<Vec<Fi
          WHERE f.file_id IN ({sub})
          ORDER BY f.file_id
          LIMIT ?{}",
-        tags.len() * 2 + 2
+        values.len() + 1
     );
     values.push(Box::new(limit));
 
@@ -542,6 +561,18 @@ pub fn files_with_tags(store: &Store, tags: &[Tag], limit: i64) -> Result<Vec<Fi
         .query_map(params.as_slice(), crate::store::row_to_file_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Live files carrying **all** of `tags`, ordered by `file_id`, at most `limit`.
+///
+/// Rejects an empty tag list: `sagasu tags` with no arguments lists namespaces,
+/// so reaching here with none is a caller bug rather than a request for the
+/// whole index. [`files_in_selection`] is the form that accepts it.
+pub fn files_with_tags(store: &Store, tags: &[Tag], limit: i64) -> Result<Vec<FileRow>> {
+    if tags.is_empty() {
+        bail!("no tags given");
+    }
+    files_in_selection(store, tags, limit)
 }
 
 /// Split index rows by whether the file is still on disk *right now*.
@@ -578,8 +609,17 @@ pub fn count_files_with_tags(store: &Store, tags: &[Tag]) -> Result<i64> {
     if tags.is_empty() {
         bail!("no tags given");
     }
-    let tags = dedup_tags(tags);
-    let (sub, values) = all_tags_subquery(&tags);
+    count_selection(store, tags)
+}
+
+/// How many live files a selection matches. An empty selection is the whole
+/// live index — see [`selection_subquery`].
+///
+/// Same caveat as [`count_files_with_tags`]: this is the *index's* notion of
+/// live, so it is an upper bound until the rows are checked against the
+/// filesystem by [`partition_existing`].
+pub fn count_selection(store: &Store, tags: &[Tag]) -> Result<i64> {
+    let (sub, values) = selection_subquery(tags);
     let sql = format!("SELECT COUNT(*) FROM ({sub})");
     let params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
     let n = store

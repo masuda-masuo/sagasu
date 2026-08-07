@@ -9,6 +9,9 @@
 //! - `find`:     path search over the metadata index.
 //! - `tag`:      generate the rule-based semantic tag layer (design.md §6).
 //! - `tags`:     browse tags, filter files by them, explain one file's tags.
+//! - `browse`:   facet drill-down — from a tag selection to the axes worth
+//!   looking at next, with a machine-generated label for the group (design.md
+//!   §6, issue #5).
 //! - `status`:   print index statistics.
 //!
 //! The pipeline order is `index` → (`hash`) → `fulltext` → `search`, with `tag`
@@ -33,13 +36,15 @@
 //! subcommand's arguments and implementation live next to the others it shares a
 //! stage with: [`index`] for the write side (`index` / `hash` / `fulltext`),
 //! [`search`] for the read side (`search` / `find`), [`tag`] for the tag layer
-//! (`tag` / `tags`), [`status`] for the report, and [`output`] for the
-//! formatting more than one of them needs.
+//! (`tag` / `tags`), [`browse`] for the drill-down over it, [`status`] for the
+//! report, and [`output`] for the formatting more than one of them needs —
+//! which now includes the tag-layer snapshot block `tags` and `browse` share.
 
 use std::process;
 
 use clap::{Parser, Subcommand};
 
+mod browse;
 mod index;
 mod output;
 mod search;
@@ -69,6 +74,8 @@ enum Command {
     Tag(tag::TagArgs),
     /// Browse tags, filter files by them, or explain one file's tags.
     Tags(tag::TagsArgs),
+    /// Drill down through the facet hierarchy: what to filter on next.
+    Browse(browse::BrowseArgs),
     /// Print index statistics.
     Status(status::StatusArgs),
 }
@@ -89,6 +96,7 @@ fn main() {
         Command::Find(args) => search::cmd_find(args),
         Command::Tag(args) => tag::cmd_tag(args),
         Command::Tags(args) => tag::cmd_tags(args),
+        Command::Browse(args) => browse::cmd_browse(args),
         Command::Status(args) => status::cmd_status(args),
     };
 

@@ -21,7 +21,12 @@
 //! - [`tagindex`]: the stateful half of that layer — building it into SQLite,
 //!   measuring its coverage, and querying it back.
 //! - [`tagrules`]: the declarative user rule file that feeds [`tags`].
+//! - [`browse`]: the facet drill-down over that layer — given a tag selection,
+//!   the next axes worth looking at, ranked by expected bits, with a c-TF-IDF
+//!   label for the group (design.md §6, issue #5). This is the interface the
+//!   M4 Tauri UI is meant to call directly; the CLI is a printer for it.
 
+pub mod browse;
 pub mod delta;
 pub mod fresh;
 pub mod fulltext;
@@ -34,6 +39,7 @@ pub mod text;
 pub mod usn;
 pub mod walk;
 
+pub use browse::{BrowseQuery, BrowseView, FacetAxis, FacetValue, LabelTerm, NextStep};
 pub use delta::{DeltaCache, DeltaSet, DeltaSource, DeltaStatus, ScanMarker};
 pub use fresh::{FreshConfig, FreshHit, FreshOutcome};
 pub use fulltext::{FulltextConfig, FulltextSummary, SearchConfig, SearchHit, SearchOutcome};

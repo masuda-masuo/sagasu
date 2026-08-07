@@ -3,8 +3,10 @@
 //!
 //! Two commands rather than one because they are two different things: `tag` is
 //! a pipeline stage next to `hash` and `fulltext`, and `tags` is a read-only
-//! query like `find`. They live in their own module so that adding a facet
-//! browser later does not keep growing `main.rs`.
+//! query like `find`. The facet browser that grew out of them is
+//! [`crate::browse`]; the snapshot/delta block all three of them owe the user
+//! lives in [`crate::output`], so it cannot be updated in one and forgotten in
+//! the others.
 
 use std::path::{Path, PathBuf};
 use std::process;
@@ -12,12 +14,13 @@ use std::process;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use sagasu_core::delta::{self, DeltaStatus};
+use sagasu_core::delta;
 use sagasu_core::store::Store;
 use sagasu_core::tagindex::{self, TagConfig};
 use sagasu_core::tagrules::{RuleSet, DEFAULT_RULES_FILE};
 use sagasu_core::tags::{self, Tag, TagSource};
-use sagasu_core::ExcludeSet;
+
+use crate::output::{print_tag_freshness, TagFreshness};
 
 // ── sagasu tag ──────────────────────────────────────────────────────────────
 
@@ -220,7 +223,15 @@ pub fn cmd_tags(args: TagsArgs) -> Result<()> {
         .with_context(|| format!("failed to open metadata index {:?}", args.db))?;
 
     let stats = store.get_stats()?;
-    report_tag_freshness(&store, &stats, &args);
+    print_tag_freshness(
+        &store,
+        &stats,
+        &TagFreshness {
+            db: &args.db,
+            no_fresh: args.no_fresh,
+            delta_limit: args.delta_limit,
+        },
+    );
 
     if let Some(file) = &args.file {
         return explain_file(&store, file, args.rules.clone());
@@ -461,149 +472,4 @@ fn explain_file(store: &Store, file: &Path, rules: Option<PathBuf>) -> Result<()
         }
     }
     Ok(())
-}
-
-/// Report what the tag layer is, and — honestly — what it is not.
-///
-/// ## Why this does not say "(current)"
-///
-/// It used to. `tag_scan_generation == scan_generation` only means "no crawl has
-/// happened since the tags were built"; it says nothing at all about the
-/// filesystem, which is free to have moved on. Measured: `sagasu find` returned
-/// six hits (three of them live) for a tree where `sagasu tags <tag>` returned
-/// three and called itself current. That is the project's worst failure mode —
-/// results silently missing — dressed up as a reassurance.
-///
-/// ## Why the answer is not simply merged, like `find` and `search`
-///
-/// A tag filter cannot be delta-merged the way a path or full-text query is.
-/// Both of those can evaluate the query *against the live file itself*; a tag
-/// filter would have to generate tags for every changed file and then decide how
-/// a live hit ranks beside an indexed one. The engine is a pure function so that
-/// is possible, but the drill-down design it belongs to is issue #5, and half of
-/// it landing here would be a second, subtly different query path.
-///
-/// So this reports rather than merges: the layer is named as a snapshot, and the
-/// delta source is asked how far the filesystem has moved since — the same
-/// question `fresh::find` asks, with the same stale notice on stderr, minus the
-/// merge. A user gets a number instead of a false assurance.
-fn report_tag_freshness(store: &Store, stats: &sagasu_core::store::IndexStats, args: &TagsArgs) {
-    let Some(generation) = stats.tag_scan_generation else {
-        println!("tags    : (never built — run `sagasu tag`)");
-        eprintln!("WARNING: this index has no tag layer; every tag query answers empty.");
-        return;
-    };
-
-    let behind = stats.scan_generation - generation;
-    println!(
-        "tags    : {} rows over {} files, {} distinct, built at scan generation {generation}",
-        stats.tag_rows,
-        stats.tag_files.unwrap_or(0),
-        stats.distinct_tags,
-    );
-    if behind > 0 {
-        println!("          ({behind} scan(s) behind the index — re-run `sagasu tag`)");
-    }
-    // Stated unconditionally, including when the layer is level with the index:
-    // "level with the index" and "level with the filesystem" are different
-    // claims, and only the first one is ever knowable from the database alone.
-    println!(
-        "snapshot: tags describe the corpus as of that scan. Files created or \
-         renamed since carry no tags and are not merged in here the way \
-         `sagasu find` merges them (issue #5); files deleted since are dropped \
-         from a listing by an existence check, and reported."
-    );
-    if let Some(rules) = &stats.tag_rules {
-        if !rules.is_empty() {
-            println!("rules   : {rules}");
-        }
-    }
-
-    if behind > 0 {
-        eprintln!(
-            "WARNING: the tag layer is {behind} scan(s) behind the metadata index — \
-             a tag filter is missing every file indexed since. Re-run `sagasu tag`."
-        );
-    }
-    report_tag_delta(store, args, behind);
-}
-
-/// Ask the delta source how far the filesystem has moved since the crawl, and
-/// say so. This is a *probe*, not a merge — see [`report_tag_freshness`].
-fn report_tag_delta(store: &Store, args: &TagsArgs, behind: i64) {
-    if args.no_fresh {
-        println!("delta   : (not probed — --no-fresh)");
-        eprintln!(
-            "WARNING: the tag layer's freshness was not checked, so this answer is \
-             of unknown completeness."
-        );
-        return;
-    }
-
-    let (marker, root) = match (store.delta_marker(), store.meta_get("root_path")) {
-        (Ok(Some(marker)), Ok(Some(root))) => (marker, root),
-        _ => {
-            println!("delta   : (no freshness marker — cannot tell what changed)");
-            eprintln!(
-                "WARNING: index is stale: no freshness marker recorded — \
-                 re-run `sagasu index <root>`"
-            );
-            return;
-        }
-    };
-
-    let config = delta::DeltaConfig {
-        root: PathBuf::from(root),
-        excludes: ExcludeSet::new(&[], false),
-        skip_paths: sagasu_core::walk::db_sibling_paths(&args.db),
-        threads: 0,
-    };
-    let set = match delta::source_for(&config).changes_since(&marker, args.delta_limit) {
-        Ok(set) => set,
-        Err(e) => {
-            println!("delta   : (probe failed: {e:#})");
-            eprintln!("WARNING: could not establish how stale the tag layer is: {e:#}");
-            return;
-        }
-    };
-
-    println!(
-        "delta   : {} changed since the index was built via {} ({} scanned, {} excluded)",
-        set.entries.len(),
-        set.kind.as_str(),
-        set.scanned,
-        set.excluded,
-    );
-
-    match set.status {
-        DeltaStatus::Complete => {}
-        DeltaStatus::Truncated { limit } => {
-            eprintln!(
-                "WARNING: index is stale: more than {limit} files changed since it was \
-                 built, so the probe was cut short — re-run `sagasu index <root>` and \
-                 `sagasu tag`."
-            );
-            return;
-        }
-        DeltaStatus::RescanRequired(reason) => {
-            eprintln!(
-                "WARNING: index is stale: {} — re-run `sagasu index <root>` and \
-                 `sagasu tag`.",
-                reason.as_str()
-            );
-            return;
-        }
-    }
-
-    // A changed file is not necessarily missing from the tag layer (an edit does
-    // not move a tag), but a created or renamed one is, and the probe cannot
-    // tell those apart without a merge. Report the bound rather than guessing.
-    if !set.entries.is_empty() && behind == 0 {
-        eprintln!(
-            "WARNING: {} file(s) changed since the index was built. Any of them that \
-             are new or renamed carry no tags, so a tag filter cannot return them — \
-             re-run `sagasu index <root>` and `sagasu tag` to include them.",
-            set.entries.len(),
-        );
-    }
 }

@@ -175,6 +175,12 @@ root, the extension and `magic` — never from `mtime`, which changes when a fil
 is merely touched. See `docs/tag_rules.md` for the generators and the user rule
 file format.
 
+The facet drill-down (`sagasu browse`, `docs/browse.md`) reads these two tables
+and nothing else — no new columns, no new tables. It does create one *temporary*
+table per call, `temp.sagasu_browse_selection`, holding the `file_id`s of the
+current selection; it lives in the connection's temp schema and never touches
+the index file.
+
 ## Tombstone rule
 
 Deleted files become tombstones (`deleted_at` set to the scan generation in which they disappeared). Rows are **never** deleted.
