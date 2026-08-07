@@ -20,12 +20,21 @@
 //!
 //! ## What gets a body
 //!
-//! Plain text and code only; PDF / Office are out of scope for M1. The decision
-//! lives in [`crate::text`]: an extension allowlist as a fast entrance, an
-//! extension denylist to reject known-binary formats without opening them, and
-//! content sniffing for everything else. Every rejection is counted with a
-//! reason and reported in [`FulltextSummary`] — a file must never disappear from
-//! the index silently.
+//! Plain text and code, plus the document formats [`crate::docmeta`] can parse
+//! (`docx` / `xlsx` / `pptx` / `pdf`, issue #40). The decision lives in
+//! [`crate::text`]: an extension allowlist as a fast entrance, an extractor
+//! lookup, an extension denylist to reject known-binary formats without opening
+//! them, and content sniffing for everything else. Every rejection is counted
+//! with a reason and reported in [`FulltextSummary`] — a file must never
+//! disappear from the index silently.
+//!
+//! **The ledger is the invariant.** `candidates == indexed + skipped_total`
+//! holds on every path (design.md §4-2), so a document that fails to parse is
+//! counted under [`SkipReason::ExtractFailed`] rather than quietly dropped, and
+//! the reason for the first few is carried verbatim in
+//! [`FulltextSummary::extract_errors`]. A parser *panic* takes the same route:
+//! [`crate::docmeta`] catches it and hands back an ordinary error, so one
+//! malformed file costs one row and not the whole build.
 //!
 //! ## Rebuild semantics (M1)
 //!
@@ -92,9 +101,21 @@ pub enum SkipReason {
     TooLarge,
     /// Zero bytes — nothing to index.
     Empty,
-    /// Extension is on the known-binary denylist. Includes PDF / Office, whose
-    /// body extraction is deliberately deferred past M1.
+    /// Extension is on the known-binary denylist: media, archives, executables,
+    /// and the document formats no parser here can read (legacy `.doc`/`.xls`,
+    /// OpenDocument, `.rtf`).
     UnsupportedExt,
+    /// A document format we *do* have a parser for, whose parse failed on this
+    /// particular file — a truncated ZIP, a PDF with no page tree, or a parser
+    /// panic caught by [`crate::docmeta`].
+    ///
+    /// Distinct from [`SkipReason::UnsupportedExt`] on purpose. "We do not read
+    /// this format" and "we read this format and this file is broken" call for
+    /// different actions from the user, and collapsing them would hide a
+    /// regression in the extractor inside a number that is expected to be
+    /// large. The reasons themselves are carried in
+    /// [`FulltextSummary::extract_errors`].
+    ExtractFailed,
     /// Content sniffing said this is not UTF-8 text (or is an encoding we
     /// cannot decode yet, e.g. UTF-16 / Shift_JIS).
     BinaryContent,
@@ -105,10 +126,11 @@ pub enum SkipReason {
 
 impl SkipReason {
     /// All reasons, in report order.
-    pub const ALL: [SkipReason; 5] = [
+    pub const ALL: [SkipReason; 6] = [
         SkipReason::TooLarge,
         SkipReason::Empty,
         SkipReason::UnsupportedExt,
+        SkipReason::ExtractFailed,
         SkipReason::BinaryContent,
         SkipReason::Unreadable,
     ];
@@ -118,7 +140,8 @@ impl SkipReason {
         match self {
             SkipReason::TooLarge => "too large",
             SkipReason::Empty => "empty",
-            SkipReason::UnsupportedExt => "unsupported format (PDF/Office/media/binary)",
+            SkipReason::UnsupportedExt => "unsupported format (media/binary/legacy documents)",
+            SkipReason::ExtractFailed => "document extraction failed",
             SkipReason::BinaryContent => "binary or undecodable content",
             SkipReason::Unreadable => "unreadable",
         }
@@ -129,11 +152,19 @@ impl SkipReason {
             SkipReason::TooLarge => 0,
             SkipReason::Empty => 1,
             SkipReason::UnsupportedExt => 2,
-            SkipReason::BinaryContent => 3,
-            SkipReason::Unreadable => 4,
+            SkipReason::ExtractFailed => 3,
+            SkipReason::BinaryContent => 4,
+            SkipReason::Unreadable => 5,
         }
     }
 }
+
+/// How many per-file extraction failures are kept with their reason.
+///
+/// A count alone cannot be acted on and an unbounded list is a memory leak on a
+/// corpus where every PDF is broken, so the first few are kept verbatim and the
+/// rest are only counted. The count is always the honest one.
+pub const MAX_REPORTED_EXTRACT_ERRORS: usize = 20;
 
 // ── Config / Summary ────────────────────────────────────────────────────────
 
@@ -184,6 +215,17 @@ pub struct FulltextSummary {
     /// Of `indexed`, how many were accepted by content sniffing. A large number
     /// here means the allowlist is missing formats worth adding.
     pub accepted_by_sniff: u64,
+    /// Of `indexed`, how many came out of a document parser (issue #40).
+    /// Reported separately from `accepted_by_ext` because these are the
+    /// documents whose body is a *derivation* rather than the file's own bytes.
+    pub accepted_by_extract: u64,
+    /// Up to [`MAX_REPORTED_EXTRACT_ERRORS`] `(path, reason)` pairs for files
+    /// counted under [`SkipReason::ExtractFailed`], in path order.
+    ///
+    /// Sorted rather than left in worker-completion order: a build summary that
+    /// lists different files on every run over an unchanged corpus is not
+    /// something anyone can diff.
+    pub extract_errors: Vec<(String, String)>,
     /// Per-reason skip counts. Reasons with zero hits are omitted.
     pub skipped: BTreeMap<SkipReason, u64>,
     /// Extensions of the files skipped for a *format* reason
@@ -289,9 +331,11 @@ fn register_ja_tokenizer(index: &Index) -> Result<()> {
 struct Counters {
     by_ext: AtomicU64,
     by_sniff: AtomicU64,
+    by_extract: AtomicU64,
     text_bytes: AtomicU64,
-    skipped: [AtomicU64; 5],
+    skipped: [AtomicU64; 6],
     skipped_exts: Mutex<BTreeMap<String, u64>>,
+    extract_errors: Mutex<Vec<(String, String)>>,
 }
 
 impl Counters {
@@ -305,6 +349,17 @@ impl Counters {
         self.skip(reason);
         let key = ext.unwrap_or_default().to_string();
         *self.skipped_exts.lock().unwrap().entry(key).or_insert(0) += 1;
+    }
+
+    /// Record a document that could not be parsed: counted like any other skip
+    /// (so `candidates = indexed + skipped` still holds) *and* remembered with
+    /// its reason, up to the cap.
+    fn extract_failed(&self, path: &str, ext: Option<&str>, error: &anyhow::Error) {
+        self.skip_format(SkipReason::ExtractFailed, ext);
+        let mut errors = self.extract_errors.lock().unwrap();
+        if errors.len() < MAX_REPORTED_EXTRACT_ERRORS {
+            errors.push((path.to_string(), format!("{error:#}")));
+        }
     }
 }
 
@@ -425,8 +480,9 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
 
     let elapsed_secs = t0.elapsed().as_secs_f64();
     let index_bytes = dir_size(&config.index_dir);
-    let indexed =
-        counters.by_ext.load(Ordering::Relaxed) + counters.by_sniff.load(Ordering::Relaxed);
+    let indexed = counters.by_ext.load(Ordering::Relaxed)
+        + counters.by_sniff.load(Ordering::Relaxed)
+        + counters.by_extract.load(Ordering::Relaxed);
 
     // Record the link back to the metadata index so `sagasu status` can show
     // whether the full-text index has fallen behind the crawl.
@@ -467,11 +523,16 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
         .collect();
     skipped_exts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+    let mut extract_errors = counters.extract_errors.lock().unwrap().clone();
+    extract_errors.sort();
+
     Ok(FulltextSummary {
         candidates,
         indexed,
         accepted_by_ext: counters.by_ext.load(Ordering::Relaxed),
         accepted_by_sniff: counters.by_sniff.load(Ordering::Relaxed),
+        accepted_by_extract: counters.by_extract.load(Ordering::Relaxed),
+        extract_errors,
         skipped,
         skipped_exts,
         text_bytes: counters.text_bytes.load(Ordering::Relaxed),
@@ -500,13 +561,26 @@ fn extract_and_add(
         return Ok(());
     }
 
-    let (bytes, by_ext) = match opts.text_policy.classify_ext(row.ext.as_deref()) {
+    let (body, accepted) = match opts.text_policy.classify_ext(row.ext.as_deref()) {
         ExtVerdict::Binary => {
             counters.skip_format(SkipReason::UnsupportedExt, row.ext.as_deref());
             return Ok(());
         }
+        // The document path. A failure here is *this file's* error, recorded
+        // with its reason and counted like any other skip — the scan carries
+        // on. `crate::docmeta` also converts a parser panic into this `Err`,
+        // so a single malformed PDF cannot end a crawl of a whole disk.
+        ExtVerdict::Extract(format) => {
+            match crate::docmeta::extract_body(Path::new(&row.path), format, opts.max_size) {
+                Ok(text) => (text, Accepted::Extract),
+                Err(e) => {
+                    counters.extract_failed(&row.path, row.ext.as_deref(), &e);
+                    return Ok(());
+                }
+            }
+        }
         ExtVerdict::Text => match std::fs::read(&row.path) {
-            Ok(b) => (b, true),
+            Ok(b) => (text::decode(&b), Accepted::Ext),
             Err(_) => {
                 counters.skip(SkipReason::Unreadable);
                 return Ok(());
@@ -534,7 +608,7 @@ fn extract_and_add(
                 return Ok(());
             }
             match std::fs::read(&row.path) {
-                Ok(b) => (b, false),
+                Ok(b) => (text::decode(&b), Accepted::Sniff),
                 Err(_) => {
                     counters.skip(SkipReason::Unreadable);
                     return Ok(());
@@ -543,7 +617,6 @@ fn extract_and_add(
         }
     };
 
-    let body = text::decode(&bytes);
     if body.trim().is_empty() {
         counters.skip(SkipReason::Empty);
         return Ok(());
@@ -562,12 +635,28 @@ fn extract_and_add(
         ))
         .with_context(|| format!("failed to add {} to the full-text index", row.path))?;
 
-    if by_ext {
-        counters.by_ext.fetch_add(1, Ordering::Relaxed);
-    } else {
-        counters.by_sniff.fetch_add(1, Ordering::Relaxed);
-    }
+    match accepted {
+        Accepted::Ext => counters.by_ext.fetch_add(1, Ordering::Relaxed),
+        Accepted::Sniff => counters.by_sniff.fetch_add(1, Ordering::Relaxed),
+        Accepted::Extract => counters.by_extract.fetch_add(1, Ordering::Relaxed),
+    };
     Ok(())
+}
+
+/// Which of the three routes produced a document's body.
+///
+/// A named enum rather than the `by_ext: bool` this used to be: with a third
+/// route the boolean would have had to become "true means extension *or*
+/// extractor", and a counter whose name no longer matches what it counts is how
+/// a report starts lying.
+#[derive(Debug, Clone, Copy)]
+enum Accepted {
+    /// The extension allowlist said "text"; the file's own bytes were indexed.
+    Ext,
+    /// Content sniffing said "text".
+    Sniff,
+    /// A document parser derived the body ([`crate::docmeta`]).
+    Extract,
 }
 
 // ── Search ──────────────────────────────────────────────────────────────────
@@ -1086,7 +1175,7 @@ mod tests {
 
     #[test]
     fn skip_reasons_have_distinct_slots() {
-        let mut seen = [false; 5];
+        let mut seen = [false; 6];
         for r in SkipReason::ALL {
             assert!(!seen[r.idx()], "duplicate slot for {r:?}");
             seen[r.idx()] = true;

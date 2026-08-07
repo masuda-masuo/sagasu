@@ -34,6 +34,9 @@
 //! | `version:` | version/revision markers in the file name | `version:v2` |
 //! | `pattern:` | naming conventions | `pattern:screenshot` |
 //! | `anomaly:` | contradictions between the sources | `anomaly:format-mismatch` |
+//! | `author:` | embedded metadata | `author:増田 太郎` |
+//! | `title:` | embedded metadata | `title:四半期レポート` |
+//! | `camera:` | EXIF | `camera:nikon d750` |
 //! | *(any)* | user rules | `author:masuda` |
 //!
 //! The file *name*'s word tokens deliberately do **not** become `path:` tags:
@@ -42,17 +45,22 @@
 //! and naming patterns are still extracted from the name, because those are
 //! *interpretations* of it rather than a repeat of its text.
 //!
-//! ## What is not here (deferred)
+//! ## Embedded metadata (issue #40)
 //!
-//! Embedded metadata — Office document properties, PDF info dictionaries, EXIF
-//! — is listed in design.md §6 but is not implemented in this version. It needs
-//! a ZIP+XML reader, a PDF parser and an EXIF parser, i.e. three new dependency
-//! families, and two of those same parsers are what the deferred PDF/Office
-//! *body extraction* (`crate::text`, still out of scope after M1) will need. The
-//! two belong in one issue, opened together, rather than pulling half the
-//! dependency set in twice. Until then `author:`-style tags come from user rules
-//! (see `docs/tag_rules.md`), which is where a person's own naming conventions
-//! live anyway.
+//! `author:` / `title:` / `camera:` and some `date:` values come from what the
+//! file says about *itself*: Office document properties, the PDF info
+//! dictionary, EXIF. Reading them needs three parsers, so it is
+//! [`crate::docmeta`]'s job, not this module's — by the time a
+//! [`crate::docmeta::EmbeddedMeta`] reaches [`FileFacts`] it is inert data.
+//!
+//! That placement is what keeps the determinism claim above intact: this module
+//! still makes no filesystem call, and the canonicalization that could
+//! otherwise vary per run (author order, date granularity) has already
+//! happened.
+//!
+//! A user rule writing `author:masuda` and a `dc:creator` of `Masuda` land in
+//! the same bucket on purpose. The tag carries both source bits, so
+//! `sagasu tags --file` can still say where it came from.
 //!
 //! ## Where the state lives
 //!
@@ -108,6 +116,14 @@ pub const NS_VERSION: &str = "version";
 pub const NS_PATTERN: &str = "pattern";
 /// A contradiction between two sources (`anomaly:format-mismatch`).
 pub const NS_ANOMALY: &str = "anomaly";
+/// A person the file names from the inside (`author:増田 太郎`) — OOXML
+/// `dc:creator` / `cp:lastModifiedBy`, the PDF `/Author`, EXIF `Artist`.
+pub const NS_AUTHOR: &str = "author";
+/// The document's own title (`title:四半期レポート`), which is often nothing
+/// like its file name.
+pub const NS_TITLE: &str = "title";
+/// The camera that took a photo (`camera:nikon d750`), from EXIF.
+pub const NS_CAMERA: &str = "camera";
 
 /// Namespaces that fall out of *any* path with an extension, so they say
 /// nothing about a file beyond what `ls` already showed.
@@ -219,16 +235,20 @@ pub enum TagSource {
     Name = 8,
     /// A user rule (`crate::tagrules`).
     Rule = 16,
+    /// Metadata the file carries inside itself (`crate::docmeta`): OOXML
+    /// document properties, the PDF info dictionary, EXIF.
+    Embedded = 32,
 }
 
 impl TagSource {
     /// All sources, in bit order.
-    pub const ALL: [TagSource; 5] = [
+    pub const ALL: [TagSource; 6] = [
         TagSource::Ext,
         TagSource::Magic,
         TagSource::Path,
         TagSource::Name,
         TagSource::Rule,
+        TagSource::Embedded,
     ];
 
     /// Stable label used in CLI output.
@@ -239,6 +259,7 @@ impl TagSource {
             TagSource::Path => "path",
             TagSource::Name => "name",
             TagSource::Rule => "rule",
+            TagSource::Embedded => "embedded",
         }
     }
 
@@ -270,6 +291,18 @@ pub struct FileFacts<'a> {
     /// read; the engine then works from the extension alone and the caller is
     /// told how many files were in that position.
     pub magic: Option<&'a [u8]>,
+    /// What the file says about itself from the inside (issue #40): Office
+    /// document properties, the PDF info dictionary, EXIF. `None` = not read
+    /// (not a format that carries any, the feature is off, or the caller chose
+    /// not to), and the caller is told how many files were in that position for
+    /// the same reason it is told about missing `magic`.
+    ///
+    /// This does not weaken the purity claim above. The *reading* happens in
+    /// [`crate::tagindex`], which is where the filesystem lives; by the time it
+    /// arrives here it is data, already canonicalized (authors sorted and
+    /// deduplicated, dates reduced to `YYYY-MM-DD`) so that no ordering or
+    /// formatting decision is left to be made per run.
+    pub embedded: Option<&'a crate::docmeta::EmbeddedMeta>,
 }
 
 /// The tags of one file: sorted, deduplicated, each with its source mask.
@@ -471,6 +504,33 @@ pub fn tags_for(facts: &FileFacts<'_>, rules: &RuleSet) -> TagSet {
         c.add(NS_PATTERN, &pattern, TagSource::Name);
     }
 
+    // ── embedded metadata ───────────────────────────────────────────────────
+    //
+    // Runs before the user rules and after everything derived from the name, so
+    // a document's own claim about its author lands in the same namespace as a
+    // rule-written one and the two merge into one bucket rather than competing.
+    if let Some(meta) = facts.embedded {
+        for author in &meta.authors {
+            c.add(NS_AUTHOR, author, TagSource::Embedded);
+        }
+        if let Some(title) = &meta.title {
+            c.add(NS_TITLE, title, TagSource::Embedded);
+        }
+        if let Some(camera) = &meta.camera {
+            c.add(NS_CAMERA, camera, TagSource::Embedded);
+        }
+        if let Some(date) = &meta.date {
+            // Reduced to the granularity the name-derived dates already use, so
+            // `date:2024-03` means one thing whether it came from a file name
+            // or a camera. The day is dropped for the reason given on
+            // `patterns::date_values`: an axis with one bucket per day is not
+            // navigable.
+            for value in date_values(date) {
+                c.add(NS_DATE, &value, TagSource::Embedded);
+            }
+        }
+    }
+
     // ── user rules ──────────────────────────────────────────────────────────
     if !rules.is_empty() {
         let rel_lower = rel.to_lowercase();
@@ -612,6 +672,7 @@ mod tests {
             root: Some(root),
             ext,
             magic: None,
+            embedded: None,
         }
     }
 
@@ -786,6 +847,7 @@ mod tests {
                 root: Some("/root"),
                 ext: Some("txt"),
                 magic: None,
+                embedded: None,
             },
             &rules,
         );
@@ -842,6 +904,7 @@ mod tests {
             root: Some("/root"),
             ext: Some("txt"),
             magic: None,
+            embedded: None,
         };
         let first = tags_for(&facts, &RuleSet::empty());
         let second = tags_for(&facts, &RuleSet::empty());

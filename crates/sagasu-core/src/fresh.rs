@@ -815,6 +815,19 @@ fn read_body(path: &str, size: i64, max_size: u64, policy: &text::TextPolicy) ->
             .as_deref(),
     ) {
         ExtVerdict::Binary => None,
+        // A changed `.docx` must be judged by the same rule as the indexed one,
+        // or editing a document deletes it from the answer: the index hit is
+        // dropped as changed and no live hit replaces it. That is the exact
+        // failure the stored `text_policy` exists to prevent (design.md §4-2),
+        // and a new format would have reintroduced it on the live side only.
+        //
+        // A parse failure here is `None` for the same reason the other arms
+        // are: the index would not have held a body for this file either, so
+        // both sides of the merge stay consistent. The build pass is where an
+        // extraction failure gets counted and named.
+        ExtVerdict::Extract(format) => {
+            crate::docmeta::extract_body(Path::new(path), format, max_size).ok()
+        }
         ExtVerdict::Text => std::fs::read(path).ok().map(|b| text::decode(&b)),
         ExtVerdict::Unknown => {
             let bytes = std::fs::read(path).ok()?;

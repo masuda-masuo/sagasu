@@ -4,8 +4,27 @@ version = "0.1.0"
 edition = "2021"
 description = "sagasu core library: parallel metadata crawl, SQLite index, rescan diff"
 
+[features]
+# On by default: the whole point of issue #40 is that `.docx` and `.pdf` stop
+# being invisible, and a user who has to discover a feature flag to get that is
+# in the same position as before. The split exists so the cost is *measurable*
+# and so an embedder who does not want the parsers can drop them — not as a
+# staged rollout.
+#
+# With a feature off the affected extensions fall back through to the built-in
+# denylist in `crate::text`, i.e. exactly the pre-#40 behaviour: counted under
+# `unsupported format`, never silently missing.
+default = ["office", "pdf", "exif"]
+office = ["dep:zip", "dep:quick-xml"]
+pdf = ["dep:lopdf"]
+exif = ["dep:kamadak-exif"]
+
 [dependencies]
 anyhow = { workspace = true }
+zip = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
+lopdf = { workspace = true, optional = true }
+kamadak-exif = { workspace = true, optional = true }
 ignore = { workspace = true }
 globset = { workspace = true }
 serde = { workspace = true }
@@ -20,3 +39,9 @@ lindera-tantivy = { workspace = true }
 # takes the mtime fallback and must not pull this in.
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+
+# The docmeta tests build real docx/xlsx/pptx fixtures rather than checking
+# binaries into the tree, so the *writer* half of `zip` is needed here even
+# though the crate itself only ever reads.
+[dev-dependencies]
+zip = { workspace = true }

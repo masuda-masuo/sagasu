@@ -365,11 +365,49 @@ fn binary_content_is_skipped_with_a_reason() {
         "{:?}",
         summary.skipped
     );
+    // The `.pdf` and `.xlsx` here are *not* documents — they are a handful of
+    // bytes with a plausible-looking prefix. Where they land is the whole
+    // feature contract of issue #40:
+    //
+    // - with the parser compiled in they reach it and fail, which is the
+    //   distinct reason "we read this format and this file is broken";
+    // - with the feature off they fall through to the denylist and are counted
+    //   under `unsupported format`, exactly as they were before #40.
+    //
+    // Either way they are *counted*. That is the invariant; which bucket is a
+    // property of the build.
+    let broken_documents = cfg!(feature = "pdf") as u64 + cfg!(feature = "office") as u64;
     assert_eq!(
         summary.skipped.get(&SkipReason::UnsupportedExt).copied(),
-        Some(3),
-        "PDF/Office/media are out of M1 scope but must still be counted: {:?}",
+        Some(3 - broken_documents),
+        "media has no text body and must still be counted: {:?}",
         summary.skipped
+    );
+    assert_eq!(
+        summary
+            .skipped
+            .get(&SkipReason::ExtractFailed)
+            .copied()
+            .unwrap_or(0),
+        broken_documents,
+        "{:?}",
+        summary.skipped
+    );
+    // …and the reason is kept, not just the count. A build that says "2 failed"
+    // and nothing else cannot be acted on.
+    assert_eq!(
+        summary.extract_errors.len(),
+        broken_documents as usize,
+        "{:?}",
+        summary.extract_errors
+    );
+    assert!(
+        summary
+            .extract_errors
+            .iter()
+            .all(|(path, reason)| !path.is_empty() && !reason.is_empty()),
+        "{:?}",
+        summary.extract_errors
     );
     assert_eq!(summary.skipped_total(), 4);
     assert_eq!(

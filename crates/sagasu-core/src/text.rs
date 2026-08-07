@@ -7,14 +7,28 @@
 //! through to content sniffing, so a plain-text file never disappears just
 //! because nobody thought to add its extension.
 //!
-//! ## Known limitations (M1)
+//! ## The fourth verdict: extract (issue #40)
+//!
+//! `docx` / `xlsx` / `pptx` / `pdf` are neither "read the bytes" nor "give up".
+//! They get [`ExtVerdict::Extract`], which names the parser in
+//! [`crate::docmeta`] that turns the file into text. The decision still happens
+//! *here*, in one function, so there is exactly one place that maps an
+//! extension to what will be done with the file.
+//!
+//! Those extensions remain in [`BINARY_EXTS`]. That is not redundancy: with the
+//! `office` / `pdf` features off, [`crate::docmeta::BodyFormat::from_ext`]
+//! yields nothing and the lookup falls straight through to the denylist, so a
+//! build without the parsers behaves exactly as it did before this feature
+//! existed — counted under `unsupported format`, never silently missing.
+//!
+//! ## Known limitations
 //!
 //! - Only UTF-8 (with or without BOM) is treated as text. Shift_JIS / EUC-JP /
 //!   UTF-16 files are classified as binary because we do not do charset
 //!   detection yet. They are counted and reported, not silently dropped.
-//! - PDF / Office are intentionally out of scope for M1 (issue #2); their
-//!   extensions live in [`BINARY_EXTS`] so they are reported under a distinct
-//!   skip reason rather than looking like a sniffing failure.
+//! - Legacy binary Office (`.doc` / `.xls` / `.ppt`), OpenDocument and `.rtf`
+//!   are still denylisted: they are different formats, not different
+//!   extensions for the ones above.
 
 /// Extensions accepted as text without opening the file.
 ///
@@ -56,10 +70,15 @@ pub const TEXT_EXTS: &[&str] = &[
 
 /// Extensions rejected without opening the file.
 ///
-/// Two groups live here: formats whose body extraction is out of M1 scope
-/// (PDF / Office) and formats that have no text body at all (media, archives,
-/// binaries). Both are counted under [`crate::fulltext::SkipReason::UnsupportedExt`]
-/// so a user can see *why* a file is missing from the index.
+/// Formats with no text body at all (media, archives, binaries), plus the
+/// document formats nothing in this crate can read (legacy binary Office,
+/// OpenDocument, `.rtf`, `.epub`). They are counted under
+/// [`crate::fulltext::SkipReason::UnsupportedExt`] so a user can see *why* a
+/// file is missing from the index.
+///
+/// The OOXML and PDF extensions are still listed: they are reached first by the
+/// [`ExtVerdict::Extract`] lookup when the parsers are compiled in, and this is
+/// where they land when they are not.
 ///
 /// Grouped and `rustfmt::skip`ped for the same reason as [`TEXT_EXTS`].
 #[rustfmt::skip]
@@ -99,6 +118,10 @@ const BOM_UTF8: &[u8] = &[0xEF, 0xBB, 0xBF];
 pub enum ExtVerdict {
     /// On the allowlist — index without reading a byte first.
     Text,
+    /// A document format with a body behind a parser (issue #40). The variant
+    /// carries which parser, so the caller never re-derives it from the
+    /// extension.
+    Extract(crate::docmeta::BodyFormat),
     /// On the denylist — skip without opening (out of scope or no text body).
     Binary,
     /// Neither list matched: the content has to decide (see [`sniff_is_text`]).
@@ -245,6 +268,13 @@ impl TextPolicy {
         }
         if TEXT_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
             return ExtVerdict::Text;
+        }
+        // Ahead of the denylist, and only because the parser exists in this
+        // build: with the feature off this yields `None` and the extension
+        // falls through to `BINARY_EXTS` below, which is where it lived before
+        // issue #40.
+        if let Some(format) = crate::docmeta::BodyFormat::from_ext(Some(ext)) {
+            return ExtVerdict::Extract(format);
         }
         if BINARY_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
             return ExtVerdict::Binary;
@@ -475,10 +505,37 @@ mod tests {
     }
 
     #[test]
-    fn office_and_pdf_are_denylisted_not_unknown() {
+    fn office_and_pdf_route_to_an_extractor_when_built_with_one() {
         for ext in ["pdf", "docx", "xlsx", "pptx"] {
-            assert_eq!(classify_ext(Some(ext)), ExtVerdict::Binary);
+            let verdict = classify_ext(Some(ext));
+            let extracting = matches!(verdict, ExtVerdict::Extract(_));
+            // The two builds are both correct; what must never happen is
+            // `Unknown`, which would send a binary document to the sniffer and
+            // report it as a *content* failure instead of a format decision.
+            let expected_without_parsers =
+                cfg!(not(feature = "office")) || cfg!(not(feature = "pdf"));
+            assert!(
+                extracting || (expected_without_parsers && verdict == ExtVerdict::Binary),
+                "{ext} classified as {verdict:?}"
+            );
         }
+    }
+
+    #[test]
+    fn legacy_binary_office_stays_on_the_denylist() {
+        // `.doc` is not `.docx` with a shorter name; nothing here can read it.
+        for ext in ["doc", "xls", "ppt", "odt", "rtf"] {
+            assert_eq!(classify_ext(Some(ext)), ExtVerdict::Binary, "{ext}");
+        }
+    }
+
+    #[test]
+    fn a_user_text_extension_still_beats_the_extractor() {
+        // Precedence is documented on `TextPolicy`: the user is looking at the
+        // files and we are not. Someone whose `.docx` are really plain text
+        // must be able to say so.
+        let p = policy_with_text(&["docx"]);
+        assert_eq!(p.classify_ext(Some("docx")), ExtVerdict::Text);
     }
 
     #[test]

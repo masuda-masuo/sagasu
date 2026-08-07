@@ -105,7 +105,11 @@ name = "acme の案件"
 path = "clients/acme/**"
 tags = ["client:acme", "billing:billable"]
 
-# --- 作成者(埋め込みメタデータの代わり) --------------------------------
+# --- 作成者(埋め込みメタデータを補う) ------------------------------------
+# issue #40 以降、`author:` は docx/xlsx/pptx の `dc:creator` / `cp:lastModifiedBy`、
+# PDF の /Author、EXIF の Artist からも自動で付く(`sagasu tag` の既定)。
+# ルールはその代わりではなく上乗せ: 同じ名前空間なので和集合になり、
+# メタデータを持たないファイル(テキスト・画像・古い形式)をここで拾える。
 [[rule]]
 path = "**/masuda/**"
 tags = ["author:masuda"]

@@ -64,6 +64,8 @@ fn tag(db_dir: &Path, read_magic: bool) -> tagindex::TagSummary {
         rules_path: None,
         read_magic,
         magic_max_size: u64::MAX,
+        read_embedded: true,
+        embedded_max_size: tagindex::DEFAULT_EMBEDDED_MAX_SIZE,
     })
     .unwrap()
 }
@@ -80,6 +82,8 @@ fn tag_with_rules(db_dir: &Path, rules: &Path, read_magic: bool) -> tagindex::Ta
         rules_path: Some(rules.to_path_buf()),
         read_magic,
         magic_max_size: u64::MAX,
+        read_embedded: true,
+        embedded_max_size: tagindex::DEFAULT_EMBEDDED_MAX_SIZE,
     })
     .unwrap()
 }
@@ -424,6 +428,8 @@ fn a_broken_rule_file_is_rejected_before_the_build_touches_anything() {
         rules_path: Some(bad),
         read_magic: true,
         magic_max_size: u64::MAX,
+        read_embedded: true,
+        embedded_max_size: tagindex::DEFAULT_EMBEDDED_MAX_SIZE,
     })
     .unwrap_err();
     assert!(

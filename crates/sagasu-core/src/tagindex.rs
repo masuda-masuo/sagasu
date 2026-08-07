@@ -21,6 +21,7 @@ use std::time::{Instant, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use rusqlite::params;
 
+use crate::docmeta;
 use crate::store::{FileRow, Store, MAGIC_LEN};
 use crate::tagrules::RuleSet;
 use crate::tags::{self, Tag};
@@ -59,7 +60,29 @@ pub struct TagConfig {
     /// Skip the head read for files larger than this. Reading the head of a
     /// huge file is cheap, but seeking into a cold archive is not free either.
     pub magic_max_size: u64,
+    /// Read embedded metadata (Office properties, PDF info, EXIF) for the
+    /// formats that carry it — issue #40, and the source of `author:` /
+    /// `title:` / `camera:`.
+    ///
+    /// On by default. Off is for the case where the parse cost is not worth it
+    /// on this corpus; the coverage numbers then say so rather than the tags
+    /// quietly not appearing.
+    pub read_embedded: bool,
+    /// Skip embedded metadata for files larger than this.
+    ///
+    /// Unlike the `magic` head read, this one opens and parses the container:
+    /// a 400 MB PDF costs real time. The default is deliberately generous
+    /// enough to cover ordinary documents and photos and mean enough to keep a
+    /// crawl off video-sized files that happen to be named `.pdf`.
+    pub embedded_max_size: u64,
 }
+
+/// Default ceiling for [`TagConfig::embedded_max_size`].
+pub const DEFAULT_EMBEDDED_MAX_SIZE: u64 = 64 * 1024 * 1024;
+
+/// How many per-file metadata failures are kept with their reason, for the same
+/// reason as [`crate::fulltext::MAX_REPORTED_EXTRACT_ERRORS`].
+pub const MAX_REPORTED_EMBEDDED_ERRORS: usize = 20;
 
 impl TagConfig {
     /// Config with the documented defaults for a database.
@@ -69,6 +92,8 @@ impl TagConfig {
             rules_path: None,
             read_magic: true,
             magic_max_size: u64::MAX,
+            read_embedded: true,
+            embedded_max_size: DEFAULT_EMBEDDED_MAX_SIZE,
         }
     }
 }
@@ -109,6 +134,20 @@ pub struct TagSummary {
     pub magic_read: u64,
     /// Files the head read could not open.
     pub magic_unreadable: u64,
+    /// Files whose format can carry embedded metadata (issue #40) — the
+    /// denominator the two numbers below are read against.
+    pub embedded_candidates: u64,
+    /// Files that yielded at least one embedded property.
+    pub embedded_read: u64,
+    /// Files whose container could not be parsed.
+    ///
+    /// A file with *no* metadata is not counted here: most JPEGs have no EXIF
+    /// and most documents have no title, and folding those in would put a
+    /// five-figure number next to the word "failed".
+    pub embedded_failed: u64,
+    /// Up to [`MAX_REPORTED_EMBEDDED_ERRORS`] `(path, reason)` pairs for those
+    /// failures, in path order.
+    pub embedded_errors: Vec<(String, String)>,
     /// Files that hit [`tags::MAX_TAGS_PER_FILE`].
     pub capped: u64,
     /// Tags the cap discarded, summed over every file.
@@ -213,11 +252,13 @@ pub fn build(config: &TagConfig) -> Result<TagSummary> {
             summary.files += 1;
 
             let magic = resolve_magic(&store, row, config, &mut summary);
+            let embedded = resolve_embedded(row, config, &mut summary);
             let facts = tags::FileFacts {
                 path: &row.path,
                 root: root.as_deref(),
                 ext: row.ext.as_deref(),
                 magic: magic.as_deref(),
+                embedded: embedded.as_ref(),
             };
             let set = tags::tags_for(&facts, &rules);
 
@@ -339,6 +380,42 @@ fn resolve_magic(
         }
         None => {
             summary.magic_unreadable += 1;
+            None
+        }
+    }
+}
+
+/// The embedded metadata to tag a file with, reading it if asked to.
+///
+/// Returns `None` for anything that is not a metadata-bearing format, is over
+/// the size ceiling, or came back empty — `Some(empty)` and `None` would
+/// produce identical tags, and collapsing them keeps the "how many files
+/// actually said something" number honest.
+fn resolve_embedded(
+    row: &FileRow,
+    config: &TagConfig,
+    summary: &mut TagSummary,
+) -> Option<docmeta::EmbeddedMeta> {
+    let format = docmeta::MetaFormat::from_ext(row.ext.as_deref())?;
+    summary.embedded_candidates += 1;
+    if !config.read_embedded || row.size <= 0 || row.size as u64 > config.embedded_max_size {
+        return None;
+    }
+    match docmeta::extract_meta(Path::new(&row.path), format) {
+        Ok(meta) if meta.is_empty() => None,
+        Ok(meta) => {
+            summary.embedded_read += 1;
+            Some(meta)
+        }
+        Err(e) => {
+            // Same rule as the full-text pass: a broken file costs one row and
+            // a recorded reason, never the run.
+            summary.embedded_failed += 1;
+            if summary.embedded_errors.len() < MAX_REPORTED_EMBEDDED_ERRORS {
+                summary
+                    .embedded_errors
+                    .push((row.path.clone(), format!("{e:#}")));
+            }
             None
         }
     }
@@ -696,6 +773,15 @@ pub fn explain(
     let magic = read_magic
         .then(|| read_head(&path_str, MAGIC_LEN))
         .flatten();
+    // `read_magic` is really "you may open this file", and it governs the
+    // embedded read too. Without that, `sagasu tags --explain` on a `.docx`
+    // would print a tag set with no `author:` in it and the user would go
+    // looking for a bug in their rule file instead of in the flag.
+    let embedded = read_magic
+        .then(|| docmeta::MetaFormat::from_ext(ext.as_deref()))
+        .flatten()
+        .and_then(|format| docmeta::extract_meta(path, format).ok())
+        .filter(|meta| !meta.is_empty());
 
     Ok(tags::tags_for(
         &tags::FileFacts {
@@ -703,6 +789,7 @@ pub fn explain(
             root,
             ext: ext.as_deref(),
             magic: magic.as_deref(),
+            embedded: embedded.as_ref(),
         },
         rules,
     ))

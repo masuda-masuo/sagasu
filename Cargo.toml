@@ -15,6 +15,26 @@ globset = "0.4"
 # already uses, so the project has one config language rather than two.
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+# ── Embedded document formats (issue #40) ────────────────────────────────────
+# OOXML (docx/xlsx/pptx) is a ZIP of XML parts, so the container and the parser
+# are two small crates rather than one library per format.
+#
+# `deflate-flate2-zlib-rs` is `deflate` (the feature a reader needs) minus
+# `zopfli`: zopfli is a *compressor* tuned for maximum ratio at glacial speed,
+# which an indexer never runs. That was the open question left on issue #40's
+# dependency comparison — the answer is one crate lighter than the estimate.
+# Plain `deflate-flate2` is not enough: it pulls flate2 with no backend
+# selected, which only builds by accident when another dependency happens to
+# choose one (it does not, in the `--no-default-features` build).
+zip = { version = "8", default-features = false, features = [
+    "deflate-flate2-zlib-rs",
+] }
+quick-xml = "0.41"
+# PDF. `default-features = false` is load-bearing: the default set pulls three
+# date/time libraries (chrono / jiff / time) and rayon, none of which text
+# extraction touches. Checked with `cargo tree -p sagasu-core --edges normal`.
+lopdf = { version = "0.44", default-features = false }
+kamadak-exif = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
 tantivy = "0.25"
