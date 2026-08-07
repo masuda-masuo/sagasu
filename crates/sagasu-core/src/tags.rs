@@ -470,9 +470,9 @@ pub fn tags_for(facts: &FileFacts<'_>, rules: &RuleSet) -> TagSet {
 /// makes one rule file usable on both platforms, and what stops a `path:` tag
 /// from encoding which machine ran the crawl.
 pub fn relative_path(path: &str, root: Option<&str>) -> String {
-    let norm = path.replace('\\', "/");
+    let norm = normalize_separators(path);
     if let Some(root) = root {
-        let root = root.replace('\\', "/");
+        let root = normalize_separators(root);
         let root = root.trim_end_matches('/');
         // Compared as bytes on purpose. `str::split_at` panics when the index is
         // not a character boundary, and `root.len()` lands mid-character
@@ -500,6 +500,32 @@ pub fn relative_path(path: &str, root: Option<&str>) -> String {
     match stripped.split_once('/') {
         Some((first, rest)) if first.len() == 2 && first.ends_with(':') => rest.to_string(),
         _ => stripped.to_string(),
+    }
+}
+
+/// `\` → `/`, with any Windows verbatim prefix removed.
+///
+/// `std::fs::canonicalize` returns `\\?\C:\…` on Windows (and
+/// `\\?\UNC\server\share\…` for network paths), and that is what `sagasu index`
+/// stores, so the prefix is the *ordinary* case there rather than an exotic one.
+/// Left in place it survives the `\`→`/` swap as `//?/C:/…`, and the fallback
+/// below then reads `?` as the first component and `c:` as the second — turning
+/// a drive letter into a facet bucket (`path:c:`) and making every file look
+/// like it diverged from the crawl root.
+///
+/// Stripping it also lets a root recorded one way match a path recorded the
+/// other, which is the same normalisation `delta::path_under` needs and for the
+/// same reason (design.md §5-2).
+fn normalize_separators(path: &str) -> String {
+    let norm = path.replace('\\', "/");
+    let Some(rest) = norm.strip_prefix("//?/") else {
+        return norm;
+    };
+    // `\\?\UNC\server\share` denotes `\\server\share`; keep it a UNC path
+    // rather than letting `UNC` become a directory token.
+    match rest.get(..4) {
+        Some(p) if p.eq_ignore_ascii_case("unc/") => format!("//{}", &rest[4..]),
+        _ => rest.to_string(),
     }
 }
 
@@ -1192,6 +1218,57 @@ mod tests {
         // Comparing by byte index here used to be a panic, not a mismatch.
         assert_eq!(relative_path("/写真/a.txt", Some("/ab")), "写真/a.txt");
         assert_eq!(relative_path("/a/写真", Some("/a/写")), "a/写真");
+    }
+
+    #[test]
+    fn a_windows_verbatim_prefix_does_not_become_a_path_tag() {
+        // What `std::fs::canonicalize` actually returns on Windows, which is
+        // what `sagasu index` stores — so this is the common case there.
+        assert_eq!(
+            relative_path(r"\\?\C:\work\docs\a.txt", Some(r"\\?\C:\work")),
+            "docs/a.txt"
+        );
+        // A root recorded one way and a path the other must still line up.
+        assert_eq!(
+            relative_path(r"\\?\C:\work\docs\a.txt", Some(r"C:\work")),
+            "docs/a.txt"
+        );
+        assert_eq!(
+            relative_path(r"C:\work\docs\a.txt", Some(r"\\?\C:\work")),
+            "docs/a.txt"
+        );
+        // Outside the root: the fallback must not leave `?` and `c:` behind as
+        // components — `path:c:` is a bucket that means nothing.
+        let outside = relative_path(r"\\?\C:\other\a.txt", Some(r"\\?\C:\work"));
+        assert_eq!(outside, "other/a.txt");
+        // UNC keeps its share, and `UNC` itself is not a directory.
+        assert_eq!(
+            relative_path(r"\\?\UNC\server\share\docs\a.txt", None),
+            "server/share/docs/a.txt"
+        );
+        assert_eq!(
+            relative_path(
+                r"\\?\UNC\server\share\docs\a.txt",
+                Some(r"\\?\UNC\server\share")
+            ),
+            "docs/a.txt"
+        );
+    }
+
+    #[test]
+    fn a_verbatim_path_yields_no_meaningless_tags() {
+        let set = tags_for(
+            &facts(r"\\?\C:\other\invoices\a.txt", r"\\?\C:\work", Some("txt")),
+            &RuleSet::empty(),
+        );
+        let path_tags = values(&set, NS_PATH);
+        assert!(path_tags.contains(&"invoices".to_string()), "{path_tags:?}");
+        for junk in ["c:", "?", "unc"] {
+            assert!(
+                !path_tags.contains(&junk.to_string()),
+                "{junk:?} is not a directory: {path_tags:?}"
+            );
+        }
     }
 
     #[test]
