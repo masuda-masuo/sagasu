@@ -10,6 +10,7 @@ mingw クロスビルドを人手でアップロードする経路ではない(�
 |---|---|---|
 | proto-crawl | `ignore` 並列走査 + BLAKE3 + SQLite 投入の速度 | #1 (M0) |
 | proto-fulltext | tantivy + Lindera の索引/検索、**fresh-search**(mtime 差分マージ) | #2 (M1), #3 (M2 フォールバック) |
+| proto-ftcompare | tantivy vs SQLite FTS5 の対比計測(同一コーパス・同一本文抽出・同一トークナイザ) | #35 (design.md §11) |
 | proto-usn | NTFS USN Journal の差分照会速度(Windows 専用・要管理者権限) | #3 (M2 本命) |
 
 ## VM (Linux) での計測結果 — 2026-07-27
@@ -20,6 +21,35 @@ mingw クロスビルドを人手でアップロードする経路ではない(�
 - proto-fulltext index: 0.32s、索引サイズ 0.9MiB(元データの ~40%)
 - 検索: 日本語「空港」23ms / 英語 "delta merge" 46ms(コールド、プロセス起動込み)
 - **fresh-search: 索引を作り直さずに 追加=live反映 / 変更=live置換 / 削除=除外 が全部成立**。差分オーバーヘッドは delta-walk 9.8ms + live-grep 0.3ms
+
+## proto-ftcompare — tantivy vs SQLite FTS5 (issue #35)
+
+`docs/design.md` §11 の open question に数字で答えるための使い捨てプロトタイプ。3エンジン
+(`tantivy` / `fts5-lindera` / `fts5-trigram`)が**同じ走査・同じ本文抽出・同じアナライザ**を
+共有するので、差はエンジンだけになる。結論と数字は design.md §11 にある。
+
+```bash
+cargo build --release --manifest-path prototypes/Cargo.toml -p proto-ftcompare
+export PATH="$PWD/prototypes/target/release:$PATH"
+
+bench gen --out /tmp/tree --files 100000 --seed 42
+
+# 索引を作る(構築時間・索引サイズ・本文に対する比を印字)
+proto-ftcompare index /tmp/tree --engine tantivy --index-dir /tmp/idx-tantivy
+
+# 検索(--repeat N でプロセス内 warm p50/p95、固定コストを含まない)
+proto-ftcompare search 全文検索 --engine tantivy --index-dir /tmp/idx-tantivy --repeat 21
+
+# 検索品質: 同じ抽出結果に対する literal な部分一致(grep 相当)と突き合わせる
+proto-ftcompare recall /tmp/tree 全文検索 --engine tantivy --index-dir /tmp/idx-tantivy
+
+# 1文書だけ置き換える差分更新のコスト
+proto-ftcompare update --engine tantivy --index-dir /tmp/idx-tantivy --path /tmp/tree/d0000/f000001.txt
+```
+
+ベンチ基盤から回す場合は `bench run --config bench/configs/ftcompare-linux.toml`。
+**バイナリは PATH に置くこと** — harness は各ターゲットの `{workdir}` を作業ディレクトリにして
+子プロセスを起こすので、`./proto-ftcompare` はそのスクラッチディレクトリを見に行って落ちる。
 
 ## 自宅 (Windows) での確認手順
 

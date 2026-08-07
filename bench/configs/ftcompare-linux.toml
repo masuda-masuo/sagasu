@@ -1,0 +1,192 @@
+# tantivy vs SQLite FTS5 — the docs/design.md §11 comparison (issue #35).
+#
+# Binary location
+# ---------------
+# The command is given as a bare name and resolved through PATH. It is *not*
+# `./proto-ftcompare`: the harness spawns every command with its working
+# directory set to that target's `{workdir}` (bench/src/run.rs), so a `./`
+# prefix would look for the binary inside the per-target scratch directory and
+# fail with "entity not found" — which is exactly what the first run of this
+# config did.
+#
+#   cargo build --release --manifest-path prototypes/Cargo.toml -p proto-ftcompare
+#   export PATH="$PWD/prototypes/target/release:$PATH"
+#
+# What this config measures
+# -------------------------
+# Three engines over one generated tree, identical corpus and identical body
+# extraction (the binary shares one walker between them):
+#
+#   tantivy       — tantivy 0.25, Lindera IPADIC + LowerCaser  (the shipped one)
+#   fts5-lindera  — SQLite FTS5, the same Lindera token stream joined with
+#                   spaces and handed to unicode61
+#   fts5-trigram  — SQLite FTS5, the trigram tokenizer (substring matching)
+#
+# Both FTS5 tables are contentless (`content=''`), while the tantivy schema
+# stores the body as the product schema does. `proto-ftcompare index` prints
+# the stored-body subtotal separately so the index-only sizes are comparable.
+#
+# Queries
+# -------
+#   en-common  `benchmark`  — planted in ~58 % of files
+#   ja-common  `性能`       — planted in ~58 % of files, and *two characters*,
+#                             which the trigram tokenizer cannot match at all
+#   ja-rare    `全文検索`   — the only planted term absent from the word pools
+#   mixed      `delta merge`— a two-token phrase
+#
+# Floor target
+# ------------
+# Every trial pays process startup, index open and — for tantivy and
+# fts5-lindera — the embedded IPADIC load. `ftc-floor-*` runs the same
+# invocation with `qzxv9floorprobe`, a token `bench gen` never plants, so its
+# warm p50 is that fixed cost. The search targets subtract it via `floor`.
+# The floor is per engine on purpose: fts5-trigram loads no dictionary, and
+# that difference is a real part of the answer.
+#
+# `--repeat 1` on every search target: the harness is measuring one query per
+# process here. Use `proto-ftcompare search --repeat N` directly when you want
+# warm in-process p50/p95 with the fixed cost excluded.
+
+# ── tantivy ────────────────────────────────────────────────────────────────
+
+[[target]]
+name = "ftc-index-tantivy"
+command = "proto-ftcompare"
+args = ["index", "{root}", "--engine", "tantivy", "--index-dir", "{workdir}/idx"]
+repeat = 2
+
+[[target]]
+name = "ftc-floor-tantivy"
+command = "proto-ftcompare"
+args = ["search", "qzxv9floorprobe", "--engine", "tantivy", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "tantivy", "--index-dir", "{workdir}/idx"] }
+
+[[target]]
+name = "ftc-search-en-common-tantivy"
+command = "proto-ftcompare"
+args = ["search", "benchmark", "--engine", "tantivy", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "tantivy", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-tantivy"
+
+[[target]]
+name = "ftc-search-ja-common-tantivy"
+command = "proto-ftcompare"
+args = ["search", "性能", "--engine", "tantivy", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "tantivy", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-tantivy"
+
+[[target]]
+name = "ftc-search-ja-rare-tantivy"
+command = "proto-ftcompare"
+args = ["search", "全文検索", "--engine", "tantivy", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "tantivy", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-tantivy"
+
+[[target]]
+name = "ftc-search-mixed-tantivy"
+command = "proto-ftcompare"
+args = ["search", "delta merge", "--engine", "tantivy", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "tantivy", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-tantivy"
+
+# ── SQLite FTS5, Lindera-segmented into unicode61 ──────────────────────────
+
+[[target]]
+name = "ftc-index-fts5-lindera"
+command = "proto-ftcompare"
+args = ["index", "{root}", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx"]
+repeat = 2
+
+[[target]]
+name = "ftc-floor-fts5-lindera"
+command = "proto-ftcompare"
+args = ["search", "qzxv9floorprobe", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx"] }
+
+[[target]]
+name = "ftc-search-en-common-fts5-lindera"
+command = "proto-ftcompare"
+args = ["search", "benchmark", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-fts5-lindera"
+
+[[target]]
+name = "ftc-search-ja-common-fts5-lindera"
+command = "proto-ftcompare"
+args = ["search", "性能", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-fts5-lindera"
+
+[[target]]
+name = "ftc-search-ja-rare-fts5-lindera"
+command = "proto-ftcompare"
+args = ["search", "全文検索", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-fts5-lindera"
+
+[[target]]
+name = "ftc-search-mixed-fts5-lindera"
+command = "proto-ftcompare"
+args = ["search", "delta merge", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "fts5-lindera", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-fts5-lindera"
+
+# ── SQLite FTS5, trigram ──────────────────────────────────────────────────
+#
+# `ja-common` (`性能`) is kept in the list even though the trigram tokenizer
+# returns nothing for a two-character query. That zero is the measurement.
+
+[[target]]
+name = "ftc-index-fts5-trigram"
+command = "proto-ftcompare"
+args = ["index", "{root}", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx"]
+repeat = 2
+
+[[target]]
+name = "ftc-floor-fts5-trigram"
+command = "proto-ftcompare"
+args = ["search", "qzxv9floorprobe", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx"] }
+
+[[target]]
+name = "ftc-search-en-common-fts5-trigram"
+command = "proto-ftcompare"
+args = ["search", "benchmark", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-fts5-trigram"
+
+[[target]]
+name = "ftc-search-ja-common-fts5-trigram"
+command = "proto-ftcompare"
+args = ["search", "性能", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-fts5-trigram"
+
+[[target]]
+name = "ftc-search-ja-rare-fts5-trigram"
+command = "proto-ftcompare"
+args = ["search", "全文検索", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-fts5-trigram"
+
+[[target]]
+name = "ftc-search-mixed-fts5-trigram"
+command = "proto-ftcompare"
+args = ["search", "delta merge", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx", "--repeat", "1"]
+repeat = 10
+setup = { command = "proto-ftcompare", args = ["index", "{root}", "--engine", "fts5-trigram", "--index-dir", "{workdir}/idx"] }
+floor = "ftc-floor-fts5-trigram"
