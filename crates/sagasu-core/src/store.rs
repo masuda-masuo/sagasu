@@ -78,6 +78,53 @@ CREATE TABLE IF NOT EXISTS file_tags (
 CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag_id, file_id);
 ";
 
+/// Read `meta.schema_version` from a connection whose schema may not exist yet.
+///
+/// Deliberately tolerant of a missing `meta` table — that is the brand-new
+/// database case, not an error — but *not* of a `meta` table holding something
+/// unparseable, which means the file is not a sagasu index (or is corrupt).
+fn stored_schema_version(conn: &Connection) -> Result<Option<i64>> {
+    let has_meta: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
+    if !has_meta {
+        return Ok(None);
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else { return Ok(None) };
+    let version = raw.parse().with_context(|| {
+        format!("database has an unparseable schema_version {raw:?}; refusing to use it")
+    })?;
+    Ok(Some(version))
+}
+
+/// Refuse a database written by a *newer* build.
+///
+/// Silently operating on a schema we do not understand is the "quietly wrong
+/// answer" failure this project treats as the worst kind: an unknown column
+/// would simply never be read, and nothing would say so. The check is a free
+/// function so it can run before the connection is wrapped in a [`Store`] — and
+/// therefore before any DDL touches the file.
+fn check_schema_version(stored: Option<i64>) -> Result<()> {
+    let Some(from) = stored else { return Ok(()) };
+    if from > SCHEMA_VERSION {
+        bail!(
+            "database schema version {from} is newer than this build understands \
+             ({SCHEMA_VERSION}); upgrade sagasu rather than letting it read a \
+             schema it does not know"
+        );
+    }
+    Ok(())
+}
+
 // ── FileRow ─────────────────────────────────────────────────────────────────
 
 /// A row from the `files` table.
@@ -143,6 +190,11 @@ pub struct Store {
 impl Store {
     /// Open (or create) the index database at `path`, enabling WAL mode and
     /// ensuring the schema exists.
+    ///
+    /// The version gate runs **before** any DDL. Refusing a database and then
+    /// having already written tables into it is not a refusal: the next build
+    /// would find structures a newer sagasu did not put there. So the order is
+    /// read the stored version → decide → only then create anything.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path.as_ref())
             .with_context(|| format!("failed to open database {:?}", path.as_ref()))?;
@@ -152,10 +204,13 @@ impl Store {
         // Enable foreign keys for access_history references.
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
+        let stored = stored_schema_version(&conn)?;
+        check_schema_version(stored)?;
+
         conn.execute_batch(SCHEMA_DDL)?;
 
         let store = Self { conn };
-        store.migrate()?;
+        store.migrate(stored)?;
         Ok(store)
     }
 
@@ -168,29 +223,17 @@ impl Store {
     /// additive — a version that rewrites a column needs real steps here, keyed
     /// off `from`.
     ///
-    /// A database written by a *newer* build is refused rather than opened.
-    /// Silently operating on a schema we do not understand is the "quietly
-    /// wrong answer" failure this project treats as the worst kind: an unknown
-    /// column would simply never be read, and nothing would say so.
-    fn migrate(&self) -> Result<()> {
-        let Some(raw) = self.meta_get("schema_version")? else {
+    /// `from` is the version read *before* the DDL ran; the refusal of a newer
+    /// schema already happened there ([`check_schema_version`]), because by this
+    /// point the tables would already exist.
+    fn migrate(&self, from: Option<i64>) -> Result<()> {
+        let Some(from) = from else {
             // No version recorded: either a brand-new database (the DDL above
             // just created everything at the current version) or one from
             // before versioning existed. Either way the tables are current now.
             // `ensure_schema_version` stamps it at the start of the next crawl.
             return Ok(());
         };
-        let from: i64 = raw.parse().with_context(|| {
-            format!("database has an unparseable schema_version {raw:?}; refusing to use it")
-        })?;
-
-        if from > SCHEMA_VERSION {
-            bail!(
-                "database schema version {from} is newer than this build understands \
-                 ({SCHEMA_VERSION}); upgrade sagasu rather than letting it read a \
-                 schema it does not know"
-            );
-        }
         if from < SCHEMA_VERSION {
             self.meta_set("schema_version", &SCHEMA_VERSION.to_string())?;
         }

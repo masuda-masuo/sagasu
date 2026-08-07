@@ -70,6 +70,11 @@ not opened. A column the build does not know about would simply never be read,
 and nothing would say so — the same class of silent wrongness the freshness
 design exists to prevent.
 
+The version is read **before** any DDL runs, so a refused database is left
+byte-for-byte as it was. Creating this build's tables and *then* declining to use
+the file would not be a refusal at all: the newer sagasu would come back to a
+database carrying structures it never wrote.
+
 ## Key columns
 
 | Column | Type | NULL semantics |

@@ -626,8 +626,15 @@ fn a_v1_database_gains_the_tag_tables_without_losing_its_files() {
 #[test]
 fn a_database_from_a_newer_build_is_refused_rather_than_misread() {
     let (_d, db) = tmp_dirs("future");
+    // A database claiming a schema this build does not know, and *missing* the
+    // tables this build would create. Dropping them is what makes the refusal
+    // checkable: if the DDL ran before the version gate, they would come back.
     {
         let store = Store::open(db_path(&db)).unwrap();
+        store
+            .conn()
+            .execute_batch("DROP TABLE file_tags; DROP TABLE tags;")
+            .unwrap();
         store
             .meta_set(
                 "schema_version",
@@ -635,6 +642,12 @@ fn a_database_from_a_newer_build_is_refused_rather_than_misread() {
             )
             .unwrap();
     }
+    let before = table_names(&db_path(&db));
+    assert!(
+        !before.contains(&"tags".to_string()),
+        "the fixture must start without the tag tables: {before:?}"
+    );
+
     let err = match Store::open(db_path(&db)) {
         Ok(_) => panic!("opening a future-schema database must fail"),
         Err(e) => e,
@@ -643,4 +656,26 @@ fn a_database_from_a_newer_build_is_refused_rather_than_misread() {
         err.to_string().contains("newer than this build"),
         "unexpected error: {err}"
     );
+
+    // A refusal that has already written to the database is not a refusal: the
+    // next build would find tables a newer sagasu never put there.
+    assert_eq!(
+        before,
+        table_names(&db_path(&db)),
+        "a refused open must not have changed the database"
+    );
+}
+
+/// Table names in a SQLite file, read through a connection that runs no DDL.
+fn table_names(db: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap();
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    names
 }
