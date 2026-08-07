@@ -248,8 +248,21 @@ pub fn cmd_tags(args: TagsArgs) -> Result<()> {
         .map(|t| Tag::parse(t))
         .collect::<Result<Vec<_>>>()?;
 
-    let rows = tagindex::files_with_tags(&store, &tags, args.limit as i64)?;
+    let page = tagindex::files_with_tags(&store, &tags, args.limit as i64)?;
     let total = tagindex::count_files_with_tags(&store, &tags)?;
+    let fetched = page.len() as i64;
+
+    // Deletion is invisible to every delta source — a walk only reports what is
+    // there — so the freshness design catches it on the other side, by checking
+    // the hits themselves (design.md §5). `sagasu find` does; without this,
+    // `sagasu tags` listed paths that `find` had already dropped at the same
+    // instant. `--no-fresh` skips it, and says so rather than looking checked.
+    let (rows, gone) = if args.no_fresh {
+        (page, Vec::new())
+    } else {
+        tagindex::partition_existing(page)
+    };
+
     let labels: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
     println!("tags    : {}", labels.join(" AND "));
     // `N of M`, matching `sagasu search`. Printing the page length alone would
@@ -259,12 +272,54 @@ pub fn cmd_tags(args: TagsArgs) -> Result<()> {
     for row in &rows {
         println!("{:>8}  {}", row.file_id, row.path);
     }
-    if rows.is_empty() {
+
+    if !gone.is_empty() {
+        // Named, not just counted: "two rows were stale" and "these two paths no
+        // longer exist" are different amounts of help when the next step is
+        // deciding whether to re-index.
+        println!(
+            "dropped : {} of the {fetched} row(s) on this page no longer exist on disk",
+            gone.len()
+        );
+        for row in &gone {
+            println!(
+                "{:>8}  {}  (deleted since the index was built)",
+                row.file_id, row.path
+            );
+        }
+    }
+
+    if rows.is_empty() && gone.is_empty() {
         println!("          (no live file carries all of these tags)");
-    } else if total > rows.len() as i64 {
+    }
+    if total > fetched {
         println!(
             "          ({} more — raise --limit/-n to see them)",
-            total - rows.len() as i64
+            total - fetched
+        );
+    }
+    // The total comes from the index and was never existence-checked, so it can
+    // only ever be an upper bound. Say which number was verified and which was
+    // not, rather than letting `of {total}` read as a fact.
+    if !gone.is_empty() || (args.no_fresh && total > 0) {
+        println!(
+            "          (the {total} total is the indexed count — an upper bound; \
+             only the rows above were checked against the filesystem)"
+        );
+    }
+
+    if args.no_fresh {
+        eprintln!(
+            "WARNING: --no-fresh: the listed paths were not checked against the \
+             filesystem, so files deleted since the index was built are listed as \
+             if they still existed."
+        );
+    } else if !gone.is_empty() {
+        eprintln!(
+            "WARNING: index is stale: {} of the files carrying these tags have been \
+             deleted since it was built — re-run `sagasu index <root>` and \
+             `sagasu tag`.",
+            gone.len()
         );
     }
     Ok(())
@@ -449,8 +504,9 @@ fn report_tag_freshness(store: &Store, stats: &sagasu_core::store::IndexStats, a
     // claims, and only the first one is ever knowable from the database alone.
     println!(
         "snapshot: tags describe the corpus as of that scan. Files created or \
-         renamed since are not in the tag layer at all, and are not merged in \
-         here the way `sagasu find` merges them (issue #5)."
+         renamed since carry no tags and are not merged in here the way \
+         `sagasu find` merges them (issue #5); files deleted since are dropped \
+         from a listing by an existence check, and reported."
     );
     if let Some(rules) = &stats.tag_rules {
         if !rules.is_empty() {

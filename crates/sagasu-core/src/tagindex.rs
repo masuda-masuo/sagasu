@@ -378,6 +378,21 @@ fn intern_tag(tx: &rusqlite::Transaction<'_>, tag: &Tag) -> Result<i64> {
 
 // ── Queries ─────────────────────────────────────────────────────────────────
 
+/// Restricts a `file_tags` query to files that are still live.
+///
+/// `file_tags` is only rebuilt by `sagasu tag`, but tombstones are created by
+/// `sagasu index`, so between a crawl and the next tag pass the junction table
+/// holds rows for files the index already knows are gone. Every count a user
+/// reads has to exclude them or the facet tree disagrees with the drill-down it
+/// leads to: measured on a three-file corpus with two deleted and re-crawled,
+/// `sagasu tags kind:` offered `3 kind:text` while `sagasu tags kind:text`
+/// answered `1 of 1 files`. A facet bucket that promises three and delivers one
+/// is worse than one that was never offered.
+///
+/// Shared as one string so the aggregate queries and [`files_with_tags`] cannot
+/// drift apart on what "live" means.
+const LIVE_FILES_JOIN: &str = "JOIN files f ON f.file_id = ft.file_id AND f.deleted_at IS NULL";
+
 /// A tag and the number of live files carrying it.
 #[derive(Debug, Clone)]
 pub struct TagCount {
@@ -399,13 +414,16 @@ pub struct NamespaceCount {
 }
 
 /// Namespaces present in the index, most-used first, then alphabetical.
+///
+/// Counts live files only — see [`LIVE_FILES_JOIN`].
 pub fn namespace_counts(store: &Store) -> Result<Vec<NamespaceCount>> {
-    let mut stmt = store.conn().prepare(
+    let mut stmt = store.conn().prepare(&format!(
         "SELECT t.namespace, COUNT(DISTINCT t.tag_id), COUNT(DISTINCT ft.file_id)
          FROM tags t JOIN file_tags ft ON ft.tag_id = t.tag_id
+         {LIVE_FILES_JOIN}
          GROUP BY t.namespace
          ORDER BY COUNT(DISTINCT ft.file_id) DESC, t.namespace",
-    )?;
+    ))?;
     let rows = stmt
         .query_map([], |row| {
             Ok(NamespaceCount {
@@ -423,14 +441,18 @@ pub fn namespace_counts(store: &Store) -> Result<Vec<NamespaceCount>> {
 /// The secondary sort is the tag itself, so two tags with the same count always
 /// come back in the same order — a facet list that reshuffles between runs is
 /// as disorienting as one that changes content.
+/// Counts live files only — see [`LIVE_FILES_JOIN`].
 pub fn tag_counts(store: &Store, namespace: Option<&str>, limit: i64) -> Result<Vec<TagCount>> {
-    let sql = "SELECT t.namespace, t.value, COUNT(ft.file_id) AS n
-               FROM tags t JOIN file_tags ft ON ft.tag_id = t.tag_id
-               WHERE (?1 IS NULL OR t.namespace = ?1)
-               GROUP BY t.tag_id
-               ORDER BY n DESC, t.namespace, t.value
-               LIMIT ?2";
-    let mut stmt = store.conn().prepare(sql)?;
+    let sql = format!(
+        "SELECT t.namespace, t.value, COUNT(ft.file_id) AS n
+         FROM tags t JOIN file_tags ft ON ft.tag_id = t.tag_id
+         {LIVE_FILES_JOIN}
+         WHERE (?1 IS NULL OR t.namespace = ?1)
+         GROUP BY t.tag_id
+         ORDER BY n DESC, t.namespace, t.value
+         LIMIT ?2"
+    );
+    let mut stmt = store.conn().prepare(&sql)?;
     let rows = stmt
         .query_map(params![namespace, limit], |row| {
             let ns: String = row.get(0)?;
@@ -477,8 +499,8 @@ fn all_tags_subquery(tags: &[Tag]) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
         "SELECT ft.file_id
          FROM file_tags ft
          JOIN tags t ON t.tag_id = ft.tag_id
-         JOIN files f ON f.file_id = ft.file_id
-         WHERE f.deleted_at IS NULL AND (t.namespace, t.value) IN ({placeholders})
+         {LIVE_FILES_JOIN}
+         WHERE (t.namespace, t.value) IN ({placeholders})
          GROUP BY ft.file_id
          HAVING COUNT(DISTINCT t.tag_id) = ?{}",
         tags.len() * 2 + 1
@@ -522,8 +544,36 @@ pub fn files_with_tags(store: &Store, tags: &[Tag], limit: i64) -> Result<Vec<Fi
     Ok(rows)
 }
 
+/// Split index rows by whether the file is still on disk *right now*.
+///
+/// ## Why a tag query has to do this at all
+///
+/// No delta source can report a deletion: the mtime walk only sees what is
+/// there, and a file that is gone leaves nothing to enumerate (design.md §5).
+/// So the freshness design handles deletion on the *other* side of the merge —
+/// every index hit that survives the changed-set test is checked for existence
+/// before it is returned ([`crate::fresh::find`] does exactly this). A tag
+/// filter answers from the same index rows and is subject to the same gap: with
+/// no check, `sagasu tags kind:text` happily lists paths that were deleted
+/// after the crawl, while `sagasu find` at the same instant drops them.
+///
+/// The check is bounded by the size of the page, not by the corpus — the caller
+/// applies it to the rows it is about to print.
+///
+/// Returns `(still on disk, gone)`, both in the input order.
+pub fn partition_existing(rows: Vec<FileRow>) -> (Vec<FileRow>, Vec<FileRow>) {
+    rows.into_iter()
+        .partition(|row| Path::new(&row.path).exists())
+}
+
 /// How many live files carry **all** of `tags` — the total behind the page
 /// [`files_with_tags`] returns.
+///
+/// "Live" here is the *index's* notion: not tombstoned. A file deleted since the
+/// last crawl is still counted, because finding that out costs one `stat` per
+/// row and this is a whole-corpus aggregate. Callers must present it as an upper
+/// bound; [`partition_existing`] is what turns the printed page into a number
+/// that has actually been checked.
 pub fn count_files_with_tags(store: &Store, tags: &[Tag]) -> Result<i64> {
     if tags.is_empty() {
         bail!("no tags given");
@@ -541,12 +591,16 @@ pub fn count_files_with_tags(store: &Store, tags: &[Tag]) -> Result<i64> {
 /// How many distinct tags [`tag_counts`] would have to choose from, before its
 /// `limit` cuts the list. A facet list that shows twenty of a hundred and eleven
 /// buckets without saying so reads as the whole axis.
+/// Counts live files only — see [`LIVE_FILES_JOIN`].
 pub fn tag_counts_total(store: &Store, namespace: Option<&str>) -> Result<i64> {
     let n = store.conn().query_row(
-        "SELECT COUNT(*) FROM (
-             SELECT t.tag_id FROM tags t JOIN file_tags ft ON ft.tag_id = t.tag_id
-             WHERE (?1 IS NULL OR t.namespace = ?1)
-             GROUP BY t.tag_id)",
+        &format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT t.tag_id FROM tags t JOIN file_tags ft ON ft.tag_id = t.tag_id
+                 {LIVE_FILES_JOIN}
+                 WHERE (?1 IS NULL OR t.namespace = ?1)
+                 GROUP BY t.tag_id)"
+        ),
         params![namespace],
         |row| row.get(0),
     )?;

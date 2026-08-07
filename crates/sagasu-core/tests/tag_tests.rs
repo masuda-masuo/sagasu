@@ -638,6 +638,99 @@ fn tags_of_a_deleted_file_are_removed_on_the_next_pass() {
 }
 
 #[test]
+fn a_tag_query_does_not_return_files_that_were_deleted_after_the_crawl() {
+    let (d, db) = tmp_dirs("deleted_not_recrawled");
+    for i in 0..3 {
+        write(&d, &format!("notes/n{i}.txt"), "body");
+    }
+    crawl(&d, &db);
+    tag(&db, true);
+
+    // Deleted, with *no* re-crawl: the index still lists all three as live, and
+    // no delta source can say otherwise — an mtime walk only enumerates what is
+    // there (design.md §5). This is the case that made `sagasu tags kind:text`
+    // print two paths that no longer existed while `sagasu find` at the same
+    // instant dropped them.
+    fs::remove_file(d.join("notes/n0.txt")).unwrap();
+    fs::remove_file(d.join("notes/n1.txt")).unwrap();
+
+    let store = Store::open(db_path(&db)).unwrap();
+    let tag = sagasu_core::Tag::parse("path:notes").unwrap();
+    let page = tagindex::files_with_tags(&store, std::slice::from_ref(&tag), 100).unwrap();
+    assert_eq!(page.len(), 3, "the index has not been told yet");
+
+    let (alive, gone) = tagindex::partition_existing(page);
+    assert_eq!(alive.len(), 1, "only one of the three is still on disk");
+    assert_eq!(gone.len(), 2);
+    for row in &gone {
+        assert!(
+            !Path::new(&row.path).exists(),
+            "{} was reported gone but exists",
+            row.path
+        );
+    }
+    assert!(alive[0].path.replace('\\', "/").ends_with("notes/n2.txt"));
+
+    // The index-side total is deliberately *not* existence-checked — it is an
+    // upper bound the CLI labels as such.
+    assert_eq!(
+        tagindex::count_files_with_tags(&store, std::slice::from_ref(&tag)).unwrap(),
+        3
+    );
+}
+
+#[test]
+fn facet_counts_do_not_include_tombstones() {
+    let (d, db) = tmp_dirs("tombstone_counts");
+    for i in 0..3 {
+        write(&d, &format!("notes/n{i}.txt"), "body");
+    }
+    crawl(&d, &db);
+    tag(&db, true);
+
+    fs::remove_file(d.join("notes/n0.txt")).unwrap();
+    fs::remove_file(d.join("notes/n1.txt")).unwrap();
+    // Re-crawl only: the two files become tombstones, but `file_tags` still
+    // carries their rows because only `sagasu tag` rebuilds that table.
+    crawl(&d, &db);
+
+    let store = Store::open(db_path(&db)).unwrap();
+    let text = sagasu_core::Tag::parse("kind:text").unwrap();
+    let drilled = tagindex::count_files_with_tags(&store, std::slice::from_ref(&text)).unwrap();
+    assert_eq!(drilled, 1, "the drill-down already excluded tombstones");
+
+    // The facet list has to agree with the drill-down it leads to. A bucket
+    // that offers three and delivers one is worse than one never offered.
+    let faceted = tagindex::tag_counts(&store, Some("kind"), 100)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.tag == text)
+        .expect("kind:text should still be listed")
+        .files;
+    assert_eq!(faceted, drilled, "facet count must match the drill-down");
+
+    let ns = tagindex::namespace_counts(&store)
+        .unwrap()
+        .into_iter()
+        .find(|n| n.namespace == "kind")
+        .expect("the kind namespace should still be listed");
+    assert_eq!(ns.files, 1, "namespace counts must exclude tombstones");
+
+    // A tag whose only holders are tombstones must leave the facet list, not
+    // sit there as a bucket that holds nothing.
+    let n0 = sagasu_core::Tag::parse("path:notes").unwrap();
+    assert_eq!(
+        tagindex::count_files_with_tags(&store, std::slice::from_ref(&n0)).unwrap(),
+        1
+    );
+    assert_eq!(
+        tagindex::tag_counts_total(&store, None).unwrap(),
+        tagindex::tag_counts(&store, None, 10_000).unwrap().len() as i64,
+        "the total and the list must still agree once tombstones are excluded"
+    );
+}
+
+#[test]
 fn the_build_records_the_generation_it_ran_against() {
     let (d, db) = tmp_dirs("generation");
     build_corpus(&d);
