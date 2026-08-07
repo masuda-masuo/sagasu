@@ -8,9 +8,9 @@ description = "Throwaway prototype: tantivy vs SQLite FTS5 head-to-head (issue #
 clap = { workspace = true }
 anyhow = { workspace = true }
 ignore = "0.4"
-tantivy = "0.25"
-lindera = "4"
-lindera-tantivy = { version = "4.0", features = ["embed-ipadic"] }
+tantivy = "0.26"
+lindera = "5"
+lindera-tantivy = { version = "5.0", features = ["embed-ipadic"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(windows)'.build-dependencies]

@@ -232,7 +232,7 @@ fn cmd_search(query_str: &str, index_dir: &Path, limit: usize) -> Result<()> {
     let reader = index.reader()?;
     let searcher = reader.searcher();
     let query = QueryParser::for_index(&index, vec![body_f]).parse_query(query_str)?;
-    let top = searcher.search(&query, &TopDocs::with_limit(limit))?;
+    let top = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
     let elapsed = t0.elapsed();
 
     println!("query   : {query_str}");
@@ -312,7 +312,7 @@ fn cmd_fresh_search(query_str: &str, index_dir: &Path, limit: usize, max_size: u
     let reader = index.reader()?;
     let searcher = reader.searcher();
     let query = QueryParser::for_index(&index, vec![body_f]).parse_query(query_str)?;
-    let top = searcher.search(&query, &TopDocs::with_limit(limit))?;
+    let top = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
     let index_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // 2) 差分ライブスキャン
