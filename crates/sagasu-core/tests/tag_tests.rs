@@ -388,6 +388,71 @@ fn a_broken_rule_file_leaves_the_existing_tags_untouched() {
 }
 
 #[test]
+fn hitting_the_tag_cap_sacrifices_path_tags_not_the_users_own_rules() {
+    let (d, db) = tmp_dirs("cap");
+
+    // A tree deep and wordy enough that `path:` tags alone overflow the 64-tag
+    // cap. Each directory contributes its whole name plus four sub-tokens; all
+    // of them are distinct, so nothing collapses.
+    let mut rel = String::new();
+    for depth in 0..12 {
+        let letter = (b'a' + depth as u8) as char;
+        let component: Vec<String> = (0..4)
+            .map(|i| format!("{letter}{}", (b'a' + i as u8) as char))
+            .collect();
+        rel.push_str(&component.join("-"));
+        rel.push('/');
+    }
+    rel.push_str("invoice-2024-03-15_v2.txt");
+    write(&d, &rel, "amount 100");
+
+    crawl(&d, &db);
+
+    let rules_file = d.parent().unwrap().join("cap-rules.toml");
+    fs::write(
+        &rules_file,
+        r#"
+        [[rule]]
+        name = "顧客案件"
+        ext  = ["txt"]
+        tags = ["project:client-work", "client:acme", "retention:7y", "stage:final"]
+        "#,
+    )
+    .unwrap();
+    let summary = tag_with_rules(&db, &rules_file, true);
+
+    assert_eq!(summary.capped, 1, "the deep file must have hit the cap");
+    assert!(summary.capped_dropped > 0);
+    assert_eq!(
+        summary.capped_dropped_namespaces.keys().collect::<Vec<_>>(),
+        vec!["path"],
+        "only path tags should have been given up: {:?}",
+        summary.capped_dropped_namespaces
+    );
+
+    // The regression this test exists for: with an alphabetical truncate, every
+    // one of these lost its place to `path:` and the query below answered
+    // `hits: 0` for a file the rule plainly matches.
+    let store = Store::open(db_path(&db)).unwrap();
+    for want in [
+        "project:client-work",
+        "client:acme",
+        "retention:7y",
+        "stage:final",
+        "version:v2",
+        "date:2024-03",
+    ] {
+        let tag = sagasu_core::Tag::parse(want).unwrap();
+        let hits = tagindex::files_with_tags(&store, std::slice::from_ref(&tag), 100).unwrap();
+        assert_eq!(hits.len(), 1, "`sagasu tags {want}` must find the file");
+    }
+
+    // And the stored layer is exactly the capped set — no more, no fewer.
+    let stored = &snapshot(&d, &db)[&rel];
+    assert_eq!(stored.len(), sagasu_core::tags::MAX_TAGS_PER_FILE);
+}
+
+#[test]
 fn the_documented_example_rule_file_actually_loads() {
     // A configuration example that does not parse is worse than no example at
     // all: it is copied, it fails, and the failure looks like a tool bug.

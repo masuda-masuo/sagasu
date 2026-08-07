@@ -117,12 +117,21 @@ pub fn cmd_tag(args: TagArgs) -> Result<()> {
         println!("               (run `sagasu tag --read-magic`, or `sagasu hash`, to fill them)");
     }
 
+    // A cap that is only visible as "N files were capped" is a silent omission
+    // with a footnote. Name the namespaces it came out of, so a user can see at
+    // a glance whether the axis they care about was the one that paid.
     if summary.capped > 0 {
         println!(
-            "capped       : {} files hit the {}-tag limit",
+            "capped       : {} files hit the {}-tag limit, {} tags dropped",
             summary.capped,
-            tags::MAX_TAGS_PER_FILE
+            tags::MAX_TAGS_PER_FILE,
+            summary.capped_dropped,
         );
+        let mut by_ns: Vec<_> = summary.capped_dropped_namespaces.iter().collect();
+        by_ns.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        for (ns, n) in by_ns {
+            println!("               {ns}: {n}");
+        }
     }
 
     println!("namespaces   :");
@@ -329,8 +338,24 @@ fn explain_file(store: &Store, file: &Path, rules: Option<PathBuf>) -> Result<()
             TagSource::describe(*sources).join(",")
         );
     }
+    // The cap applies here exactly as it does to the stored layer — showing an
+    // uncapped `computed` list would make the two columns disagree for a reason
+    // that has nothing to do with staleness. Instead the dropped tags are named
+    // underneath, so the difference between "the engine never produced this" and
+    // "the engine produced it and the cap took it" is visible.
     if computed.capped {
-        println!("  (cut at the {}-tag limit)", tags::MAX_TAGS_PER_FILE);
+        println!(
+            "  ({} tags dropped by the {}-tag cap:)",
+            computed.dropped.len(),
+            tags::MAX_TAGS_PER_FILE
+        );
+        for (tag, sources) in &computed.dropped {
+            println!(
+                "  - {:<30} [{}]",
+                tag.to_string(),
+                TagSource::describe(*sources).join(",")
+            );
+        }
     }
     Ok(())
 }

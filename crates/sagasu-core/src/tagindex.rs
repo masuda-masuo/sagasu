@@ -106,6 +106,14 @@ pub struct TagSummary {
     pub magic_unreadable: u64,
     /// Files that hit [`tags::MAX_TAGS_PER_FILE`].
     pub capped: u64,
+    /// Tags the cap discarded, summed over every file.
+    pub capped_dropped: u64,
+    /// Those same discards broken down by namespace, in namespace order.
+    ///
+    /// A cap that is only reported as a file count says "something was lost";
+    /// this says *what*, which is the difference between a user shrugging and a
+    /// user noticing that the axis they were about to filter on is incomplete.
+    pub capped_dropped_namespaces: BTreeMap<String, u64>,
     /// Rule file used, if any.
     pub rules_path: Option<String>,
     /// Number of rules loaded.
@@ -210,6 +218,10 @@ pub fn build(config: &TagConfig) -> Result<TagSummary> {
 
             if set.capped {
                 summary.capped += 1;
+                summary.capped_dropped += set.dropped.len() as u64;
+                for (ns, n) in set.dropped_by_namespace() {
+                    *summary.capped_dropped_namespaces.entry(ns).or_insert(0) += n;
+                }
             }
             if set.is_empty() {
                 continue;

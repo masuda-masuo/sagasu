@@ -98,9 +98,9 @@ pub const STRUCTURAL_NAMESPACES: &[&str] = &[NS_FORMAT, NS_EXT, NS_KIND, NS_PATH
 /// Upper bound on tags per file.
 ///
 /// A pathologically deep or long path would otherwise put unbounded rows in
-/// `file_tags`. Tags are sorted before the cut, so which ones survive is
-/// deterministic, and the number of files that hit the cap is reported rather
-/// than being invisible.
+/// `file_tags`. Which tags survive the cut is decided by [`cap_priority`] and
+/// then by tag order, so it is deterministic; what was dropped is carried in
+/// [`TagSet::dropped`] rather than vanishing.
 pub const MAX_TAGS_PER_FILE: usize = 64;
 
 /// How many directory components (nearest the file first) contribute `path:`
@@ -256,6 +256,11 @@ pub struct TagSet {
     pub tags: Vec<(Tag, u32)>,
     /// True when [`MAX_TAGS_PER_FILE`] cut the list short.
     pub capped: bool,
+    /// The tags that lost the cut, in `Tag` order. Kept rather than counted so
+    /// `sagasu tags --file` can name them: "this file has 64 tags" and "these
+    /// eleven tags were dropped, all of them `path:`" are different answers, and
+    /// only the second one lets a user decide whether it mattered.
+    pub dropped: Vec<(Tag, u32)>,
 }
 
 impl TagSet {
@@ -274,6 +279,50 @@ impl TagSet {
         self.tags
             .iter()
             .any(|(t, _)| !STRUCTURAL_NAMESPACES.contains(&t.namespace()))
+    }
+
+    /// How many tags the cap dropped, per namespace, in namespace order.
+    pub fn dropped_by_namespace(&self) -> BTreeMap<String, u64> {
+        let mut out: BTreeMap<String, u64> = BTreeMap::new();
+        for (tag, _) in &self.dropped {
+            *out.entry(tag.namespace().to_string()).or_insert(0) += 1;
+        }
+        out
+    }
+}
+
+/// Rank for the [`MAX_TAGS_PER_FILE`] cut — lower survives.
+///
+/// The cut used to be plain `truncate` over the alphabetically ordered set,
+/// which is the worst possible order for it: `path:` is the one axis that grows
+/// multiplicatively with depth *and* the one that says least (a directory name
+/// is already visible in the path), so it ate the budget and starved everything
+/// else. Measured on a real tree, `sagasu tags project:client-work` answered
+/// `hits: 0` for files the rule plainly matched.
+///
+/// So the budget is spent in the order of how much a tag could only have come
+/// from here:
+///
+/// 1. **User-rule tags.** Someone wrote this knowledge down by hand; nothing
+///    else in the system can reconstruct it.
+/// 2. **Other non-structural tags** (`date:` / `version:` / `pattern:` /
+///    `anomaly:`) — interpretations of the name, not a repeat of it.
+/// 3. **Structural, non-`path:`** (`format:` / `ext:` / `kind:`) — one tag each,
+///    so they cannot crowd anything out.
+/// 4. **`path:`** — the unbounded one, and the one `sagasu find` can stand in
+///    for.
+///
+/// Ties are broken by tag order, so the whole comparison is a total order and
+/// the surviving set stays deterministic.
+fn cap_priority(tag: &Tag, sources: u32) -> u8 {
+    if sources & (TagSource::Rule as u32) != 0 {
+        0
+    } else if !STRUCTURAL_NAMESPACES.contains(&tag.namespace()) {
+        1
+    } else if tag.namespace() != NS_PATH {
+        2
+    } else {
+        3
     }
 }
 
@@ -300,10 +349,31 @@ impl Collector {
     }
 
     fn finish(self) -> TagSet {
+        // `BTreeMap` hands these over in `Tag` order already.
         let mut tags: Vec<(Tag, u32)> = self.map.into_iter().collect();
-        let capped = tags.len() > MAX_TAGS_PER_FILE;
-        tags.truncate(MAX_TAGS_PER_FILE);
-        TagSet { tags, capped }
+        if tags.len() <= MAX_TAGS_PER_FILE {
+            return TagSet {
+                tags,
+                capped: false,
+                dropped: Vec::new(),
+            };
+        }
+        // A *stable* sort by priority alone: within a tier the incoming `Tag`
+        // order is preserved, so priority-then-tag is the effective total order
+        // without having to clone a key for it.
+        tags.sort_by_key(|(tag, sources)| cap_priority(tag, *sources));
+        let mut dropped = tags.split_off(MAX_TAGS_PER_FILE);
+        // Both halves go back to canonical order: everything downstream (the
+        // stored rows, the explain output, the determinism tests) reads them as
+        // sorted lists, and the priority order is an implementation detail of
+        // the cut itself.
+        tags.sort();
+        dropped.sort();
+        TagSet {
+            tags,
+            capped: true,
+            dropped,
+        }
     }
 }
 
@@ -1294,6 +1364,128 @@ mod tests {
         sorted.sort();
         assert_eq!(list, sorted, "tags must come back in canonical order");
         assert_eq!(values(&set, NS_DATE), vec!["2024"], "duplicates collapse");
+    }
+
+    /// A path deep and wordy enough to blow past [`MAX_TAGS_PER_FILE`] on
+    /// `path:` tags alone, with a dated, versioned file name at the end of it.
+    fn overflowing_path() -> String {
+        let mut out = String::from("/root/");
+        for d in 0..MAX_PATH_COMPONENTS {
+            let letter = (b'a' + d as u8) as char;
+            let component: Vec<String> = (0..4)
+                .map(|i| format!("{letter}{}", (b'a' + i as u8) as char))
+                .collect();
+            out.push_str(&component.join("-"));
+            out.push('/');
+        }
+        out.push_str("invoice-2024-03-15_v2.txt");
+        out
+    }
+
+    #[test]
+    fn the_cap_spends_its_budget_on_the_tags_nothing_else_could_produce() {
+        let rules = RuleSet::parse(
+            r#"
+            [[rule]]
+            ext  = ["txt"]
+            tags = [
+                "project:client-work", "client:acme", "billing:billable",
+                "dept:accounting", "retention:7y", "stage:final",
+                "author:masuda", "doc-type:invoice",
+            ]
+            "#,
+        )
+        .unwrap();
+        let path = overflowing_path();
+        let set = tags_for(
+            &FileFacts {
+                path: &path,
+                root: Some("/root"),
+                ext: Some("txt"),
+                magic: None,
+            },
+            &rules,
+        );
+
+        assert!(set.capped, "this path must overflow the cap");
+        assert_eq!(set.len(), MAX_TAGS_PER_FILE);
+
+        // The whole point: a user rule's tags are the *last* thing to go, not
+        // the first. Alphabetical truncation dropped every one of these.
+        for want in [
+            "project:client-work",
+            "client:acme",
+            "billing:billable",
+            "dept:accounting",
+            "retention:7y",
+            "stage:final",
+            "author:masuda",
+            "doc-type:invoice",
+        ] {
+            assert!(
+                set.tags.iter().any(|(t, _)| t.to_string() == want),
+                "{want} was dropped by the cap: {:?}",
+                set.tags
+                    .iter()
+                    .map(|(t, _)| t.to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+        // …and so are the interpretations of the name, and the one-per-file
+        // structural tags.
+        for want in ["date:2024", "date:2024-03", "version:v2", "ext:txt"] {
+            assert!(
+                set.tags.iter().any(|(t, _)| t.to_string() == want),
+                "{want} was dropped by the cap"
+            );
+        }
+
+        // Everything sacrificed is `path:`, and it is reported rather than
+        // silently missing.
+        assert!(!set.dropped.is_empty());
+        assert_eq!(
+            set.dropped_by_namespace().keys().collect::<Vec<_>>(),
+            vec![NS_PATH],
+            "only path tags should have been given up: {:?}",
+            set.dropped_by_namespace()
+        );
+    }
+
+    #[test]
+    fn the_capped_result_is_still_sorted_and_still_deterministic() {
+        let path = overflowing_path();
+        let facts = FileFacts {
+            path: &path,
+            root: Some("/root"),
+            ext: Some("txt"),
+            magic: None,
+        };
+        let first = tags_for(&facts, &RuleSet::empty());
+        let second = tags_for(&facts, &RuleSet::empty());
+        assert_eq!(first, second, "the cut must not wobble between runs");
+
+        let list: Vec<String> = first.tags.iter().map(|(t, _)| t.to_string()).collect();
+        let mut sorted = list.clone();
+        sorted.sort();
+        assert_eq!(list, sorted, "survivors must come back in canonical order");
+
+        let dropped: Vec<String> = first.dropped.iter().map(|(t, _)| t.to_string()).collect();
+        let mut sorted_dropped = dropped.clone();
+        sorted_dropped.sort();
+        assert_eq!(dropped, sorted_dropped);
+        // No tag is both kept and dropped.
+        assert!(!dropped.iter().any(|d| list.contains(d)));
+    }
+
+    #[test]
+    fn a_set_under_the_cap_drops_nothing() {
+        let set = tags_for(
+            &facts("/root/a/notes.txt", "/root", Some("txt")),
+            &RuleSet::empty(),
+        );
+        assert!(!set.capped);
+        assert!(set.dropped.is_empty());
+        assert!(set.dropped_by_namespace().is_empty());
     }
 
     #[test]
