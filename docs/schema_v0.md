@@ -33,7 +33,42 @@ CREATE TABLE IF NOT EXISTS access_history (
     ts      INTEGER NOT NULL,
     kind    TEXT    NOT NULL
 );
+
+-- Semantic layer (design.md §6, schema version 2).
+CREATE TABLE IF NOT EXISTS tags (
+    tag_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace TEXT NOT NULL,
+    value     TEXT NOT NULL,
+    UNIQUE(namespace, value)
+);
+
+CREATE TABLE IF NOT EXISTS file_tags (
+    file_id INTEGER NOT NULL REFERENCES files(file_id),
+    tag_id  INTEGER NOT NULL REFERENCES tags(tag_id),
+    sources INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (file_id, tag_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag_id, file_id);
 ```
+
+## Schema versions
+
+| Version | Change |
+|---------|--------|
+| 1 | M0: `meta`, `files`, `access_history`. |
+| 2 | M3: `tags`, `file_tags` (issue #4). |
+
+Every change so far has been **additive** — new tables and indexes, no change to
+an existing column — so `CREATE TABLE IF NOT EXISTS` performs the migration and
+`Store::open` only has to stamp the new version number. A future change that
+rewrites a column needs real steps in `Store::migrate`, keyed off the stored
+version.
+
+A database whose `schema_version` is **newer** than the running build is refused,
+not opened. A column the build does not know about would simply never be read,
+and nothing would say so — the same class of silent wrongness the freshness
+design exists to prevent.
 
 ## Key columns
 
@@ -41,7 +76,7 @@ CREATE TABLE IF NOT EXISTS access_history (
 |--------|------|----------------|
 | `file_id` | `INTEGER PK AUTOINCREMENT` | Stable, never-reused identifier. Survives rename/move; persists after deletion (tombstone). |
 | `blake3` | `BLOB NULL` | `NULL` = not yet computed. Non-`NULL` = BLAKE3 hash (32 bytes). Filled only by `sagasu hash`. |
-| `magic` | `BLOB NULL` | `NULL` = not yet read. Non-`NULL` = first 512 bytes of file content. Filled only by `sagasu hash`. |
+| `magic` | `BLOB NULL` | `NULL` = not yet read. Non-`NULL` = first 512 bytes of file content. Filled by `sagasu hash`, or by `sagasu tag --read-magic` (which reads only those 512 bytes and leaves `blake3` NULL, so a later `hash` still picks the file up). |
 | `fs_id` | `BLOB NULL` | Platform file identity. Unix: 16-byte `(dev_be, ino_be)`. Windows M0: `NULL`. Primary key for rename/move detection. |
 
 ## `meta` keys
@@ -57,6 +92,16 @@ CREATE TABLE IF NOT EXISTS access_history (
 | `fulltext_marker` | `sagasu fulltext` | Unix ns at which the full-text build started. |
 | `fulltext_docs` | `sagasu fulltext` | Number of documents written in that build. |
 | `fulltext_scan_generation` | `sagasu fulltext` | `scan_generation` the full-text index was built from. Less than `scan_generation` → the full-text index is behind the metadata index. |
+| `tag_marker` | `sagasu tag` | Unix ns at which the tag build started. |
+| `tag_scan_generation` | `sagasu tag` | `scan_generation` the tag layer was built from. Less than `scan_generation` → the tags are behind the metadata index, and a tag filter is silently missing every file added since. |
+| `tag_files` | `sagasu tag` | Live files that received at least one tag. |
+| `tag_rows` | `sagasu tag` | Rows written to `file_tags`. |
+| `tag_rules` | `sagasu tag` | Path of the user rule file used, or empty. |
+| `tag_rules_digest` | `sagasu tag` | BLAKE3 (hex) of that file's bytes, so the tags can be attributed to an exact rule set. It is recorded, not re-checked: verifying it would mean re-reading the rule file on every query. |
+
+All seven are cleared at the start of a tag build and written together at its
+end, inside the same transaction as the rows, so they never describe a build that
+did not finish.
 
 ## `delta_marker` encoding
 
@@ -99,6 +144,32 @@ filesystem, so the crawl's exclusion set is the *only* exclusion set. Which
 files get a body is then decided by extension allowlist → extension denylist →
 content sniffing, and every rejection is reported with a reason.
 
+## Tag layer
+
+`tags` holds each distinct `namespace:value` once; `file_tags` is the junction.
+Both halves of a tag are lowercased before they get here, so a facet count is
+never split between two spellings of the same thing.
+
+- **`sources`** is a bitmask of the generators that produced the tag for that
+  file (`ext`=1, `magic`=2, `path`=4, `name`=8, `rule`=16). A tag reachable two
+  ways records both bits; the union of two sets is order-independent, so this
+  column cannot make the stored result depend on evaluation order.
+- **The join key is `file_id`**, so a rename or move carries the tags with the
+  file, exactly as it does for full-text hits.
+- **Only live files are tagged.** A tag build replaces the whole layer, which
+  also drops the rows of files that became tombstones since the last one, and
+  then deletes `tags` rows no live file references any more — a facet list must
+  not offer buckets that hold nothing. (Keeping tags on tombstones is what the
+  §9 ledger idea would want; that is deliberately not what this does yet.)
+- **The build is one transaction.** Half the corpus carrying this pass's tags
+  and half the last pass's would be a set of facet counts that mean nothing, and
+  no later error message can undo it.
+
+Tags are generated by `sagasu tag` from a *pure function* of the path, the crawl
+root, the extension and `magic` — never from `mtime`, which changes when a file
+is merely touched. See `docs/tag_rules.md` for the generators and the user rule
+file format.
+
 ## Tombstone rule
 
 Deleted files become tombstones (`deleted_at` set to the scan generation in which they disappeared). Rows are **never** deleted.
@@ -115,7 +186,7 @@ Deleted files become tombstones (`deleted_at` set to the scan generation in whic
 - `deleted_at IS NULL` → file is live.
 - `deleted_at IS NOT NULL` → file was deleted (tombstone).
 
-Crawl (`sagasu index`) never opens files, so `blake3` and `magic` are always `NULL` immediately after indexing. Content hashes are backfilled by `sagasu hash`.
+Crawl (`sagasu index`) never opens files, so `blake3` and `magic` are always `NULL` immediately after indexing. Content hashes are backfilled by `sagasu hash`; `magic` alone can also be backfilled by `sagasu tag --read-magic`, which is what the `format:` tag axis is built on.
 
 ## Database placement
 

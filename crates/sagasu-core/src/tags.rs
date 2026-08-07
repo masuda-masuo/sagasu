@@ -1,0 +1,1317 @@
+//! Rule-based tag engine — the semantic layer of design.md §6, without an LLM.
+//!
+//! ## What this is for
+//!
+//! Files are remembered by meaning, not by location, but a filesystem can only
+//! be queried by location. This module manufactures the missing axis: it reads
+//! what is already knowable about a file — its format, the directories it sits
+//! in, the shape of its name — and turns that into `namespace:value` tags that
+//! can be counted, faceted and drilled into (issue #5).
+//!
+//! ## The one hard property: determinism
+//!
+//! [`tags_for`] is a **pure function** of four inputs: the file's path, the
+//! crawl root it is relative to, its extension, and its leading bytes. No clock,
+//! no filesystem access, no iteration over a hash map, no dependence on the
+//! order files were crawled in. Re-indexing therefore cannot make a file's tags
+//! wobble, which is what lets a user build spatial memory on top of a facet
+//! tree instead of re-learning it after every scan.
+//!
+//! Everything that could break that property is deliberately kept out:
+//! `mtime` never produces a tag (it changes when a file is touched), and the
+//! user rule set is order-independent (a file collects the *union* of matching
+//! rules, see [`crate::tagrules`]).
+//!
+//! ## Generators
+//!
+//! | Namespace | Source | Example |
+//! |---|---|---|
+//! | `format:` | magic bytes, else extension | `format:pdf` |
+//! | `ext:` | extension, alias-folded | `ext:jpg` |
+//! | `kind:` | coarse category of the format | `kind:image` |
+//! | `path:` | directory components and their sub-tokens | `path:invoices` |
+//! | `date:` | date patterns in names | `date:2024`, `date:2024-03` |
+//! | `version:` | version/revision markers in the file name | `version:v2` |
+//! | `pattern:` | naming conventions | `pattern:screenshot` |
+//! | `anomaly:` | contradictions between the sources | `anomaly:format-mismatch` |
+//! | *(any)* | user rules | `author:masuda` |
+//!
+//! The file *name*'s word tokens deliberately do **not** become `path:` tags:
+//! the name is already reachable through `sagasu find` and the full-text index,
+//! whereas directory names are a query axis nothing else offers. Date, version
+//! and naming patterns are still extracted from the name, because those are
+//! *interpretations* of it rather than a repeat of its text.
+//!
+//! ## What is not here (deferred)
+//!
+//! Embedded metadata — Office document properties, PDF info dictionaries, EXIF
+//! — is listed in design.md §6 but is not implemented in this version. It needs
+//! a ZIP+XML reader, a PDF parser and an EXIF parser, i.e. three new dependency
+//! families, and two of those same parsers are what the deferred PDF/Office
+//! *body extraction* (`crate::text`, still out of scope after M1) will need. The
+//! two belong in one issue, opened together, rather than pulling half the
+//! dependency set in twice. Until then `author:`-style tags come from user rules
+//! (see `docs/tag_rules.md`), which is where a person's own naming conventions
+//! live anyway.
+//!
+//! ## Where the state lives
+//!
+//! Nowhere in here. Building the layer into SQLite, measuring its coverage and
+//! querying it back are [`crate::tagindex`]. This module has no database handle
+//! and makes no filesystem call, which is what turns the determinism claim above
+//! from a promise into a property of the code.
+
+use std::collections::BTreeMap;
+
+use anyhow::{bail, Context, Result};
+
+use crate::tagrules::RuleSet;
+
+// ── Namespaces ──────────────────────────────────────────────────────────────
+
+/// Concrete file format (`format:pdf`), from magic bytes where available.
+pub const NS_FORMAT: &str = "format";
+/// Alias-folded extension (`ext:jpg` for both `.jpg` and `.jpeg`).
+pub const NS_EXT: &str = "ext";
+/// Coarse category (`kind:image`).
+pub const NS_KIND: &str = "kind";
+/// Directory component or sub-token (`path:invoices`).
+pub const NS_PATH: &str = "path";
+/// Date found in a name (`date:2024`, `date:2024-03`).
+pub const NS_DATE: &str = "date";
+/// Version / revision marker (`version:v2`, `version:final`).
+pub const NS_VERSION: &str = "version";
+/// Naming convention (`pattern:screenshot`).
+pub const NS_PATTERN: &str = "pattern";
+/// A contradiction between two sources (`anomaly:format-mismatch`).
+pub const NS_ANOMALY: &str = "anomaly";
+
+/// Namespaces that fall out of *any* path with an extension, so they say
+/// nothing about a file beyond what `ls` already showed.
+///
+/// The acceptance criterion for this work is "the share of files that get at
+/// least one semantic tag". Counting `ext:`/`kind:`/`format:`/`path:` would make
+/// that number ~100% by construction and therefore meaningless, so the summary
+/// reports coverage *both* ways and this list is what separates them.
+pub const STRUCTURAL_NAMESPACES: &[&str] = &[NS_FORMAT, NS_EXT, NS_KIND, NS_PATH];
+
+/// Upper bound on tags per file.
+///
+/// A pathologically deep or long path would otherwise put unbounded rows in
+/// `file_tags`. Tags are sorted before the cut, so which ones survive is
+/// deterministic, and the number of files that hit the cap is reported rather
+/// than being invisible.
+pub const MAX_TAGS_PER_FILE: usize = 64;
+
+/// How many directory components (nearest the file first) contribute `path:`
+/// tags. Deeper ancestors are progressively less about the file itself.
+pub const MAX_PATH_COMPONENTS: usize = 12;
+
+/// Longest accepted tag value, in characters.
+pub const MAX_VALUE_CHARS: usize = 128;
+
+// ── Tag ─────────────────────────────────────────────────────────────────────
+
+/// One `namespace:value` tag.
+///
+/// Both halves are lowercased on construction. Case folding costs the original
+/// spelling but buys a single facet bucket: `author:Masuda` and `author:masuda`
+/// being two different tags would split every count in a facet tree, and there
+/// is no way for a user to notice that from the outside.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Tag {
+    namespace: String,
+    value: String,
+}
+
+impl Tag {
+    /// Build a tag from its two halves, validating and lowercasing both.
+    pub fn new(namespace: &str, value: &str) -> Result<Self> {
+        let namespace = namespace.trim().to_lowercase();
+        let value = value.trim().to_lowercase();
+
+        if namespace.is_empty() {
+            bail!("tag namespace is empty");
+        }
+        if !namespace
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        {
+            bail!("tag namespace {namespace:?} must be ASCII [a-z0-9_-]");
+        }
+        if value.is_empty() {
+            bail!("tag value for namespace {namespace:?} is empty");
+        }
+        if value.chars().any(|c| c.is_control()) {
+            bail!("tag value {value:?} contains a control character");
+        }
+        if value.chars().count() > MAX_VALUE_CHARS {
+            bail!("tag value {value:?} is longer than {MAX_VALUE_CHARS} characters");
+        }
+
+        Ok(Self { namespace, value })
+    }
+
+    /// Parse `namespace:value`. The value may itself contain `:`.
+    pub fn parse(s: &str) -> Result<Self> {
+        let (ns, value) = s
+            .split_once(':')
+            .with_context(|| format!("tag {s:?} is not in `namespace:value` form"))?;
+        Self::new(ns, value)
+    }
+
+    /// The namespace half.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// The value half.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl std::fmt::Display for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.namespace, self.value)
+    }
+}
+
+// ── Sources ─────────────────────────────────────────────────────────────────
+
+/// Which generator produced a tag. Stored as a bitmask because the same tag can
+/// come from several at once (`format:pdf` from both the extension and the magic
+/// bytes), and the union of two sets is order-independent — one more thing that
+/// cannot make the stored result depend on evaluation order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TagSource {
+    /// The file extension.
+    Ext = 1,
+    /// The leading bytes of the file.
+    Magic = 2,
+    /// A directory component of the path.
+    Path = 4,
+    /// The file name (date / version / naming pattern).
+    Name = 8,
+    /// A user rule (`crate::tagrules`).
+    Rule = 16,
+}
+
+impl TagSource {
+    /// All sources, in bit order.
+    pub const ALL: [TagSource; 5] = [
+        TagSource::Ext,
+        TagSource::Magic,
+        TagSource::Path,
+        TagSource::Name,
+        TagSource::Rule,
+    ];
+
+    /// Stable label used in CLI output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TagSource::Ext => "ext",
+            TagSource::Magic => "magic",
+            TagSource::Path => "path",
+            TagSource::Name => "name",
+            TagSource::Rule => "rule",
+        }
+    }
+
+    /// Decode a stored bitmask into labels, in bit order.
+    pub fn describe(mask: u32) -> Vec<&'static str> {
+        Self::ALL
+            .iter()
+            .filter(|s| mask & (**s as u32) != 0)
+            .map(|s| s.as_str())
+            .collect()
+    }
+}
+
+// ── Engine input / output ───────────────────────────────────────────────────
+
+/// Everything the engine is allowed to look at. Constructing one of these is the
+/// only way to call [`tags_for`], which is how the purity claim in the module
+/// docs is kept honest: there is no path from here to a clock or a syscall.
+#[derive(Debug, Clone, Copy)]
+pub struct FileFacts<'a> {
+    /// The file's path as stored in `files.path` (absolute, native separators).
+    pub path: &'a str,
+    /// The crawl root, so path tags can be relative to it. `None` falls back to
+    /// treating every component of the absolute path as a candidate.
+    pub root: Option<&'a str>,
+    /// The lowercased extension, as stored in `files.ext`.
+    pub ext: Option<&'a str>,
+    /// The first [`MAGIC_LEN`] bytes, as stored in `files.magic`. `None` = never
+    /// read; the engine then works from the extension alone and the caller is
+    /// told how many files were in that position.
+    pub magic: Option<&'a [u8]>,
+}
+
+/// The tags of one file: sorted, deduplicated, each with its source mask.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagSet {
+    /// `(tag, source mask)` in `Tag` order.
+    pub tags: Vec<(Tag, u32)>,
+    /// True when [`MAX_TAGS_PER_FILE`] cut the list short.
+    pub capped: bool,
+}
+
+impl TagSet {
+    /// Number of tags.
+    pub fn len(&self) -> usize {
+        self.tags.len()
+    }
+
+    /// Whether the file got no tags at all.
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty()
+    }
+
+    /// Whether any tag lives outside [`STRUCTURAL_NAMESPACES`].
+    pub fn has_semantic_tag(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|(t, _)| !STRUCTURAL_NAMESPACES.contains(&t.namespace()))
+    }
+}
+
+/// Accumulator that keeps the output canonical no matter what order the
+/// generators run in.
+#[derive(Default)]
+struct Collector {
+    map: BTreeMap<Tag, u32>,
+}
+
+impl Collector {
+    fn add(&mut self, namespace: &str, value: &str, source: TagSource) {
+        // A generator producing an invalid tag is a bug in *this* file, not user
+        // input; the value is dropped rather than aborting a whole index pass
+        // over one odd filename. User-supplied tags are validated at rule-load
+        // time instead, where the error can name the offending rule.
+        if let Ok(tag) = Tag::new(namespace, value) {
+            *self.map.entry(tag).or_insert(0) |= source as u32;
+        }
+    }
+
+    fn add_tag(&mut self, tag: Tag, source: TagSource) {
+        *self.map.entry(tag).or_insert(0) |= source as u32;
+    }
+
+    fn finish(self) -> TagSet {
+        let mut tags: Vec<(Tag, u32)> = self.map.into_iter().collect();
+        let capped = tags.len() > MAX_TAGS_PER_FILE;
+        tags.truncate(MAX_TAGS_PER_FILE);
+        TagSet { tags, capped }
+    }
+}
+
+/// Generate every tag for one file.
+///
+/// Pure: same inputs, same output, on every platform and every run.
+pub fn tags_for(facts: &FileFacts<'_>, rules: &RuleSet) -> TagSet {
+    let mut c = Collector::default();
+
+    let rel = relative_path(facts.path, facts.root);
+    let file_name = rel.rsplit('/').next().unwrap_or("").to_string();
+    let stem = file_stem(&file_name);
+
+    // ── format / ext / kind ─────────────────────────────────────────────────
+    let ext = facts.ext.map(|e| e.to_lowercase());
+    let ext = ext.as_deref().filter(|e| !e.is_empty());
+    let folded = ext.map(fold_ext);
+    if let Some(folded) = folded {
+        c.add(NS_EXT, folded, TagSource::Ext);
+    }
+
+    let magic_format = facts.magic.and_then(format_from_magic);
+    let ext_format = folded.and_then(format_from_ext);
+
+    match (magic_format, ext_format) {
+        (Some(m), _) => c.add(NS_FORMAT, m, TagSource::Magic),
+        (None, Some(e)) => c.add(NS_FORMAT, e, TagSource::Ext),
+        (None, None) => {}
+    }
+
+    // Only claim a mismatch when the extension carries a *binary* expectation:
+    // "this .png does not start with a PNG header" is a real finding, while
+    // "this .txt is Shift_JIS so it sniffed as binary" is an encoding gap in
+    // `crate::text`, not a mislabelled file, and flagging it would train the
+    // user to ignore the namespace.
+    if let (Some(m), Some(folded)) = (magic_format, folded) {
+        if let Some(expected) = expected_formats(folded) {
+            if !expected.contains(&m) {
+                c.add(NS_ANOMALY, "format-mismatch", TagSource::Magic);
+            }
+        }
+    }
+
+    let kind = folded
+        .and_then(kind_from_ext)
+        .or_else(|| magic_format.or(ext_format).and_then(kind_from_format));
+    if let Some(kind) = kind {
+        c.add(NS_KIND, kind, TagSource::Ext);
+    }
+
+    // ── path components ─────────────────────────────────────────────────────
+    let components: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let dirs = components.split_last().map(|(_, d)| d).unwrap_or(&[]);
+    let start = dirs.len().saturating_sub(MAX_PATH_COMPONENTS);
+    for component in &dirs[start..] {
+        for token in component_tokens(component) {
+            c.add(NS_PATH, &token, TagSource::Path);
+        }
+        for date in date_values(component) {
+            c.add(NS_DATE, &date, TagSource::Path);
+        }
+    }
+
+    // ── file name patterns ──────────────────────────────────────────────────
+    for date in date_values(stem) {
+        c.add(NS_DATE, &date, TagSource::Name);
+    }
+    for version in version_values(stem) {
+        c.add(NS_VERSION, &version, TagSource::Name);
+    }
+    for pattern in pattern_values(&file_name, stem, ext) {
+        c.add(NS_PATTERN, &pattern, TagSource::Name);
+    }
+
+    // ── user rules ──────────────────────────────────────────────────────────
+    if !rules.is_empty() {
+        let rel_lower = rel.to_lowercase();
+        let name_lower = file_name.to_lowercase();
+        for rule in rules.matches(&rel_lower, &name_lower, ext) {
+            for tag in rule.tags() {
+                c.add_tag(tag.clone(), TagSource::Rule);
+            }
+        }
+    }
+
+    c.finish()
+}
+
+// ── Path handling ───────────────────────────────────────────────────────────
+
+/// Path relative to the crawl root, always `/`-separated.
+///
+/// Producing the same string from `C:\work\a\b.txt` and `/work/a/b.txt` is what
+/// makes one rule file usable on both platforms, and what stops a `path:` tag
+/// from encoding which machine ran the crawl.
+pub fn relative_path(path: &str, root: Option<&str>) -> String {
+    let norm = path.replace('\\', "/");
+    if let Some(root) = root {
+        let root = root.replace('\\', "/");
+        let root = root.trim_end_matches('/');
+        // Compared as bytes on purpose. `str::split_at` panics when the index is
+        // not a character boundary, and `root.len()` lands mid-character
+        // whenever the path diverges from the root inside a multi-byte name
+        // (`/ab` against `/写真/...`). A prefix test must never be able to abort
+        // an index pass over a Japanese directory name.
+        let (rb, nb) = (root.as_bytes(), norm.as_bytes());
+        if !rb.is_empty()
+            && nb.len() > rb.len()
+            && nb[..rb.len()].eq_ignore_ascii_case(rb)
+            // NTFS compares case-insensitively; folding ASCII case is enough
+            // here because the root was produced by the same canonicalization
+            // that produced the path.
+            && nb[rb.len()] == b'/'
+        {
+            return norm[rb.len() + 1..].trim_start_matches('/').to_string();
+        }
+        if norm.eq_ignore_ascii_case(root) {
+            return String::new();
+        }
+    }
+    // No root (or the path is not under it): drop a leading `/` and any drive
+    // letter so the result is still a relative-looking path.
+    let stripped = norm.trim_start_matches('/');
+    match stripped.split_once('/') {
+        Some((first, rest)) if first.len() == 2 && first.ends_with(':') => rest.to_string(),
+        _ => stripped.to_string(),
+    }
+}
+
+/// The file name minus its final extension.
+fn file_stem(name: &str) -> &str {
+    match name.rfind('.') {
+        // A leading dot is part of the name (`.gitignore`), not a separator.
+        Some(0) | None => name,
+        Some(i) => &name[..i],
+    }
+}
+
+/// Characters that separate words inside a path component or file name.
+const TOKEN_SEPARATORS: &[char] = &[
+    '-', '_', '.', ' ', '+', '&', '(', ')', '[', ']', '{', '}', ',', ';', '\'', '@', '!', '#', '=',
+    '~', '\t', '　',
+];
+
+/// `path:` tags for one directory component: the whole component, plus its
+/// sub-tokens when splitting yields more than one.
+fn component_tokens(component: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let whole = component.to_lowercase();
+    if is_useful_token(&whole) {
+        out.push(whole);
+    }
+    let parts: Vec<&str> = component
+        .split(TOKEN_SEPARATORS)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.len() > 1 {
+        for part in parts {
+            let t = part.to_lowercase();
+            if is_useful_token(&t) && !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a token is worth a facet bucket.
+///
+/// Single characters carry no meaning, and an all-digit token is either a date
+/// (which the `date:` generator already handles properly) or an opaque id.
+fn is_useful_token(token: &str) -> bool {
+    let chars = token.chars().count();
+    if !(2..=MAX_VALUE_CHARS).contains(&chars) {
+        return false;
+    }
+    !token.chars().all(|c| c.is_ascii_digit())
+}
+
+// ── Date extraction ─────────────────────────────────────────────────────────
+
+/// Earliest year accepted as a date. Below this a four-digit run is far more
+/// likely to be an identifier than a year.
+const MIN_YEAR: u32 = 1970;
+/// Latest year accepted as a date.
+const MAX_YEAR: u32 = 2099;
+
+/// Date tags found in a name: `YYYY` always, `YYYY-MM` when a month is present.
+///
+/// The day is deliberately dropped. A facet axis with one bucket per day is not
+/// navigable, and `date:2024-03` is what someone actually recalls about a file.
+///
+/// Matching works on *maximal* digit runs, so a year is never taken out of the
+/// middle of a longer number: `20240315` is a date, `1234567890` is not.
+pub fn date_values(s: &str) -> Vec<String> {
+    let runs = digit_runs(s);
+    let mut out: Vec<String> = Vec::new();
+
+    let push = |year: u32, month: Option<u32>, out: &mut Vec<String>| {
+        let y = year.to_string();
+        if !out.contains(&y) {
+            out.push(y);
+        }
+        if let Some(m) = month {
+            let ym = format!("{year:04}-{m:02}");
+            if !out.contains(&ym) {
+                out.push(ym);
+            }
+        }
+    };
+
+    // Single runs: YYYYMMDD, YYYYMM, YYYY.
+    for run in &runs {
+        match run.digits.len() {
+            8 => {
+                let (y, m, d) = (
+                    num(&run.digits[0..4]),
+                    num(&run.digits[4..6]),
+                    num(&run.digits[6..8]),
+                );
+                if valid_ymd(y, m, d) {
+                    push(y, Some(m), &mut out);
+                }
+            }
+            6 => {
+                let (y, m) = (num(&run.digits[0..4]), num(&run.digits[4..6]));
+                if valid_ymd(y, m, 1) {
+                    push(y, Some(m), &mut out);
+                }
+            }
+            4 => {
+                let y = num(&run.digits);
+                if (MIN_YEAR..=MAX_YEAR).contains(&y) {
+                    push(y, None, &mut out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Separated runs: YYYY-MM and YYYY-MM-DD (any of `-`, `_`, `.`, `/`).
+    for pair in runs.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if a.digits.len() == 4 && b.digits.len() == 2 && single_date_separator(s, a.end, b.start) {
+            let (y, m) = (num(&a.digits), num(&b.digits));
+            if valid_ymd(y, m, 1) {
+                push(y, Some(m), &mut out);
+            }
+        }
+    }
+
+    out
+}
+
+struct DigitRun {
+    digits: String,
+    start: usize,
+    end: usize,
+}
+
+/// Maximal runs of ASCII digits, with their byte offsets.
+fn digit_runs(s: &str) -> Vec<DigitRun> {
+    let mut runs = Vec::new();
+    let mut current: Option<(usize, String)> = None;
+    for (i, ch) in s.char_indices() {
+        if ch.is_ascii_digit() {
+            current.get_or_insert_with(|| (i, String::new())).1.push(ch);
+        } else if let Some((start, digits)) = current.take() {
+            let end = start + digits.len();
+            runs.push(DigitRun { digits, start, end });
+        }
+    }
+    if let Some((start, digits)) = current {
+        let end = start + digits.len();
+        runs.push(DigitRun { digits, start, end });
+    }
+    runs
+}
+
+/// Whether exactly one date separator sits between two digit runs.
+fn single_date_separator(s: &str, from: usize, to: usize) -> bool {
+    to == from + 1 && matches!(&s[from..to], "-" | "_" | "." | "/")
+}
+
+fn num(digits: &str) -> u32 {
+    digits.parse().unwrap_or(0)
+}
+
+fn valid_ymd(y: u32, m: u32, d: u32) -> bool {
+    (MIN_YEAR..=MAX_YEAR).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d)
+}
+
+// ── Version extraction ──────────────────────────────────────────────────────
+
+/// ASCII keywords recognised as version markers, as whole tokens.
+const VERSION_KEYWORDS: &[(&str, &str)] = &[
+    ("final", "final"),
+    ("draft", "draft"),
+    ("old", "old"),
+    ("latest", "latest"),
+    ("wip", "wip"),
+];
+
+/// Japanese version markers. These are matched as substrings because Japanese
+/// file names have no separators to tokenise on; each string is long and
+/// specific enough that a chance occurrence is not a realistic worry.
+const VERSION_SUBSTRINGS_JA: &[(&str, &str)] =
+    &[("最終", "final"), ("最新", "latest"), ("下書き", "draft")];
+
+/// Suffixes of the OS "duplicate of another file" convention, exactly as the
+/// shells write them: `report - Copy.txt`, `報告書 のコピー.txt`.
+///
+/// Anything looser was measured to be wrong. A bare `copy` token matched
+/// `copy.bc`, `geqo_copy.bc` and `COPY.7` (PostgreSQL's `COPY` statement);
+/// dropping the space and accepting `-copy` matched `edit-copy.svg` and
+/// `folder-copy.svg` (icon names). A version namespace that fires on subject
+/// matter is a namespace users learn to ignore.
+const COPY_SUFFIXES: &[&str] = &["- copy", "のコピー"];
+
+/// Version / revision markers in a file name stem.
+pub fn version_values(stem: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |v: String, out: &mut Vec<String>| {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    };
+
+    for token in stem.split(TOKEN_SEPARATORS).filter(|s| !s.is_empty()) {
+        let lower = token.to_lowercase();
+        if let Some((_, tag)) = VERSION_KEYWORDS.iter().find(|(k, _)| *k == lower) {
+            push(tag.to_string(), &mut out);
+            continue;
+        }
+        for (prefix, label) in [("v", "v"), ("ver", "v"), ("rev", "rev"), ("r", "rev")] {
+            let Some(rest) = lower.strip_prefix(prefix) else {
+                continue;
+            };
+            // `r` alone would fire on far too much; require it to be the whole
+            // token followed by digits, and keep the number short so an id like
+            // `v20240315` is read as a date, not as version 20,240,315.
+            if rest.is_empty() || rest.len() > 3 || !rest.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let n: u32 = rest.parse().unwrap_or(0);
+            push(format!("{label}{n}"), &mut out);
+            break;
+        }
+    }
+
+    for (needle, tag) in VERSION_SUBSTRINGS_JA {
+        if stem.contains(needle) {
+            push((*tag).to_string(), &mut out);
+        }
+    }
+
+    // Windows' duplicate-file conventions: `report (3).xlsx`, `report - Copy`,
+    // `報告書 のコピー`. `report - Copy (2)` satisfies the first test as well.
+    let trimmed = stem.trim_end().to_lowercase();
+    if trailing_paren_number(stem).is_some() || COPY_SUFFIXES.iter().any(|s| trimmed.ends_with(s)) {
+        push("copy".to_string(), &mut out);
+    }
+
+    // `旧` is a strong marker only at the start of a name.
+    if stem.starts_with('旧') {
+        push("old".to_string(), &mut out);
+    }
+
+    out
+}
+
+/// `Some(n)` when the stem ends with ` (n)` / `(n)` for a decimal `n`.
+fn trailing_paren_number(stem: &str) -> Option<u32> {
+    let trimmed = stem.trim_end();
+    let inner = trimmed.strip_suffix(')')?;
+    let open = inner.rfind('(')?;
+    let digits = &inner[open + 1..];
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+// ── Naming patterns ─────────────────────────────────────────────────────────
+
+/// Stem prefixes that identify a screenshot, across the common OS conventions.
+const SCREENSHOT_PREFIXES: &[&str] = &[
+    "screenshot",
+    "screen shot",
+    "screen_shot",
+    "screen-shot",
+    "screencapture",
+    "scr-",
+    "scr_",
+    "snipaste_",
+    "スクリーンショット",
+    "画面キャプチャ",
+];
+
+/// Camera / phone naming prefixes, each followed by at least four digits.
+const CAMERA_PREFIXES: &[&str] = &[
+    "img_", "img-", "img", "dsc", "dscf", "dscn", "pxl_", "mvi_", "gopr", "dji_", "vid_", "pano_",
+];
+
+/// Extensions that mean "this file is a backup of another one".
+///
+/// The extension (or a trailing `~`) is the whole of the backup signal. The word
+/// "backup" *inside* a name is a topic, not a status: measured against `/usr` it
+/// claimed `pg_basebackup`, `dpkg-db-backup.service` and `Debconf/DbDriver/
+/// Backup.pm`, none of which is a backup of anything. `report_backup.xlsx` is
+/// therefore deliberately not claimed either — precision is worth more here,
+/// because that file is still one `sagasu find backup` away.
+const BACKUP_EXTS: &[&str] = &["bak", "bkp", "old", "orig", "backup", "save", "sav"];
+
+/// Extensions that mean "this file is mid-write or mid-download".
+const TEMP_EXTS: &[&str] = &[
+    "tmp",
+    "temp",
+    "swp",
+    "swo",
+    "swn",
+    "part",
+    "partial",
+    "crdownload",
+];
+
+/// Naming conventions recognised in a file name.
+pub fn pattern_values(file_name: &str, stem: &str, ext: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |v: &str, out: &mut Vec<String>| {
+        if !out.iter().any(|e| e == v) {
+            out.push(v.to_string());
+        }
+    };
+
+    let lower_stem = stem.to_lowercase();
+    let lower_name = file_name.to_lowercase();
+
+    // The prefix has to end at a boundary: a separator, a digit, or the end of
+    // the stem. Measured against `/usr`, a bare `starts_with` claimed
+    // LibreOffice's `screenshotannotationdialog.ui` — a UI definition that
+    // merely begins with the word.
+    if SCREENSHOT_PREFIXES
+        .iter()
+        .any(|p| starts_with_at_boundary(&lower_stem, p))
+    {
+        push("screenshot", &mut out);
+    }
+
+    if is_camera_name(&lower_stem) {
+        push("camera", &mut out);
+    }
+
+    let ext_is =
+        |list: &[&str]| ext.is_some_and(|e| list.iter().any(|x| x.eq_ignore_ascii_case(e)));
+
+    if ext_is(BACKUP_EXTS) || lower_name.ends_with('~') || stem.ends_with("バックアップ") {
+        push("backup", &mut out);
+    }
+
+    if ext_is(TEMP_EXTS)
+        || lower_name.starts_with("~$")
+        || lower_name.starts_with(".~lock.")
+        || lower_name.starts_with('~')
+    {
+        push("temp", &mut out);
+    }
+
+    // A dot-prefixed name is a naming convention, not a filesystem attribute,
+    // so it is portable to say so — unlike the Windows hidden bit, which the
+    // crawl does not read.
+    if file_name.starts_with('.') && file_name.len() > 1 {
+        push("dotfile", &mut out);
+    }
+
+    out
+}
+
+/// Whether `s` starts with `prefix` *and* the prefix ends at a word boundary.
+///
+/// A boundary is the end of the string, one of the usual name separators, or a
+/// digit — which covers every real form of these conventions (`Screenshot
+/// 2024-…`, `Screenshot_2024…`, `SCR-20240315`, plain `screenshot.png`) without
+/// matching a longer word that merely begins the same way.
+fn starts_with_at_boundary(s: &str, prefix: &str) -> bool {
+    let Some(rest) = s.strip_prefix(prefix) else {
+        return false;
+    };
+    match rest.chars().next() {
+        None => true,
+        Some(c) => c.is_ascii_digit() || matches!(c, ' ' | '_' | '-' | '.' | '(' | '　'),
+    }
+}
+
+/// Whether a lowercased stem follows a camera / phone naming convention.
+fn is_camera_name(stem: &str) -> bool {
+    // `P1010123`: Panasonic / Olympus use `P` plus exactly seven digits.
+    if let Some(rest) = stem.strip_prefix('p') {
+        if rest.len() == 7 && rest.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    for prefix in CAMERA_PREFIXES {
+        let Some(rest) = stem.strip_prefix(prefix) else {
+            continue;
+        };
+        let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits < 4 {
+            continue;
+        }
+        let tail = &rest[digits..];
+        if tail.is_empty() || tail.starts_with(['_', '-', '.']) {
+            return true;
+        }
+    }
+    false
+}
+
+// ── Format detection ────────────────────────────────────────────────────────
+
+/// Identify a format from a leading byte sample.
+///
+/// Returns `None` for an empty sample: a zero-byte file is not evidence of any
+/// format, and calling it "binary" would invent an anomaly out of nothing.
+pub fn format_from_magic(sample: &[u8]) -> Option<&'static str> {
+    if sample.is_empty() {
+        return None;
+    }
+    let at = |off: usize, sig: &[u8]| -> bool {
+        sample.len() >= off + sig.len() && &sample[off..off + sig.len()] == sig
+    };
+
+    let signatures: &[(&[u8], &str)] = &[
+        (b"%PDF-", "pdf"),
+        (b"\x89PNG\r\n\x1a\n", "png"),
+        (b"\xFF\xD8\xFF", "jpg"),
+        (b"GIF87a", "gif"),
+        (b"GIF89a", "gif"),
+        (b"BM", "bmp"),
+        (b"II*\x00", "tiff"),
+        (b"MM\x00*", "tiff"),
+        (b"PK\x03\x04", "zip"),
+        (b"PK\x05\x06", "zip"),
+        (b"PK\x07\x08", "zip"),
+        (b"\x1F\x8B", "gzip"),
+        (b"BZh", "bzip2"),
+        (b"\xFD7zXZ\x00", "xz"),
+        (b"\x28\xB5\x2F\xFD", "zstd"),
+        (b"7z\xBC\xAF\x27\x1C", "sevenzip"),
+        (b"Rar!\x1A\x07", "rar"),
+        (b"\x7FELF", "elf"),
+        (b"MZ", "pe"),
+        (b"\xFE\xED\xFA\xCE", "macho"),
+        (b"\xFE\xED\xFA\xCF", "macho"),
+        // Also a Mach-O universal binary header; `.class` is by far the more
+        // common thing to meet in a document tree, and the extension
+        // disambiguates in the cases that matter.
+        (b"\xCA\xFE\xBA\xBE", "class"),
+        (b"SQLite format 3\x00", "sqlite"),
+        (b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1", "ole2"),
+        (b"{\\rtf", "rtf"),
+        (b"OggS", "ogg"),
+        (b"fLaC", "flac"),
+        (b"ID3", "mp3"),
+        (b"\x1A\x45\xDF\xA3", "matroska"),
+        (b"%!PS", "postscript"),
+        (b"\x00asm", "wasm"),
+        (b"wOFF", "woff"),
+        (b"wOF2", "woff2"),
+        (b"\x00\x01\x00\x00\x00", "ttf"),
+        (b"OTTO", "otf"),
+        (b"8BPS", "psd"),
+        (b"\x25\x21", "postscript"),
+    ];
+    for (sig, name) in signatures {
+        if sample.starts_with(sig) {
+            return Some(name);
+        }
+    }
+
+    // Container formats whose signature is not at offset 0.
+    if at(0, b"RIFF") {
+        if at(8, b"WAVE") {
+            return Some("wav");
+        }
+        if at(8, b"AVI ") {
+            return Some("avi");
+        }
+        if at(8, b"WEBP") {
+            return Some("webp");
+        }
+        return Some("riff");
+    }
+    if at(4, b"ftyp") {
+        if at(8, b"heic") || at(8, b"heix") || at(8, b"mif1") {
+            return Some("heif");
+        }
+        return Some("mp4");
+    }
+
+    // UTF-16 is text we cannot decode yet (`crate::text`), but its byte-order
+    // mark is a positive identification, so say what it is instead of "binary".
+    if sample.starts_with(&[0xFF, 0xFE]) || sample.starts_with(&[0xFE, 0xFF]) {
+        return Some("utf16");
+    }
+    if sample.starts_with(b"<?xml") || sample.starts_with(b"\xEF\xBB\xBF<?xml") {
+        return Some("xml");
+    }
+
+    // Nothing matched: fall back to the same text/binary judgement the indexer
+    // uses, so `format:text` means exactly "this is what the full-text stage
+    // would have indexed".
+    Some(if crate::text::sniff_is_text(sample) {
+        "text"
+    } else {
+        "binary"
+    })
+}
+
+/// Fold extension aliases so one format lands in one bucket.
+pub fn fold_ext(ext: &str) -> &str {
+    match ext {
+        "jpeg" | "jpe" => "jpg",
+        "htm" => "html",
+        "yml" => "yaml",
+        "tif" => "tiff",
+        "mpeg" => "mpg",
+        "markdown" | "mdown" => "md",
+        "text" => "txt",
+        "tgz" => "tar.gz",
+        other => other,
+    }
+}
+
+/// The format an extension implies, when it implies one at all.
+#[rustfmt::skip]
+pub fn format_from_ext(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "pdf" => "pdf",
+        "png" => "png", "jpg" => "jpg", "gif" => "gif", "webp" => "webp", "bmp" => "bmp",
+        "tiff" => "tiff", "ico" => "ico", "heic" | "heif" => "heif", "psd" => "psd",
+        "svg" => "xml",
+        "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" => "ooxml",
+        "doc" | "xls" | "ppt" | "msi" | "msg" => "ole2",
+        "odt" | "ods" | "odp" => "opendocument",
+        "rtf" => "rtf", "epub" => "zip",
+        "zip" | "jar" | "war" | "whl" | "apk" => "zip",
+        "gz" | "tar.gz" => "gzip", "bz2" => "bzip2", "xz" => "xz", "zst" => "zstd",
+        "7z" => "sevenzip", "rar" => "rar", "tar" => "tar",
+        "exe" | "dll" | "sys" => "pe", "so" => "elf", "dylib" => "macho", "class" => "class",
+        "wasm" => "wasm",
+        "sqlite" | "sqlite3" | "db" => "sqlite",
+        "mp3" => "mp3", "flac" => "flac", "ogg" | "oga" => "ogg", "wav" => "wav",
+        "mp4" | "m4v" | "m4a" => "mp4", "mkv" | "webm" => "matroska", "avi" => "avi",
+        "ttf" => "ttf", "otf" => "otf", "woff" => "woff", "woff2" => "woff2",
+        "ps" | "eps" => "postscript",
+        "xml" | "xsd" | "xsl" | "xslt" | "plist" | "resx" => "xml",
+        _ => return crate::text::TEXT_EXTS.contains(&ext).then_some("text"),
+    })
+}
+
+/// Formats an extension is *expected* to have, for mismatch detection.
+///
+/// Only extensions whose content has a checkable binary signature appear here —
+/// see the comment at the call site in [`tags_for`].
+#[rustfmt::skip]
+fn expected_formats(ext: &str) -> Option<&'static [&'static str]> {
+    Some(match ext {
+        "pdf" => &["pdf"],
+        "png" => &["png"], "jpg" => &["jpg"], "gif" => &["gif"], "bmp" => &["bmp"],
+        "tiff" => &["tiff"], "webp" => &["webp", "riff"], "psd" => &["psd"],
+        "heic" | "heif" => &["heif", "mp4"],
+        // OOXML and ODF are ZIP containers; the ZIP signature is the right
+        // answer for them, not a mismatch.
+        "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" => &["zip", "ooxml"],
+        "odt" | "ods" | "odp" => &["zip", "opendocument"],
+        "doc" | "xls" | "ppt" | "msi" => &["ole2"],
+        "zip" | "jar" | "war" | "whl" | "apk" | "epub" => &["zip"],
+        "gz" | "tar.gz" => &["gzip"], "bz2" => &["bzip2"], "xz" => &["xz"], "zst" => &["zstd"],
+        "7z" => &["sevenzip"], "rar" => &["rar"],
+        "exe" | "dll" => &["pe"], "so" => &["elf"], "class" => &["class"], "wasm" => &["wasm"],
+        "sqlite" | "sqlite3" => &["sqlite"],
+        "mp3" => &["mp3", "binary"], "flac" => &["flac"], "ogg" | "oga" => &["ogg"],
+        "wav" => &["wav", "riff"], "avi" => &["avi", "riff"],
+        "mp4" | "m4v" | "m4a" => &["mp4"], "mkv" | "webm" => &["matroska"],
+        "ttf" => &["ttf"], "otf" => &["otf"], "woff" => &["woff"], "woff2" => &["woff2"],
+        _ => return None,
+    })
+}
+
+/// Coarse category from the extension.
+#[rustfmt::skip]
+pub fn kind_from_ext(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        // 文書
+        "pdf" | "doc" | "docx" | "docm" | "odt" | "rtf" | "epub" | "mobi" | "pages" | "one"
+        | "djvu" | "xps" | "tex" => "document",
+        // 表計算
+        "xls" | "xlsx" | "xlsm" | "ods" | "numbers" | "csv" | "tsv" => "spreadsheet",
+        // プレゼンテーション
+        "ppt" | "pptx" | "pptm" | "odp" | "key" => "presentation",
+        // 画像
+        "jpg" | "png" | "gif" | "bmp" | "ico" | "webp" | "tiff" | "heif" | "avif" | "svg"
+        | "psd" | "xcf" | "raw" | "cr2" | "nef" => "image",
+        // 音声
+        "mp3" | "wav" | "flac" | "ogg" | "oga" | "m4a" | "aac" | "wma" => "audio",
+        // 映像
+        "mp4" | "m4v" | "avi" | "mkv" | "mov" | "wmv" | "webm" | "flv" | "mpg" => "video",
+        // アーカイブ
+        "zip" | "gz" | "tar.gz" | "bz2" | "xz" | "zst" | "lz4" | "7z" | "rar" | "tar" | "cab"
+        | "whl" | "crate" | "jar" | "war" | "apk" => "archive",
+        // 実行形式
+        "exe" | "dll" | "so" | "dylib" | "a" | "lib" | "o" | "obj" | "bin" | "class" | "pyc"
+        | "pyo" | "wasm" | "msi" | "sys" | "ko" => "executable",
+        // フォント
+        "ttf" | "otf" | "ttc" | "woff" | "woff2" | "eot" => "font",
+        // データベース・ディスクイメージ
+        "db" | "sqlite" | "sqlite3" | "mdb" | "accdb" | "iso" | "dmg" | "img" | "vhd"
+        | "vmdk" => "database",
+        // 設定
+        "ini" | "cfg" | "conf" | "config" | "properties" | "env" | "editorconfig" | "json"
+        | "json5" | "jsonc" | "yaml" | "toml" | "plist" | "resx" | "tf" | "tfvars"
+        | "hcl" => "config",
+        // データ・ログ
+        "log" | "ndjson" | "jsonl" | "xml" | "xsd" | "xsl" | "xslt" | "avsc" | "parquet" => "data",
+        // ノート
+        "ipynb" => "notebook",
+        // 平文
+        "txt" | "md" | "mdx" | "rst" | "adoc" | "asciidoc" | "org" | "bib" | "srt" | "vtt"
+        | "po" | "pot" | "man" | "patch" | "diff" => "text",
+        other => {
+            // Everything else on the text allowlist that is not covered above is
+            // source code — the largest group by far, and not worth spelling out
+            // extension by extension a second time.
+            return crate::text::TEXT_EXTS.contains(&other).then_some("code");
+        }
+    })
+}
+
+/// Coarse category from a detected format, used when the extension is unknown
+/// or absent.
+#[rustfmt::skip]
+fn kind_from_format(format: &str) -> Option<&'static str> {
+    Some(match format {
+        "pdf" | "ole2" | "ooxml" | "opendocument" | "rtf" | "postscript" => "document",
+        "png" | "jpg" | "gif" | "bmp" | "tiff" | "webp" | "heif" | "psd" | "ico" => "image",
+        "mp3" | "flac" | "ogg" | "wav" => "audio",
+        "mp4" | "matroska" | "avi" => "video",
+        "zip" | "gzip" | "bzip2" | "xz" | "zstd" | "sevenzip" | "rar" | "tar" => "archive",
+        "elf" | "pe" | "macho" | "class" | "wasm" => "executable",
+        "ttf" | "otf" | "woff" | "woff2" => "font",
+        "sqlite" => "database",
+        "xml" => "data",
+        "text" => "text",
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts<'a>(path: &'a str, root: &'a str, ext: Option<&'a str>) -> FileFacts<'a> {
+        FileFacts {
+            path,
+            root: Some(root),
+            ext,
+            magic: None,
+        }
+    }
+
+    fn values(set: &TagSet, ns: &str) -> Vec<String> {
+        set.tags
+            .iter()
+            .filter(|(t, _)| t.namespace() == ns)
+            .map(|(t, _)| t.value().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tag_parsing_lowercases_both_halves() {
+        let t = Tag::parse("Author:Masuda Masuo").unwrap();
+        assert_eq!(t.namespace(), "author");
+        assert_eq!(t.value(), "masuda masuo");
+        assert_eq!(t.to_string(), "author:masuda masuo");
+    }
+
+    #[test]
+    fn tag_parsing_rejects_the_shapes_that_would_corrupt_a_facet_axis() {
+        assert!(Tag::parse("nocolon").is_err());
+        assert!(Tag::parse(":value").is_err());
+        assert!(Tag::parse("ns:").is_err());
+        assert!(Tag::parse("bad ns:value").is_err());
+        // A value may contain a colon; only the first one splits.
+        assert_eq!(Tag::parse("url:http://x").unwrap().value(), "http://x");
+    }
+
+    #[test]
+    fn relative_path_is_platform_neutral() {
+        assert_eq!(
+            relative_path(r"C:\work\docs\a.txt", Some(r"C:\work")),
+            "docs/a.txt"
+        );
+        assert_eq!(
+            relative_path("/home/u/work/docs/a.txt", Some("/home/u/work")),
+            "docs/a.txt"
+        );
+        // Root given with a trailing separator, and a case difference.
+        assert_eq!(
+            relative_path(r"C:\Work\docs\a.txt", Some(r"c:\work\")),
+            "docs/a.txt"
+        );
+        // Not under the root: fall back to a relative-looking path.
+        assert_eq!(relative_path("/other/a.txt", Some("/work")), "other/a.txt");
+        // A path that diverges from the root *inside* a multi-byte character.
+        // Comparing by byte index here used to be a panic, not a mismatch.
+        assert_eq!(relative_path("/写真/a.txt", Some("/ab")), "写真/a.txt");
+        assert_eq!(relative_path("/a/写真", Some("/a/写")), "a/写真");
+    }
+
+    #[test]
+    fn dates_come_from_maximal_digit_runs_only() {
+        assert_eq!(date_values("report-2024-03-15"), vec!["2024", "2024-03"]);
+        assert_eq!(date_values("IMG_20240315_120000"), vec!["2024", "2024-03"]);
+        assert_eq!(date_values("archive/2024"), vec!["2024"]);
+        // A ten-digit id must not yield a year from its first four digits.
+        assert!(date_values("id1234567890").is_empty());
+        // Out-of-range year: nothing at all.
+        assert!(date_values("18990101").is_empty());
+        // Impossible month: the month is dropped, the year survives on its own
+        // four-digit run. Losing the year too would be the wrong trade — a
+        // directory called `2024-13` is still about 2024.
+        assert_eq!(date_values("2024-13"), vec!["2024"]);
+    }
+
+    #[test]
+    fn version_markers_are_whole_tokens() {
+        assert_eq!(version_values("plan_v2_final"), vec!["v2", "final"]);
+        assert_eq!(version_values("提案書_最終"), vec!["final"]);
+        // `v` inside a word must not fire.
+        assert!(version_values("service").is_empty());
+        // A long digit run after `v` is a date or an id, not a version.
+        assert!(version_values("v20240315").is_empty());
+    }
+
+    #[test]
+    fn the_duplicate_convention_is_a_suffix_not_the_word_copy() {
+        assert_eq!(version_values("report (3)"), vec!["copy"]);
+        assert_eq!(version_values("report - Copy"), vec!["copy"]);
+        assert_eq!(version_values("report - Copy (2)"), vec!["copy"]);
+        assert_eq!(version_values("報告書 のコピー"), vec!["copy"]);
+        // Regressions from the `/usr` measurement: PostgreSQL's `COPY`
+        // statement, and icon names, both matched looser rules.
+        assert!(version_values("copy").is_empty());
+        assert!(version_values("geqo_copy").is_empty());
+        assert!(version_values("edit-copy").is_empty());
+        assert!(version_values("folder-copy").is_empty());
+    }
+
+    #[test]
+    fn backup_comes_from_the_extension_not_from_the_word() {
+        assert_eq!(
+            pattern_values("report.xlsx.bak", "report.xlsx", Some("bak")),
+            vec!["backup"]
+        );
+        assert_eq!(
+            pattern_values("notes.txt~", "notes.txt~", None),
+            vec!["backup"]
+        );
+        // Regressions from the `/usr` measurement: programs *about* backups.
+        assert!(pattern_values("pg_basebackup", "pg_basebackup", None).is_empty());
+        assert!(pattern_values("Backup.pm", "Backup", Some("pm")).is_empty());
+        assert!(pattern_values("045_backup.t", "045_backup", Some("t")).is_empty());
+    }
+
+    #[test]
+    fn a_screenshot_prefix_has_to_end_at_a_boundary() {
+        for name in [
+            "Screenshot 2024-03-15",
+            "Screenshot_2024-03-15",
+            "SCR-20240315",
+            "screenshot",
+            "スクリーンショット 2024-03-15",
+        ] {
+            assert_eq!(
+                pattern_values(name, name, None),
+                vec!["screenshot"],
+                "{name} should be a screenshot"
+            );
+        }
+        // Regression from the `/usr` measurement: a LibreOffice UI definition.
+        assert!(pattern_values(
+            "screenshotannotationdialog.ui",
+            "screenshotannotationdialog",
+            Some("ui")
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn naming_patterns_recognise_the_common_conventions() {
+        assert_eq!(
+            pattern_values(
+                "Screenshot 2024-03-15.png",
+                "Screenshot 2024-03-15",
+                Some("png")
+            ),
+            vec!["screenshot"]
+        );
+        assert_eq!(
+            pattern_values("IMG_4821.JPG", "IMG_4821", Some("jpg")),
+            vec!["camera"]
+        );
+        assert_eq!(
+            pattern_values("~$plan.docx", "~$plan", Some("docx")),
+            vec!["temp"]
+        );
+        assert_eq!(
+            pattern_values(".gitignore", ".gitignore", None),
+            vec!["dotfile"]
+        );
+        // `image1.png` starts with `img`-ish text but has no digit run there.
+        assert!(pattern_values("image1.png", "image1", Some("png")).is_empty());
+    }
+
+    #[test]
+    fn magic_bytes_beat_the_extension_and_the_disagreement_is_tagged() {
+        let mut sample = b"%PDF-1.7\n".to_vec();
+        sample.extend_from_slice(&[0u8; 32]);
+        let set = tags_for(
+            &FileFacts {
+                path: "/root/a/notes.png",
+                root: Some("/root"),
+                ext: Some("png"),
+                magic: Some(&sample),
+            },
+            &RuleSet::empty(),
+        );
+        assert_eq!(values(&set, NS_FORMAT), vec!["pdf"]);
+        assert_eq!(values(&set, NS_EXT), vec!["png"]);
+        assert_eq!(values(&set, NS_ANOMALY), vec!["format-mismatch"]);
+    }
+
+    #[test]
+    fn a_zip_signature_on_a_docx_is_not_an_anomaly() {
+        let set = tags_for(
+            &FileFacts {
+                path: "/root/a/plan.docx",
+                root: Some("/root"),
+                ext: Some("docx"),
+                magic: Some(b"PK\x03\x04\x14\x00\x06\x00"),
+            },
+            &RuleSet::empty(),
+        );
+        assert_eq!(values(&set, NS_FORMAT), vec!["zip"]);
+        assert!(values(&set, NS_ANOMALY).is_empty());
+    }
+
+    #[test]
+    fn path_tags_come_from_directories_not_from_the_file_name() {
+        let set = tags_for(
+            &facts(
+                "/root/clients/acme-corp/invoice-april.pdf",
+                "/root",
+                Some("pdf"),
+            ),
+            &RuleSet::empty(),
+        );
+        let path_tags = values(&set, NS_PATH);
+        assert!(path_tags.contains(&"clients".to_string()));
+        assert!(path_tags.contains(&"acme-corp".to_string()));
+        assert!(path_tags.contains(&"acme".to_string()));
+        assert!(path_tags.contains(&"corp".to_string()));
+        assert!(
+            !path_tags.contains(&"invoice".to_string()),
+            "the file name must not become a path token: {path_tags:?}"
+        );
+    }
+
+    #[test]
+    fn output_is_sorted_and_deduplicated() {
+        let set = tags_for(
+            &facts("/root/2024/2024/report-2024.txt", "/root", Some("txt")),
+            &RuleSet::empty(),
+        );
+        let list: Vec<String> = set.tags.iter().map(|(t, _)| t.to_string()).collect();
+        let mut sorted = list.clone();
+        sorted.sort();
+        assert_eq!(list, sorted, "tags must come back in canonical order");
+        assert_eq!(values(&set, NS_DATE), vec!["2024"], "duplicates collapse");
+    }
+
+    #[test]
+    fn the_same_tag_from_two_sources_keeps_both_bits() {
+        // `2024` appears both as a directory and in the file name.
+        let set = tags_for(
+            &facts("/root/2024/report-2024.txt", "/root", Some("txt")),
+            &RuleSet::empty(),
+        );
+        let (_, sources) = set
+            .tags
+            .iter()
+            .find(|(t, _)| t.namespace() == NS_DATE && t.value() == "2024")
+            .expect("date:2024");
+        assert_eq!(
+            TagSource::describe(*sources),
+            vec!["path", "name"],
+            "a tag reached from two generators must record both"
+        );
+    }
+}

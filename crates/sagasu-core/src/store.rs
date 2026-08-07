@@ -8,10 +8,12 @@
 //! - `fs_id` is a platform file-identity blob: (dev, ino) on Unix, NULL on Windows
 //!   (M0). It is the primary key for rename/move detection during rescan.
 //! - Deleted files become tombstones (`deleted_at` set); rows are never removed.
+//! - `tags` / `file_tags` hold the machine-generated semantic layer (design.md
+//!   §6). They join on `file_id`, so a rename does not disturb them.
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 /// Number of magic bytes (start of file content) stored for file-type detection.
@@ -20,7 +22,12 @@ pub const MAGIC_LEN: usize = 512;
 // ── Schema ──────────────────────────────────────────────────────────────────
 
 /// Current schema version. Increment when the DDL changes.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// | Version | Change |
+/// |---|---|
+/// | 1 | M0: `meta`, `files`, `access_history`. |
+/// | 2 | M3: `tags`, `file_tags` (issue #4). Purely additive. |
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_DDL: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -53,6 +60,22 @@ CREATE TABLE IF NOT EXISTS access_history (
     ts      INTEGER NOT NULL,
     kind    TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS tags (
+    tag_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace TEXT NOT NULL,
+    value     TEXT NOT NULL,
+    UNIQUE(namespace, value)
+);
+
+CREATE TABLE IF NOT EXISTS file_tags (
+    file_id INTEGER NOT NULL REFERENCES files(file_id),
+    tag_id  INTEGER NOT NULL REFERENCES tags(tag_id),
+    sources INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (file_id, tag_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag_id, file_id);
 ";
 
 // ── FileRow ─────────────────────────────────────────────────────────────────
@@ -96,6 +119,18 @@ pub struct IndexStats {
     /// `scan_generation` to see whether the full-text index is behind the
     /// metadata index.
     pub fulltext_scan_generation: Option<i64>,
+    /// Scan generation the tag layer was built from. `None` = `sagasu tag` has
+    /// never run. Less than `scan_generation` → the tags are behind the
+    /// metadata index.
+    pub tag_scan_generation: Option<i64>,
+    /// Live files that carried at least one tag at the end of that build.
+    pub tag_files: Option<i64>,
+    /// The user rule file that build used, if any.
+    pub tag_rules: Option<String>,
+    /// Rows currently in `file_tags`.
+    pub tag_rows: i64,
+    /// Distinct `namespace:value` pairs currently referenced by a live file.
+    pub distinct_tags: i64,
 }
 
 // ── Store ───────────────────────────────────────────────────────────────────
@@ -119,7 +154,47 @@ impl Store {
 
         conn.execute_batch(SCHEMA_DDL)?;
 
-        Ok(Self { conn })
+        let store = Self { conn };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// Reconcile the stored `schema_version` with [`SCHEMA_VERSION`].
+    ///
+    /// Every DDL change so far has been **additive** (new tables and indexes,
+    /// no change to an existing column), so `CREATE TABLE IF NOT EXISTS` above
+    /// has already done the structural work by the time this runs; all that is
+    /// left is to stamp the new version. That is only true while migrations stay
+    /// additive — a version that rewrites a column needs real steps here, keyed
+    /// off `from`.
+    ///
+    /// A database written by a *newer* build is refused rather than opened.
+    /// Silently operating on a schema we do not understand is the "quietly
+    /// wrong answer" failure this project treats as the worst kind: an unknown
+    /// column would simply never be read, and nothing would say so.
+    fn migrate(&self) -> Result<()> {
+        let Some(raw) = self.meta_get("schema_version")? else {
+            // No version recorded: either a brand-new database (the DDL above
+            // just created everything at the current version) or one from
+            // before versioning existed. Either way the tables are current now.
+            // `ensure_schema_version` stamps it at the start of the next crawl.
+            return Ok(());
+        };
+        let from: i64 = raw.parse().with_context(|| {
+            format!("database has an unparseable schema_version {raw:?}; refusing to use it")
+        })?;
+
+        if from > SCHEMA_VERSION {
+            bail!(
+                "database schema version {from} is newer than this build understands \
+                 ({SCHEMA_VERSION}); upgrade sagasu rather than letting it read a \
+                 schema it does not know"
+            );
+        }
+        if from < SCHEMA_VERSION {
+            self.meta_set("schema_version", &SCHEMA_VERSION.to_string())?;
+        }
+        Ok(())
     }
 
     /// Return a shared reference to the inner connection (for direct queries).
@@ -478,6 +553,22 @@ impl Store {
         Ok(rows)
     }
 
+    /// Fill in `magic` alone, leaving `blake3` untouched.
+    ///
+    /// The tag engine needs the leading bytes to identify a format, but not the
+    /// content hash — reading 512 bytes is orders of magnitude cheaper than
+    /// hashing the file, so `sagasu tag --read-magic` backfills just this column
+    /// rather than forcing a full `sagasu hash` pass first. `blake3 IS NULL`
+    /// still means "not hashed", so a later `sagasu hash` picks the file up
+    /// exactly as before.
+    pub fn update_magic(&self, file_id: i64, magic: &[u8]) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET magic=?1 WHERE file_id=?2",
+            params![magic, file_id],
+        )?;
+        Ok(())
+    }
+
     /// Update the hash columns for a file.
     pub fn update_hash(&self, file_id: i64, blake3_hash: &[u8], magic: &[u8]) -> Result<()> {
         self.conn.execute(
@@ -530,6 +621,15 @@ impl Store {
             |row| row.get(0),
         )?;
 
+        let tag_rows: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM file_tags", [], |row| row.get(0))?;
+        let distinct_tags: i64 =
+            self.conn
+                .query_row("SELECT COUNT(DISTINCT tag_id) FROM file_tags", [], |row| {
+                    row.get(0)
+                })?;
+
         Ok(IndexStats {
             root_path,
             schema_version,
@@ -544,6 +644,13 @@ impl Store {
             fulltext_scan_generation: self
                 .meta_get("fulltext_scan_generation")?
                 .and_then(|s| s.parse().ok()),
+            tag_scan_generation: self
+                .meta_get("tag_scan_generation")?
+                .and_then(|s| s.parse().ok()),
+            tag_files: self.meta_get("tag_files")?.and_then(|s| s.parse().ok()),
+            tag_rules: self.meta_get("tag_rules")?,
+            tag_rows,
+            distinct_tags,
         })
     }
 
@@ -612,7 +719,7 @@ fn escape_like(needle: &str) -> String {
     out
 }
 
-fn row_to_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
+pub(crate) fn row_to_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
     Ok(FileRow {
         file_id: row.get(0)?,
         path: row.get(1)?,

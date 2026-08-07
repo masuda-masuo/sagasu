@@ -7,6 +7,14 @@ exclude = ["prototypes", "bench"]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 ignore = "0.4"
+# Glob matching for the user-defined tag rules (docs/tag_rules.md). Already in
+# the tree as a dependency of `ignore`, so declaring it directly costs no extra
+# compilation.
+globset = "0.4"
+# Config format for the tag rule file. TOML is what `bench/configs/*.toml`
+# already uses, so the project has one config language rather than two.
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
 tantivy = "0.25"
