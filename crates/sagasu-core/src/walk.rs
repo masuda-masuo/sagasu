@@ -48,9 +48,71 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".cargo", // see special-case logic below
 ];
 
-/// Check whether a directory basename appears in the exclude list (case-insensitive).
-fn is_excluded_dir(name: &str, excludes: &[String]) -> bool {
-    excludes.iter().any(|e| e.eq_ignore_ascii_case(name))
+/// The effective exclusion set of a crawl: the built-in list (unless dropped)
+/// plus whatever the user added.
+///
+/// This is a type rather than a `Vec<String>` because the *same* set has to be
+/// applied in two places that do not share a walker: the crawl below, and the
+/// search-time delta set ([`crate::delta`]). A USN Journal read returns raw
+/// volume-wide change records, so unless the very same rule is applied there,
+/// the delta set fills up with build artefacts and telemetry the index never
+/// contained — measured at a 94% noise ratio on a real machine (issue #16).
+#[derive(Debug, Clone)]
+pub struct ExcludeSet {
+    names: Vec<String>,
+}
+
+impl ExcludeSet {
+    /// Build the set from the built-in list plus `extra`. `no_default` drops the
+    /// built-in list, leaving only `extra`.
+    pub fn new(extra: &[String], no_default: bool) -> Self {
+        let mut names: Vec<String> = if no_default {
+            Vec::new()
+        } else {
+            DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect()
+        };
+        for e in extra {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(e)) {
+                names.push(e.clone());
+            }
+        }
+        Self { names }
+    }
+
+    /// The excluded directory basenames, in effective order.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Whether a directory basename is excluded (case-insensitive).
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.iter().any(|e| e.eq_ignore_ascii_case(name))
+    }
+
+    /// If `path` lives under an excluded directory at or below `root`, return
+    /// that directory's lowercased basename (the key used in skip counts).
+    ///
+    /// `.cargo` is special-cased: only `.cargo/registry` is skipped, not
+    /// `.cargo` itself or its other children.
+    pub fn matched_dir(&self, path: &Path, root: &Path) -> Option<String> {
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor == root {
+                break;
+            }
+            let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let hit = if name.eq_ignore_ascii_case(".cargo") {
+                self.contains(name) && path.starts_with(ancestor.join("registry"))
+            } else {
+                self.contains(name)
+            };
+            if hit {
+                return Some(name.to_lowercase());
+            }
+        }
+        None
+    }
 }
 
 /// Resolve a database path to its canonical (absolute) form, tolerating a file
@@ -73,12 +135,27 @@ pub fn canonical_db_path(p: &Path) -> PathBuf {
     }
 }
 
+/// The database file and its WAL/SHM siblings, canonicalized.
+///
+/// These must never be indexed, and must never enter a search-time delta set
+/// either: SQLite writes to them on every scan, so they would look like a
+/// changed file on every single query.
+pub fn db_sibling_paths(db_path: &Path) -> Vec<PathBuf> {
+    let db_canon = canonical_db_path(db_path);
+    vec![
+        db_canon.clone(),
+        PathBuf::from(format!("{}-wal", db_canon.display())),
+        PathBuf::from(format!("{}-shm", db_canon.display())),
+    ]
+}
+
 /// Path equality that tolerates case differences (Windows filesystems).
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
-    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
 // ── Config / Summary ────────────────────────────────────────────────────────
@@ -163,25 +240,28 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
         .unwrap_or(0);
 
     // Build the effective exclude list.
-    let mut excludes: Vec<String> = if config.no_default_excludes {
-        Vec::new()
-    } else {
-        DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect()
-    };
-    for extra in &config.exclude {
-        if !excludes.iter().any(|e| e.eq_ignore_ascii_case(extra)) {
-            excludes.push(extra.clone());
-        }
-    }
+    let excludes = ExcludeSet::new(&config.exclude, config.no_default_excludes);
 
     // The database file (and its WAL/SHM siblings) must never be indexed. If the
     // user pointed `--db` inside the crawl root, skip those paths explicitly.
-    let db_canon = canonical_db_path(&config.db_path);
-    let db_skip: Vec<PathBuf> = vec![
-        db_canon.clone(),
-        PathBuf::from(format!("{}-wal", db_canon.display())),
-        PathBuf::from(format!("{}-shm", db_canon.display())),
-    ];
+    let db_skip = db_sibling_paths(&config.db_path);
+
+    // Point-in-time marker for the search-time delta merge (design.md §5).
+    // Taken *before* the walk: anything that changes while the crawl is running
+    // falls on the delta side of the next search, which is the safe direction.
+    // On Windows this is a USN Journal position when one is available, and a
+    // wall-clock instant otherwise; the source that produced it also knows how
+    // to read a range back from it.
+    let delta_marker = crate::delta::source_for(&crate::delta::DeltaConfig {
+        root: root.clone(),
+        excludes: excludes.clone(),
+        skip_paths: db_skip.clone(),
+        threads: config.threads,
+    })
+    .current_marker()
+    .unwrap_or(crate::delta::ScanMarker::Mtime {
+        started_ns: scan_marker_ns,
+    });
 
     // ── Walk in parallel, collect into a channel ────────────────────────────
     let (tx, rx) = mpsc::channel::<FileEntry>();
@@ -223,6 +303,7 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
     let tx_db = store.begin_tx()?;
     Store::meta_set_tx(&tx_db, "root_path", &root.to_string_lossy())?;
     Store::meta_set_tx(&tx_db, "scan_marker", &scan_marker_ns.to_string())?;
+    Store::meta_set_tx(&tx_db, "delta_marker", &delta_marker.encode())?;
     let scan_gen = Store::next_scan_generation_tx(&tx_db)?;
 
     // Capture the summary from within the scope via Arc<Mutex>.
@@ -259,25 +340,10 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                     scanned.fetch_add(1, Ordering::Relaxed);
 
                     // Check parent directories against the exclude list.
-                    for ancestor in entry.path().ancestors().skip(1) {
-                        if ancestor == root {
-                            break;
-                        }
-                        if let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) {
-                            let should_skip =
-                                if name.eq_ignore_ascii_case(".cargo") {
-                                    let registry = ancestor.join("registry");
-                                    entry.path().starts_with(&registry)
-                                } else {
-                                    is_excluded_dir(name, &excludes)
-                                };
-
-                            if should_skip {
-                                let mut sm = skip_map.lock().unwrap();
-                                *sm.entry(name.to_lowercase()).or_insert(0) += 1;
-                                return WalkState::Skip;
-                            }
-                        }
+                    if let Some(name) = excludes.matched_dir(entry.path(), &root) {
+                        let mut sm = skip_map.lock().unwrap();
+                        *sm.entry(name).or_insert(0) += 1;
+                        return WalkState::Skip;
                     }
 
                     let Ok(meta) = entry.metadata() else {
@@ -299,9 +365,7 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                         .unwrap_or(0);
 
                     let path = entry.path();
-                    let ext = path
-                        .extension()
-                        .map(|e| e.to_string_lossy().to_lowercase());
+                    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
                     let fs_id = store::fs_id_from_metadata(&meta);
 
                     let _ = tx.send(FileEntry {
@@ -346,8 +410,7 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                 let existing = store.find_by_path(&tx_db, &entry.path)?;
 
                 if let Some(row) = existing {
-                    let unchanged =
-                        row.size == entry.size && row.mtime_ns == entry.mtime_ns;
+                    let unchanged = row.size == entry.size && row.mtime_ns == entry.mtime_ns;
                     seen_ids.insert(row.file_id, true);
 
                     if unchanged {
@@ -365,23 +428,15 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                     };
 
                     let matched = match matched {
-                        Some(ref row)
-                            if !seen_ids.get(&row.file_id).copied().unwrap_or(true) =>
-                        {
+                        Some(ref row) if !seen_ids.get(&row.file_id).copied().unwrap_or(true) => {
                             Some(row.clone())
                         }
                         _ => {
-                            let candidate = store.find_by_size_mtime(
-                                &tx_db,
-                                entry.size,
-                                entry.mtime_ns,
-                            )?;
+                            let candidate =
+                                store.find_by_size_mtime(&tx_db, entry.size, entry.mtime_ns)?;
                             match candidate {
                                 Some(ref row)
-                                    if !seen_ids
-                                        .get(&row.file_id)
-                                        .copied()
-                                        .unwrap_or(true) =>
+                                    if !seen_ids.get(&row.file_id).copied().unwrap_or(true) =>
                                 {
                                     Some(row.clone())
                                 }

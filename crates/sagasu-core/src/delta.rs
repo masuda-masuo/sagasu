@@ -1,0 +1,884 @@
+//! Search-time delta sources — steps 1 and 2 of the freshness design (design.md §5).
+//!
+//! ## Why this exists
+//!
+//! sagasu's central bet is that **the index is allowed to be stale**. What is
+//! not allowed to be stale is the *answer*. So every search asks a delta source
+//! for "everything that changed since the marker recorded at index time",
+//! live-greps that (normally tiny) set, and merges it over the index result —
+//! see [`crate::fresh`] for the merge.
+//!
+//! ## The marker
+//!
+//! [`ScanMarker`] is the point-in-time token `sagasu index` writes into the
+//! `delta_marker` meta key:
+//!
+//! - [`ScanMarker::Mtime`] — the wall-clock instant the crawl started. Never
+//!   expires, works everywhere, costs a full `stat` walk to read back.
+//! - [`ScanMarker::Usn`] — an NTFS USN Journal position: volume, **journal id**,
+//!   next USN, the journal's `MaximumSize`, and when it was taken. Reading a
+//!   range back is a journal read (tens of ms) instead of a walk, but the marker
+//!   has a finite lifetime.
+//!
+//! ## A USN marker expires — that is normal operation, not an error path
+//!
+//! The USN Journal is a ring buffer. On a working machine it is consumed at
+//! roughly 8 MiB per few minutes, so a marker older than the journal window is
+//! the *expected* state after a lunch break, not a rare corruption case
+//! (issue #16). Two independent things can invalidate it:
+//!
+//! 1. **The records rolled off**: `marker.next_usn < journal.first_usn`, or the
+//!    read fails with `ERROR_JOURNAL_ENTRY_DELETED` (0x8007049D).
+//! 2. **The journal was recreated**: the USN number space restarts, so number
+//!    comparison alone is not enough — the **journal id** must match too.
+//!
+//! Both land on [`DeltaStatus::RescanRequired`], which is a *different* branch
+//! from [`DeltaStatus::Truncated`]: "the delta set is too big to live-grep" and
+//! "we can no longer tell what the delta set is" call for different things (one
+//! degrades to a warning, the other demands a re-crawl).
+//!
+//! [`estimate_lifetime`] turns the values stored in the marker into a remaining
+//! lifetime estimate, so a caller can warn *before* the marker expires.
+//!
+//! ## One exclusion set, not two
+//!
+//! The delta set goes through the same [`ExcludeSet`] as the crawl. This matters
+//! most on the USN path, which returns raw volume-wide change records: without
+//! the filter the delta set is dominated by telemetry (`.etl`), PowerShell
+//! temporaries and build artefacts the index never contained — measured at a
+//! 94% noise ratio on a real machine. [`DeltaSet::excluded`] reports how many
+//! records the filter dropped so that ratio stays visible.
+//!
+//! ## Future sources
+//!
+//! macOS FSEvents and Linux fanotify are additional [`DeltaSource`] impls; both
+//! need a resident watcher, which is out of M2 scope. [`DeltaSourceKind`] names
+//! them so the seam is explicit rather than implied.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, UNIX_EPOCH};
+
+use anyhow::Result;
+use ignore::{WalkBuilder, WalkState};
+
+use crate::walk::{self, ExcludeSet};
+
+// ── Constants ───────────────────────────────────────────────────────────────
+
+/// Default cap on the size of a delta set.
+///
+/// Above this the live grep stops being "unnoticeable" and the honest answer is
+/// to say the index is stale rather than to spend a second reading files. It is
+/// deliberately generous relative to the 0.1%-of-corpus figure the design
+/// assumes (design.md §5): 2000 changed files is 0.1% of two million.
+pub const DEFAULT_DELTA_LIMIT: usize = 2000;
+
+/// Default lifetime of a cached delta set, in milliseconds.
+///
+/// Sized for interactive search: a burst of keystrokes shares one delta query,
+/// and a file touched in another window shows up within a second. See
+/// [`DeltaCache`].
+pub const DEFAULT_DELTA_TTL_MS: u64 = 1000;
+
+// ── Marker ──────────────────────────────────────────────────────────────────
+
+/// The point-in-time token recorded by a crawl and replayed by a search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanMarker {
+    /// Wall-clock instant (unix ns) at which the crawl started.
+    Mtime {
+        /// Unix nanoseconds.
+        started_ns: i64,
+    },
+    /// NTFS USN Journal position.
+    Usn {
+        /// Volume the journal belongs to, e.g. `C:`.
+        volume: String,
+        /// `UsnJournalID`. A recreated journal gets a new id and restarts its
+        /// number space, so this must match before `next_usn` means anything.
+        journal_id: u64,
+        /// `NextUsn` at marker time: the first record a delta read asks for.
+        next_usn: i64,
+        /// `MaximumSize` of the journal in bytes — the ring-buffer capacity the
+        /// lifetime estimate is measured against.
+        maximum_size: u64,
+        /// Unix ns at which the marker was taken (the other half of the rate
+        /// calculation in [`estimate_lifetime`]).
+        recorded_ns: i64,
+    },
+}
+
+impl ScanMarker {
+    /// Wall-clock instant the marker was taken, in unix ns.
+    ///
+    /// Every marker carries one, which is what lets the mtime source stand in
+    /// for a USN source that is unavailable at search time (no admin rights, a
+    /// non-NTFS volume) instead of giving up.
+    pub fn wall_clock_ns(&self) -> i64 {
+        match self {
+            ScanMarker::Mtime { started_ns } => *started_ns,
+            ScanMarker::Usn { recorded_ns, .. } => *recorded_ns,
+        }
+    }
+
+    /// Short label for reporting (`mtime` / `usn`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ScanMarker::Mtime { .. } => "mtime",
+            ScanMarker::Usn { .. } => "usn",
+        }
+    }
+
+    /// Encode for the `meta` table (TEXT). Pipe-separated because `|` cannot
+    /// appear in a Windows volume specifier while `:` obviously can.
+    pub fn encode(&self) -> String {
+        match self {
+            ScanMarker::Mtime { started_ns } => format!("mtime|{started_ns}"),
+            ScanMarker::Usn {
+                volume,
+                journal_id,
+                next_usn,
+                maximum_size,
+                recorded_ns,
+            } => format!("usn|{volume}|{journal_id}|{next_usn}|{maximum_size}|{recorded_ns}"),
+        }
+    }
+
+    /// Parse a marker written by [`ScanMarker::encode`]. Returns `None` for an
+    /// unknown or malformed encoding — the caller then has no usable marker and
+    /// must treat the whole index as stale.
+    pub fn decode(s: &str) -> Option<Self> {
+        let mut parts = s.split('|');
+        match parts.next()? {
+            "mtime" => Some(ScanMarker::Mtime {
+                started_ns: parts.next()?.parse().ok()?,
+            }),
+            "usn" => Some(ScanMarker::Usn {
+                volume: parts.next()?.to_string(),
+                journal_id: parts.next()?.parse().ok()?,
+                next_usn: parts.next()?.parse().ok()?,
+                maximum_size: parts.next()?.parse().ok()?,
+                recorded_ns: parts.next()?.parse().ok()?,
+            }),
+            _ => None,
+        }
+    }
+}
+
+// ── Marker lifetime (issue #16, requirement 3) ──────────────────────────────
+
+/// How much of a USN marker's runway is left.
+///
+/// The USN of a record is its byte offset in the journal, so "USN numbers
+/// consumed since the marker" and "journal bytes written since the marker" are
+/// the same quantity. That makes the estimate a straight division against
+/// `MaximumSize` — no extra bookkeeping, using only what the marker already
+/// stores.
+#[derive(Debug, Clone)]
+pub struct MarkerLifetime {
+    /// `MaximumSize` recorded with the marker (ring-buffer capacity, bytes).
+    pub maximum_size: u64,
+    /// Journal bytes written since the marker was taken.
+    pub consumed: u64,
+    /// Capacity left before the marker's records roll off.
+    pub headroom: u64,
+    /// Seconds since the marker was taken.
+    pub elapsed_secs: f64,
+    /// Observed journal write rate, bytes/second.
+    pub rate_bytes_per_sec: f64,
+    /// Estimated seconds until the marker expires. `None` when the rate cannot
+    /// be observed yet (no elapsed time, or nothing written since the marker).
+    pub remaining_secs: Option<f64>,
+    /// True when the marker's records have already rolled off.
+    pub expired: bool,
+}
+
+/// Estimate how long a marker still has, given the journal's current `NextUsn`
+/// and the current wall clock.
+///
+/// Returns `None` for an mtime marker: a wall-clock instant does not expire.
+///
+/// The two inputs come from a live `FSCTL_QUERY_USN_JOURNAL`; keeping them as
+/// parameters (rather than querying inside) makes the arithmetic testable on any
+/// platform, which is the only part of the USN path that can be.
+pub fn estimate_lifetime(
+    marker: &ScanMarker,
+    next_usn_now: i64,
+    now_ns: i64,
+) -> Option<MarkerLifetime> {
+    let ScanMarker::Usn {
+        next_usn,
+        maximum_size,
+        recorded_ns,
+        ..
+    } = marker
+    else {
+        return None;
+    };
+
+    let consumed = next_usn_now.saturating_sub(*next_usn).max(0) as u64;
+    let headroom = maximum_size.saturating_sub(consumed);
+    let elapsed_secs = ((now_ns - recorded_ns).max(0) as f64) / 1e9;
+    let rate_bytes_per_sec = if elapsed_secs > 0.0 {
+        consumed as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+    let remaining_secs = (rate_bytes_per_sec > 0.0).then(|| headroom as f64 / rate_bytes_per_sec);
+
+    Some(MarkerLifetime {
+        maximum_size: *maximum_size,
+        consumed,
+        headroom,
+        elapsed_secs,
+        rate_bytes_per_sec,
+        remaining_secs,
+        expired: headroom == 0,
+    })
+}
+
+// ── Delta set ───────────────────────────────────────────────────────────────
+
+/// One file the delta source says changed since the marker.
+#[derive(Debug, Clone)]
+pub struct DeltaEntry {
+    /// Absolute path.
+    pub path: String,
+    /// Size at delta time, or 0 when the file is gone.
+    pub size: i64,
+    /// Modification time at delta time (unix ns), or 0 when the file is gone.
+    pub mtime_ns: i64,
+    /// False when the source positively knows the file was deleted (a USN
+    /// `FILE_DELETE` record). The mtime source can only see what still exists,
+    /// so deletions reach the answer through the merge's existence check
+    /// instead — see [`crate::fresh`].
+    pub exists: bool,
+}
+
+/// Why a delta query could not produce a usable set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescanReason {
+    /// `marker.next_usn < journal.first_usn`: the records rolled off the ring.
+    MarkerExpired,
+    /// The journal was recreated — its id no longer matches the marker, so the
+    /// USN numbers refer to a different number space entirely.
+    JournalIdMismatch,
+    /// The read returned `ERROR_JOURNAL_ENTRY_DELETED` (0x8007049D).
+    JournalEntryDeleted,
+    /// The journal could not be queried at all (disabled, not NTFS, or the
+    /// process lacks the rights to open the volume).
+    JournalUnavailable,
+    /// No marker was recorded, or the recorded one could not be parsed.
+    MarkerMissing,
+}
+
+impl RescanReason {
+    /// Stable one-line explanation used in CLI output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RescanReason::MarkerExpired => "USN marker rolled off the journal (marker < first USN)",
+            RescanReason::JournalIdMismatch => "USN journal was recreated (journal id mismatch)",
+            RescanReason::JournalEntryDeleted => {
+                "USN journal entries were deleted (ERROR_JOURNAL_ENTRY_DELETED)"
+            }
+            RescanReason::JournalUnavailable => "USN journal unavailable",
+            RescanReason::MarkerMissing => "no usable index marker",
+        }
+    }
+}
+
+/// What a delta query managed to determine. Three outcomes, not two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaStatus {
+    /// The set is complete: everything that changed since the marker is in it.
+    Complete,
+    /// The set hit the configured cap and collection stopped. The entries that
+    /// *are* present are still correct — but changes are missing, so the answer
+    /// must be labelled stale.
+    Truncated {
+        /// The cap that was hit.
+        limit: usize,
+    },
+    /// The delta could not be determined; only a full re-crawl restores
+    /// freshness. Independent of [`DeltaStatus::Truncated`] on purpose.
+    RescanRequired(RescanReason),
+}
+
+impl DeltaStatus {
+    /// Whether the answer built on this delta set may be missing changes.
+    pub fn is_stale(self) -> bool {
+        !matches!(self, DeltaStatus::Complete)
+    }
+}
+
+/// The result of one delta query.
+#[derive(Debug, Clone)]
+pub struct DeltaSet {
+    /// Files that changed since the marker.
+    pub entries: Vec<DeltaEntry>,
+    /// Completeness of `entries`.
+    pub status: DeltaStatus,
+    /// Which source produced it.
+    pub kind: DeltaSourceKind,
+    /// Files stat'ed (mtime source) or journal records read (USN source).
+    pub scanned: u64,
+    /// Candidates dropped by the exclusion set. `excluded / (excluded +
+    /// entries)` is the noise ratio issue #16 measured at 94%.
+    pub excluded: u64,
+    /// Wall-clock cost of the query in milliseconds — the number the freshness
+    /// claim lives or dies by.
+    pub elapsed_ms: f64,
+    /// The marker this set was taken against. A cached set whose marker no
+    /// longer matches the index has to be thrown away.
+    pub marker: ScanMarker,
+}
+
+impl DeltaSet {
+    /// An empty set carrying a failure status.
+    fn failed(kind: DeltaSourceKind, marker: &ScanMarker, reason: RescanReason, ms: f64) -> Self {
+        Self {
+            entries: Vec::new(),
+            status: DeltaStatus::RescanRequired(reason),
+            kind,
+            scanned: 0,
+            excluded: 0,
+            elapsed_ms: ms,
+            marker: marker.clone(),
+        }
+    }
+
+    /// Paths in the set, for O(1) membership tests during the merge.
+    pub fn path_set(&self) -> HashSet<&str> {
+        self.entries.iter().map(|e| e.path.as_str()).collect()
+    }
+}
+
+// ── The abstraction ─────────────────────────────────────────────────────────
+
+/// Which mechanism a [`DeltaSource`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaSourceKind {
+    /// Full `stat` walk of the root, filtered by mtime. Slow but universal;
+    /// this is the fallback every platform always has.
+    Mtime,
+    /// NTFS USN Journal range read (Windows).
+    Usn,
+    /// macOS FSEvents. Not implemented — needs a resident watcher (post-M2).
+    FsEvents,
+    /// Linux fanotify. Not implemented — needs a resident watcher (post-M2).
+    Fanotify,
+}
+
+impl DeltaSourceKind {
+    /// Stable label used in reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeltaSourceKind::Mtime => "mtime",
+            DeltaSourceKind::Usn => "usn",
+            DeltaSourceKind::FsEvents => "fsevents",
+            DeltaSourceKind::Fanotify => "fanotify",
+        }
+    }
+}
+
+/// Configuration shared by every delta source.
+#[derive(Debug, Clone)]
+pub struct DeltaConfig {
+    /// Canonical crawl root. Changes outside it are not our business.
+    pub root: PathBuf,
+    /// The crawl's exclusion set — the same one, by construction.
+    pub excludes: ExcludeSet,
+    /// Paths that must never enter a delta set (the database and its WAL/SHM
+    /// siblings, which SQLite rewrites on every scan).
+    pub skip_paths: Vec<PathBuf>,
+    /// Walker threads for the mtime source (0 = auto).
+    pub threads: usize,
+}
+
+impl DeltaConfig {
+    /// Config for `root` with the crawl's default exclusion set and no database
+    /// to skip.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            excludes: ExcludeSet::new(&[], false),
+            skip_paths: Vec::new(),
+            threads: 0,
+        }
+    }
+
+    /// True when `path` belongs to the indexed set: under the root, not under an
+    /// excluded directory, and not one of our own database files.
+    fn accepts(&self, path: &Path) -> bool {
+        path.starts_with(&self.root)
+            && self.excludes.matched_dir(path, &self.root).is_none()
+            && !self.skip_paths.iter().any(|p| walk::same_path(p, path))
+    }
+}
+
+/// A source of "what changed since the marker".
+///
+/// The trait is the seam that keeps the search pipeline from knowing whether it
+/// is talking to a USN Journal, a `stat` walk, or (later) a resident watcher.
+/// Implementations must be cheap to call repeatedly: an interactive UI asks on
+/// every keystroke, mediated by a [`DeltaCache`].
+pub trait DeltaSource: Send + Sync {
+    /// Which mechanism this is.
+    fn kind(&self) -> DeltaSourceKind;
+
+    /// Take a marker for *now* — what a crawl records so a later search can ask
+    /// this source for the range since.
+    fn current_marker(&self) -> Result<ScanMarker>;
+
+    /// Everything that changed since `marker`, capped at `limit` entries.
+    ///
+    /// Returning `Ok` with [`DeltaStatus::RescanRequired`] rather than `Err` is
+    /// deliberate: an expired marker is normal operation on Windows (issue #16),
+    /// and the caller has to *report* it, not abort on it. `Err` is reserved for
+    /// failures that say nothing about freshness.
+    fn changes_since(&self, marker: &ScanMarker, limit: usize) -> Result<DeltaSet>;
+}
+
+/// The best delta source available for this platform and configuration.
+///
+/// Windows prefers the USN Journal and falls back to the mtime walk when the
+/// journal cannot be opened (non-NTFS volume, no administrator rights); every
+/// other platform gets the mtime walk. The fallback is silent by design — it is
+/// slower, not wrong, and [`DeltaSet::kind`] reports which one ran.
+pub fn source_for(config: &DeltaConfig) -> Box<dyn DeltaSource> {
+    #[cfg(windows)]
+    {
+        if let Some(src) = crate::usn::UsnDeltaSource::for_config(config) {
+            return Box::new(src);
+        }
+    }
+    Box::new(MtimeDeltaSource::new(config.clone()))
+}
+
+// ── mtime fallback ──────────────────────────────────────────────────────────
+
+/// The universal fallback: walk the root and keep everything newer than the
+/// marker.
+///
+/// It is a full `stat` walk, so its cost scales with the corpus rather than with
+/// the number of changes — the price of needing no journal, no watcher and no
+/// privileges. On Unix the comparison also looks at the inode change time
+/// (`st_ctime`), which is what makes a plain rename visible: a rename leaves
+/// mtime untouched but always bumps ctime. Windows has no equivalent through
+/// `std::fs` (`created()` is a birth time), which is exactly the gap the USN
+/// source fills on that platform.
+pub struct MtimeDeltaSource {
+    config: DeltaConfig,
+}
+
+impl MtimeDeltaSource {
+    /// A source that walks `config.root`.
+    pub fn new(config: DeltaConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl DeltaSource for MtimeDeltaSource {
+    fn kind(&self) -> DeltaSourceKind {
+        DeltaSourceKind::Mtime
+    }
+
+    fn current_marker(&self) -> Result<ScanMarker> {
+        Ok(ScanMarker::Mtime {
+            started_ns: now_ns(),
+        })
+    }
+
+    fn changes_since(&self, marker: &ScanMarker, limit: usize) -> Result<DeltaSet> {
+        let since_ns = marker.wall_clock_ns();
+        let t0 = Instant::now();
+
+        let entries: Mutex<Vec<DeltaEntry>> = Mutex::new(Vec::new());
+        let scanned = AtomicU64::new(0);
+        let excluded = AtomicU64::new(0);
+        let found = AtomicU64::new(0);
+        let truncated = AtomicBool::new(false);
+
+        let threads = if self.config.threads == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        } else {
+            self.config.threads
+        };
+
+        let mut builder = WalkBuilder::new(&self.config.root);
+        builder
+            .threads(threads)
+            .hidden(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .follow_links(false);
+
+        builder.build_parallel().run(|| {
+            let (config, entries) = (&self.config, &entries);
+            let (scanned, excluded, found, truncated) = (&scanned, &excluded, &found, &truncated);
+
+            Box::new(move |entry| {
+                let Ok(entry) = entry else {
+                    return WalkState::Continue;
+                };
+                if !entry.file_type().is_some_and(|t| t.is_file()) {
+                    return WalkState::Continue;
+                }
+                if truncated.load(Ordering::Relaxed) {
+                    return WalkState::Quit;
+                }
+
+                scanned.fetch_add(1, Ordering::Relaxed);
+
+                if !config.accepts(entry.path()) {
+                    excluded.fetch_add(1, Ordering::Relaxed);
+                    // Skipping the whole directory is only safe for the exclude
+                    // rule; a database sibling is a single file.
+                    return match config.excludes.matched_dir(entry.path(), &config.root) {
+                        Some(_) => WalkState::Skip,
+                        None => WalkState::Continue,
+                    };
+                }
+
+                let Ok(meta) = entry.metadata() else {
+                    return WalkState::Continue;
+                };
+                if !changed_since(&meta, since_ns) {
+                    return WalkState::Continue;
+                }
+
+                // Claim a slot before pushing so the cap is honoured even with
+                // every walker thread racing for the last one.
+                if found.fetch_add(1, Ordering::Relaxed) >= limit as u64 {
+                    truncated.store(true, Ordering::Relaxed);
+                    return WalkState::Quit;
+                }
+
+                entries.lock().unwrap().push(DeltaEntry {
+                    path: entry.path().to_string_lossy().into_owned(),
+                    size: meta.len() as i64,
+                    mtime_ns: mtime_ns(&meta),
+                    exists: true,
+                });
+                WalkState::Continue
+            })
+        });
+
+        let mut entries = entries.into_inner().unwrap_or_else(|e| e.into_inner());
+        // Parallel collection order is nondeterministic; sort so the same tree
+        // produces the same delta set (and the same merged result order).
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let status = if truncated.load(Ordering::Relaxed) {
+            DeltaStatus::Truncated { limit }
+        } else {
+            DeltaStatus::Complete
+        };
+
+        Ok(DeltaSet {
+            entries,
+            status,
+            kind: DeltaSourceKind::Mtime,
+            scanned: scanned.load(Ordering::Relaxed),
+            excluded: excluded.load(Ordering::Relaxed),
+            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            marker: marker.clone(),
+        })
+    }
+}
+
+/// A source that reports "nothing changed" without looking.
+///
+/// Used when a marker is missing or unusable: the caller still gets a report it
+/// can render (with [`DeltaStatus::RescanRequired`]) instead of a special case.
+pub struct NullDeltaSource {
+    kind: DeltaSourceKind,
+    reason: RescanReason,
+}
+
+impl NullDeltaSource {
+    /// A source that always reports `reason`.
+    pub fn new(kind: DeltaSourceKind, reason: RescanReason) -> Self {
+        Self { kind, reason }
+    }
+}
+
+impl DeltaSource for NullDeltaSource {
+    fn kind(&self) -> DeltaSourceKind {
+        self.kind
+    }
+
+    fn current_marker(&self) -> Result<ScanMarker> {
+        Ok(ScanMarker::Mtime {
+            started_ns: now_ns(),
+        })
+    }
+
+    fn changes_since(&self, marker: &ScanMarker, _limit: usize) -> Result<DeltaSet> {
+        Ok(DeltaSet::failed(self.kind, marker, self.reason, 0.0))
+    }
+}
+
+// ── Cache ───────────────────────────────────────────────────────────────────
+
+/// Statistics of a [`DeltaCache`], for measurement.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeltaCacheStats {
+    /// Queries served from the cached set.
+    pub hits: u64,
+    /// Queries that had to run the source.
+    pub misses: u64,
+    /// Of `misses`, how many were caused by the index marker having moved
+    /// (i.e. a re-crawl happened).
+    pub marker_invalidations: u64,
+}
+
+/// A short-lived cache in front of a [`DeltaSource`].
+///
+/// ## Why this is the M2 design question
+///
+/// Incremental search fires a query per keystroke. With the mtime fallback each
+/// query is a full `stat` walk of the root, so "ask the source every time" turns
+/// a 7 ms cost into 7 ms × every character typed, and the freshness mechanism
+/// becomes the thing that makes the UI feel slow. Caching it is therefore not an
+/// optimisation, it is what makes the design usable interactively.
+///
+/// ## Invalidation rules
+///
+/// A cached set is reused only when **all** of these hold:
+///
+/// 1. **Age < `ttl`.** The whole point of the delta set is freshness, so the
+///    cache trades a bounded amount of it for latency. At the default 1 s, a
+///    file changed in another window is visible within a second while a burst of
+///    typing shares one query.
+/// 2. **The marker is unchanged.** A re-crawl moves the marker, which makes
+///    every cached delta entry meaningless (it is relative to the old marker).
+///    Counted separately in [`DeltaCacheStats`] because it is a correctness
+///    invalidation, not an expiry.
+///
+/// [`DeltaCache::invalidate`] drops the entry explicitly — a caller that just
+/// wrote a file should not wait out the TTL to see it.
+///
+/// Deliberately *not* cached across process runs: a persisted delta set would
+/// have to be re-validated against the filesystem anyway, which costs the same
+/// as recomputing it.
+pub struct DeltaCache {
+    ttl_ms: u64,
+    entry: Mutex<Option<CachedDelta>>,
+    stats: Mutex<DeltaCacheStats>,
+}
+
+struct CachedDelta {
+    taken_at: Instant,
+    set: Arc<DeltaSet>,
+}
+
+impl DeltaCache {
+    /// A cache with the default TTL ([`DEFAULT_DELTA_TTL_MS`]).
+    pub fn new() -> Self {
+        Self::with_ttl_ms(DEFAULT_DELTA_TTL_MS)
+    }
+
+    /// A cache with an explicit TTL. `0` disables reuse (every query runs the
+    /// source), which is what the CLI wants: one query per process.
+    pub fn with_ttl_ms(ttl_ms: u64) -> Self {
+        Self {
+            ttl_ms,
+            entry: Mutex::new(None),
+            stats: Mutex::new(DeltaCacheStats::default()),
+        }
+    }
+
+    /// Return the delta set for `marker`, running `source` only when the cached
+    /// one is missing, expired, or was taken against a different marker.
+    ///
+    /// The second element of the returned pair is `true` when the answer came
+    /// from the cache.
+    pub fn get(
+        &self,
+        source: &dyn DeltaSource,
+        marker: &ScanMarker,
+        limit: usize,
+    ) -> Result<(Arc<DeltaSet>, bool)> {
+        let mut slot = self.entry.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap();
+
+        if let Some(cached) = slot.as_ref() {
+            let fresh_enough = cached.taken_at.elapsed().as_millis() as u64 <= self.ttl_ms;
+            let same_marker = &cached.set.marker == marker;
+            if !same_marker {
+                stats.marker_invalidations += 1;
+            }
+            if fresh_enough && same_marker && self.ttl_ms > 0 {
+                stats.hits += 1;
+                return Ok((cached.set.clone(), true));
+            }
+        }
+
+        stats.misses += 1;
+        drop(stats);
+
+        let set = Arc::new(source.changes_since(marker, limit)?);
+        *slot = Some(CachedDelta {
+            taken_at: Instant::now(),
+            set: set.clone(),
+        });
+        Ok((set, false))
+    }
+
+    /// Drop the cached set. Use after performing a filesystem change yourself.
+    pub fn invalidate(&self) {
+        *self.entry.lock().unwrap() = None;
+    }
+
+    /// Hit / miss counters.
+    pub fn stats(&self) -> DeltaCacheStats {
+        *self.stats.lock().unwrap()
+    }
+
+    /// Configured TTL in milliseconds.
+    pub fn ttl_ms(&self) -> u64 {
+        self.ttl_ms
+    }
+}
+
+impl Default for DeltaCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── internal helpers ────────────────────────────────────────────────────────
+
+/// Current wall clock in unix nanoseconds.
+pub(crate) fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Modification time in unix ns (0 when unavailable), matching what the crawl
+/// stores in `files.mtime_ns`.
+fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether a file looks touched since `since_ns`.
+///
+/// On Unix the inode change time is consulted as well as mtime: `rename(2)`
+/// bumps ctime but not mtime, so a file moved into the tree after the crawl
+/// would otherwise be invisible to the fallback source.
+fn changed_since(meta: &std::fs::Metadata, since_ns: i64) -> bool {
+    if mtime_ns(meta) > since_ns {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ctime_ns = meta
+            .ctime()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(meta.ctime_nsec());
+        if ctime_ns > since_ns {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_round_trips_through_the_meta_encoding() {
+        let mtime = ScanMarker::Mtime {
+            started_ns: 1_737_000_000_000_000_000,
+        };
+        assert_eq!(ScanMarker::decode(&mtime.encode()), Some(mtime));
+
+        let usn = ScanMarker::Usn {
+            volume: "C:".into(),
+            journal_id: 0x01d9_abcd_ef01_2345,
+            next_usn: 123_456_789,
+            maximum_size: 32 * 1024 * 1024,
+            recorded_ns: 1_737_000_000_000_000_000,
+        };
+        assert_eq!(ScanMarker::decode(&usn.encode()), Some(usn));
+    }
+
+    #[test]
+    fn marker_decoding_rejects_garbage_instead_of_guessing() {
+        assert_eq!(ScanMarker::decode(""), None);
+        assert_eq!(ScanMarker::decode("mtime"), None);
+        assert_eq!(ScanMarker::decode("mtime|not-a-number"), None);
+        assert_eq!(ScanMarker::decode("fsevents|1"), None);
+        // A USN marker missing its trailing fields is not half-usable.
+        assert_eq!(ScanMarker::decode("usn|C:|1|2"), None);
+    }
+
+    #[test]
+    fn lifetime_estimate_divides_headroom_by_the_observed_rate() {
+        // 8 MiB consumed in 300 s against a 32 MiB journal: 24 MiB of headroom
+        // at ~27.9 KiB/s leaves roughly 900 s.
+        let marker = ScanMarker::Usn {
+            volume: "C:".into(),
+            journal_id: 7,
+            next_usn: 1_000_000,
+            maximum_size: 32 * 1024 * 1024,
+            recorded_ns: 0,
+        };
+        let now = 300i64 * 1_000_000_000;
+        let est = estimate_lifetime(&marker, 1_000_000 + 8 * 1024 * 1024, now).unwrap();
+
+        assert_eq!(est.consumed, 8 * 1024 * 1024);
+        assert_eq!(est.headroom, 24 * 1024 * 1024);
+        assert!(!est.expired);
+        let remaining = est.remaining_secs.unwrap();
+        assert!((remaining - 900.0).abs() < 1.0, "{remaining}");
+    }
+
+    #[test]
+    fn lifetime_estimate_reports_an_already_expired_marker() {
+        let marker = ScanMarker::Usn {
+            volume: "C:".into(),
+            journal_id: 7,
+            next_usn: 0,
+            maximum_size: 8 * 1024 * 1024,
+            recorded_ns: 0,
+        };
+        let est = estimate_lifetime(&marker, 64 * 1024 * 1024, 60 * 1_000_000_000).unwrap();
+        assert!(est.expired);
+        assert_eq!(est.headroom, 0);
+    }
+
+    #[test]
+    fn lifetime_estimate_is_meaningless_for_a_wall_clock_marker() {
+        let marker = ScanMarker::Mtime { started_ns: 0 };
+        assert!(estimate_lifetime(&marker, 1, 1).is_none());
+    }
+
+    #[test]
+    fn a_usn_marker_still_gives_the_mtime_source_a_threshold() {
+        let marker = ScanMarker::Usn {
+            volume: "C:".into(),
+            journal_id: 1,
+            next_usn: 5,
+            maximum_size: 1,
+            recorded_ns: 42,
+        };
+        assert_eq!(marker.wall_clock_ns(), 42);
+    }
+}

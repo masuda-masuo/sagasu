@@ -9,7 +9,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sagasu_core::fulltext::{self, FulltextConfig, FulltextSummary, SearchConfig, SearchOutcome, SkipReason};
+use sagasu_core::fulltext::{
+    self, FulltextConfig, FulltextSummary, SearchConfig, SearchOutcome, SkipReason,
+};
 use sagasu_core::store::Store;
 use sagasu_core::walk::{self, CrawlConfig};
 
@@ -223,7 +225,10 @@ fn english_matching_is_case_insensitive() {
 #[test]
 fn esm_and_tsx_extensions_are_indexed() {
     let (data, db, index) = tmp_dirs("esm_exts");
-    for (i, ext) in ["mjs", "cjs", "jsx", "tsx", "mts", "cts"].iter().enumerate() {
+    for (i, ext) in ["mjs", "cjs", "jsx", "tsx", "mts", "cts"]
+        .iter()
+        .enumerate()
+    {
         write_file(
             &data,
             &format!("mod{i}.{ext}"),
@@ -251,8 +256,16 @@ fn esm_and_tsx_extensions_are_indexed() {
 #[test]
 fn dot_directories_are_indexed() {
     let (data, db, index) = tmp_dirs("dot_dirs");
-    write_file(&data, ".github/workflows/ci.yml", "name: ワークフロー定義\n");
-    write_file(&data, ".opencode/notes.md", "エージェントのルールをここに書く\n");
+    write_file(
+        &data,
+        ".github/workflows/ci.yml",
+        "name: ワークフロー定義\n",
+    );
+    write_file(
+        &data,
+        ".opencode/notes.md",
+        "エージェントのルールをここに書く\n",
+    );
     write_file(&data, ".config/app.toml", "[section]\nkey = \"ルール\"\n");
     write_file(&data, "readme.md", "通常のファイル\n");
 
@@ -276,8 +289,16 @@ fn dot_directories_are_indexed() {
 fn build_artifacts_are_not_indexed() {
     let (data, db, index) = tmp_dirs("artifacts");
     write_file(&data, "src/main.rs", "// マーカー語 ホウレンソウ\n");
-    write_file(&data, "node_modules/pkg/index.js", "// マーカー語 ホウレンソウ\n");
-    write_file(&data, "target/debug/build.rs", "// マーカー語 ホウレンソウ\n");
+    write_file(
+        &data,
+        "node_modules/pkg/index.js",
+        "// マーカー語 ホウレンソウ\n",
+    );
+    write_file(
+        &data,
+        "target/debug/build.rs",
+        "// マーカー語 ホウレンソウ\n",
+    );
     write_file(&data, "__pycache__/mod.py", "# マーカー語 ホウレンソウ\n");
 
     let summary = index_all(&data, &db, &index);
@@ -297,8 +318,16 @@ fn build_artifacts_are_not_indexed() {
 fn extensionless_text_is_indexed_by_sniffing() {
     let (data, db, index) = tmp_dirs("sniff_text");
     write_file(&data, "Makefile", "all:\n\techo タラバガニ\n");
-    write_file(&data, "LICENSE", "Permission is hereby granted, タラバガニ\n");
-    write_file(&data, "notes.wat", "unknown extension, still text: タラバガニ\n");
+    write_file(
+        &data,
+        "LICENSE",
+        "Permission is hereby granted, タラバガニ\n",
+    );
+    write_file(
+        &data,
+        "notes.wat",
+        "unknown extension, still text: タラバガニ\n",
+    );
 
     let summary = index_all(&data, &db, &index);
     assert_eq!(summary.indexed, 3);
@@ -368,7 +397,10 @@ fn oversized_files_are_skipped_and_counted() {
         "{:?}",
         summary.skipped
     );
-    assert_eq!(hit_names(&search(&index, "小さい")), vec!["small.md".to_string()]);
+    assert_eq!(
+        hit_names(&search(&index, "小さい")),
+        vec!["small.md".to_string()]
+    );
 }
 
 // ── 10. Empty files are counted, not silently dropped ──────────────────────
@@ -591,7 +623,10 @@ fn extra_extensions_extend_the_allowlist() {
     config.extra_exts = vec!["obj".to_string()];
     let extended = fulltext::build(&config).unwrap();
     assert_eq!(extended.indexed, 1, "--ext must win over the denylist");
-    assert_eq!(hit_names(&search(&index, "コメント")), vec!["model.obj".to_string()]);
+    assert_eq!(
+        hit_names(&search(&index, "コメント")),
+        vec!["model.obj".to_string()]
+    );
 }
 
 // ── 19. Rebuilding refuses to erase an unrelated directory ─────────────────
@@ -757,6 +792,9 @@ fn summary_reports_text_and_index_sizes() {
     let summary = index_all(&data, &db, &index);
     assert_eq!(summary.indexed, 50);
     assert!(summary.text_bytes > 0, "extracted text should be counted");
-    assert!(summary.index_bytes > 0, "the index directory should have a size");
+    assert!(
+        summary.index_bytes > 0,
+        "the index directory should have a size"
+    );
     assert!(summary.elapsed_secs >= 0.0);
 }

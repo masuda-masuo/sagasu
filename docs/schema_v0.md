@@ -50,12 +50,40 @@ CREATE TABLE IF NOT EXISTS access_history (
 |-----|------------|---------|
 | `schema_version` | `sagasu index` | DDL version of this database. |
 | `root_path` | `sagasu index` | Canonical root of the last crawl. |
-| `scan_marker` | `sagasu index` | Unix ns at which the last crawl *started* (freshness marker, design.md §5). |
+| `scan_marker` | `sagasu index` | Unix ns at which the last crawl *started*. Human-facing "age of the index" for `sagasu status`. |
+| `delta_marker` | `sagasu index` | The point-in-time token the search-time delta merge replays against (design.md §5). See below. |
 | `scan_generation` | `sagasu index` | Monotonic crawl counter; `last_seen_scan` / `deleted_at` are stamped with it. |
 | `fulltext_dir` | `sagasu fulltext` | Canonical directory of the tantivy index built from this database. |
 | `fulltext_marker` | `sagasu fulltext` | Unix ns at which the full-text build started. |
 | `fulltext_docs` | `sagasu fulltext` | Number of documents written in that build. |
 | `fulltext_scan_generation` | `sagasu fulltext` | `scan_generation` the full-text index was built from. Less than `scan_generation` → the full-text index is behind the metadata index. |
+
+## `delta_marker` encoding
+
+One TEXT line, pipe-separated. `|` is used rather than `:` because a Windows
+volume specifier contains a colon.
+
+```
+mtime|<started_ns>
+usn|<volume>|<journal_id>|<next_usn>|<maximum_size>|<recorded_ns>
+```
+
+| Field | Meaning |
+|-------|---------|
+| `started_ns` | Unix ns at which the crawl started. An mtime marker never expires. |
+| `volume` | Volume the journal belongs to, e.g. `C:`. |
+| `journal_id` | `UsnJournalID`. **Required**: a recreated journal restarts the USN number space, so comparing `next_usn` alone would silently compare against unrelated records (issue #16). |
+| `next_usn` | `NextUsn` at marker time — where a delta read starts. |
+| `maximum_size` | Journal `MaximumSize` in bytes. A USN is a byte offset into the journal, so `NextUsn_now - next_usn` is the bytes consumed since the marker; against `maximum_size` and `recorded_ns` that gives a remaining-lifetime estimate (`delta::estimate_lifetime`). |
+| `recorded_ns` | Unix ns at which the marker was taken. Also the fallback threshold: an mtime scan can stand in for an unavailable USN journal by using this value. |
+
+An unparseable or absent value is **not** treated as "no changes". The search
+reports `RescanRequired(MarkerMissing)` and labels its answer stale — an index
+whose freshness cannot be established must never look fresh.
+
+A marker is written inside the crawl's transaction, alongside `root_path` and
+`scan_generation`, so a failed crawl leaves no marker claiming a scan that did
+not finish.
 
 ## Metadata ↔ full-text link
 

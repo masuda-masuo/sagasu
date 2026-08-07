@@ -12,3 +12,8 @@ blake3 = { workspace = true }
 tantivy = { workspace = true }
 lindera = { workspace = true }
 lindera-tantivy = { workspace = true }
+
+# USN Journal delta source (src/usn.rs). Windows-only: every other platform
+# takes the mtime fallback and must not pull this in.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
