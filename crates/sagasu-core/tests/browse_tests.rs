@@ -137,10 +137,36 @@ fn build_corpus(data: &Path) {
     for n in 0..8 {
         write(data, &format!("tooling/scripts/step-{n:03}.py"), "print(1)");
     }
+    // A deep, wide `path:` namespace over one big block of files. This is the
+    // shape that produced the /usr failure: inside `vendor/`, `path:dist` (and
+    // its four ancestors) land on 40 of the 41 files, so they are *not*
+    // universal, they sort first by count, and a drill-down that takes the first
+    // row keeps re-offering a step that removes one file.
+    //
+    // The two leaves under it split that block in half, so a genuinely balanced
+    // step does exist — the fixture has to contain the better answer, or a test
+    // that the recommendation is better proves nothing.
+    for n in 0..20 {
+        write(
+            data,
+            &format!("vendor/pkg/mod/lib/dist/a/unit-{n:03}.txt"),
+            "vendored",
+        );
+        write(
+            data,
+            &format!("vendor/pkg/mod/lib/dist/b/unit-{n:03}.md"),
+            "vendored",
+        );
+    }
+    write(data, "vendor/README.md", "the odd one out");
 }
 
-/// Follow the drill-down greedily — always the top value of the top axis —
-/// until the group is small enough to read, and report the path taken.
+/// Follow the drill-down the way the tool tells you to — always
+/// [`BrowseView::recommended`] — until the group is small enough to read.
+///
+/// Deliberately *not* "the first value of the first axis". That is what the CLI
+/// used to print, and on real data it is the largest bucket, i.e. the step that
+/// narrows least.
 fn walk_down(store: &Store, max_steps: usize, small_enough: i64) -> (Vec<String>, Vec<i64>) {
     let mut selection: Vec<Tag> = Vec::new();
     let mut sizes: Vec<i64> = Vec::new();
@@ -150,7 +176,7 @@ fn walk_down(store: &Store, max_steps: usize, small_enough: i64) -> (Vec<String>
         if v.matched <= small_enough {
             break;
         }
-        let Some(next) = v.axes.first().and_then(|a| a.values.first()) else {
+        let Some(next) = v.recommended.as_ref() else {
             break;
         };
         selection.push(next.tag.clone());
@@ -161,26 +187,74 @@ fn walk_down(store: &Store, max_steps: usize, small_enough: i64) -> (Vec<String>
 /// Everything a view says, as one string — the comparison a determinism test
 /// needs, since a reshuffle of two equal-scoring axes is exactly the kind of
 /// wobble a field-by-field assertion would miss.
+///
+/// **Every** public field of [`BrowseView`], including the derived ones and the
+/// preview. An earlier version quietly left out seven of them, which made the
+/// determinism tests weaker than they read. If a field is added to the view and
+/// this stops compiling, that is the point.
 fn render(v: &BrowseView) -> String {
+    let BrowseView {
+        selected,
+        matched,
+        corpus,
+        label,
+        label_vocabulary,
+        universal,
+        axes,
+        axes_total,
+        axes_refining,
+        recommended,
+        preview,
+        snapshot,
+    } = v;
+
     let mut out = String::new();
-    out.push_str(&format!("matched={} corpus={}\n", v.matched, v.corpus));
-    for term in &v.label {
+    out.push_str(&format!(
+        "selected={:?} matched={matched} corpus={corpus} vocabulary={label_vocabulary} \
+         axes_total={axes_total} axes_refining={axes_refining} built={} behind={}\n",
+        selected.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+        snapshot.built(),
+        snapshot.behind(),
+    ));
+    for term in label {
         out.push_str(&format!(
             "label {} {} {} {:.9}\n",
             term.tag, term.files, term.corpus_files, term.weight
         ));
     }
-    for u in &v.universal {
+    for u in universal {
         out.push_str(&format!("universal {u}\n"));
     }
-    for axis in &v.axes {
+    match recommended {
+        Some(n) => out.push_str(&format!(
+            "next {} {} {} {:.9} {:.9}\n",
+            n.namespace, n.tag, n.files, n.share, n.bits
+        )),
+        None => out.push_str("next (none)\n"),
+    }
+    for axis in axes {
         out.push_str(&format!(
-            "axis {} {:.9} {:.9} {} {}\n",
-            axis.namespace, axis.score, axis.coverage, axis.files, axis.distinct
+            "axis {} {:.9} {:.9} {} {} tail={}\n",
+            axis.namespace,
+            axis.score,
+            axis.coverage,
+            axis.files,
+            axis.distinct,
+            axis.tail_assignments,
         ));
         for value in &axis.values {
-            out.push_str(&format!("  value {} {}\n", value.tag, value.files));
+            out.push_str(&format!(
+                "  value {} {} {:.9}\n",
+                value.tag, value.files, value.share
+            ));
         }
+    }
+    // `file_id`, not the path: the ids come from the parallel crawl, so two
+    // independent indexings of the same tree can number the files differently.
+    // Within one database — which is what these tests re-crawl — they are stable,
+    // and that is exactly the claim worth pinning.
+    for row in preview {
+        out.push_str(&format!("preview {} {}\n", row.file_id, row.path));
     }
     out
 }
@@ -244,39 +318,139 @@ fn a_file_whose_directory_is_unknown_is_reached_in_four_steps() {
 }
 
 #[test]
-fn following_the_top_ranked_value_narrows_the_group_every_time() {
+fn every_recommended_step_removes_at_least_a_fifth_of_the_group() {
     let (d, db) = tmp_dirs("greedy");
     build_corpus(&d);
     crawl(&d, &db);
     tag(&db);
     let store = open(&db);
 
-    // Nothing about the corpus is assumed here — just that the ranking, left to
-    // drive itself, never proposes a step that fails to narrow. An axis whose
-    // top value covered the whole group would loop forever, which is the bug
-    // the `universal` exclusion exists to prevent.
+    // "It narrows" is too weak a bar, and the first version of this test passed
+    // while the CLI was recommending steps that removed four files out of
+    // 21,006 on real data. What a step has to do is *advance*.
+    const MIN_REDUCTION: f64 = 0.20;
+
     let (path, sizes) = walk_down(&store, 12, 3);
     assert!(!path.is_empty(), "the root offered nothing to drill into");
-    for pair in sizes.windows(2) {
+    for (i, pair) in sizes.windows(2).enumerate() {
+        let reduction = 1.0 - (pair[1] as f64 / pair[0] as f64);
         assert!(
-            pair[1] < pair[0],
-            "the greedy path {path:?} did not narrow: {sizes:?}"
+            reduction >= MIN_REDUCTION,
+            "step {} ({}) took {} to {} — only {:.1}% off, path {path:?}, sizes {sizes:?}",
+            i + 1,
+            path[i],
+            pair[0],
+            pair[1],
+            100.0 * reduction,
         );
     }
     // The descent has to *end*: either it reached a readable group, or it ran
-    // out of axes because every remaining tag is shared by the whole group. What
-    // it must never do is offer a step that changes nothing, which is what the
-    // strict-narrowing check above rules out and what would otherwise loop until
-    // `max_steps`.
+    // out of values because every remaining tag is shared by the whole group.
     let last = view(&store, &path.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     assert!(
-        last.matched <= 3 || last.axes.is_empty(),
-        "greedy descent neither narrowed nor ran out: {sizes:?} after {path:?}"
+        last.matched <= 3 || last.recommended.is_none(),
+        "descent neither narrowed nor ran out: {sizes:?} after {path:?}"
     );
     assert!(
         path.len() < 12,
         "the descent used every step it was allowed: {path:?}"
     );
+}
+
+#[test]
+fn the_recommendation_is_not_the_first_row_of_the_best_axis() {
+    let (d, db) = tmp_dirs("recommend");
+    build_corpus(&d);
+    crawl(&d, &db);
+    tag(&db);
+    let store = open(&db);
+
+    // `vendor/pkg/mod/lib/dist/` holds 40 of the 41 files under `vendor/`, so
+    // `path:dist` is not universal, sorts first by count, and is exactly the
+    // step the CLI used to hand out.
+    let v = view(&store, &["path:vendor"]);
+    let first_row = &v.axes[0].values[0];
+    let recommended = v.recommended.as_ref().expect("something is on offer");
+    assert!(
+        first_row.share > 0.9,
+        "this fixture is meant to lead with a near-universal value: {} at {:.3}",
+        first_row.tag,
+        first_row.share
+    );
+    assert_ne!(
+        recommended.tag, first_row.tag,
+        "the recommendation copied the largest bucket"
+    );
+    // The fixture holds a near-even split, and that is what has to come back.
+    assert!(
+        (recommended.share - 0.5).abs() < 0.1,
+        "the recommendation ({} at {:.3}) is nowhere near an even split",
+        recommended.tag,
+        recommended.share,
+    );
+    assert!(
+        recommended.bits > 0.99 && recommended.bits > first_row_bits(first_row.share),
+        "{} ({:.4} bits) should beat the first row {} ({:.4} bits)",
+        recommended.tag,
+        recommended.bits,
+        first_row.tag,
+        first_row_bits(first_row.share),
+    );
+    // …and taking it actually lands where it said it would.
+    let deeper = tagindex::count_files_with_tags(
+        &store,
+        &[Tag::parse("path:vendor").unwrap(), recommended.tag.clone()],
+    )
+    .unwrap();
+    assert_eq!(deeper, recommended.files);
+    assert!(
+        (deeper as f64) < 0.75 * v.matched as f64,
+        "taking the recommendation went from {} to {deeper}",
+        v.matched
+    );
+}
+
+fn first_row_bits(share: f64) -> f64 {
+    sagasu_core::browse::step_bits(share)
+}
+
+#[test]
+fn the_recommendation_is_only_ever_something_the_caller_was_shown() {
+    let (d, db) = tmp_dirs("onscreen");
+    build_corpus(&d);
+    crawl(&d, &db);
+    tag(&db);
+    let store = open(&db);
+
+    for (axes, values) in [(4, 8), (1, 2), (2, 1), (4, 0), (0, 8)] {
+        let v = browse::browse(
+            &store,
+            &BrowseQuery {
+                max_axes: axes,
+                max_values: values,
+                ..BrowseQuery::new(Vec::new())
+            },
+        )
+        .unwrap();
+        match &v.recommended {
+            Some(step) => {
+                let on_screen = v
+                    .axes
+                    .iter()
+                    .flat_map(|a| a.values.iter().map(|x| x.tag.clone()))
+                    .any(|t| t == step.tag);
+                assert!(
+                    on_screen,
+                    "--axes {axes} --values {values} recommended {} which is not on screen",
+                    step.tag
+                );
+            }
+            None => assert!(
+                v.axes.iter().all(|a| a.values.is_empty()),
+                "--axes {axes} --values {values} showed values but recommended nothing"
+            ),
+        }
+    }
 }
 
 // ── 2. The counts have to mean what they say ────────────────────────────────
