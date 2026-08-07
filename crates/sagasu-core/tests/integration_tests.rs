@@ -50,7 +50,12 @@ fn crawl(dir: &Path, db_dir: &Path) -> walk::CrawlSummary {
 }
 
 /// Run a crawl with extra excludes.
-fn crawl_exclude(dir: &Path, db_dir: &Path, exclude: Vec<String>, no_default: bool) -> walk::CrawlSummary {
+fn crawl_exclude(
+    dir: &Path,
+    db_dir: &Path,
+    exclude: Vec<String>,
+    no_default: bool,
+) -> walk::CrawlSummary {
     walk::crawl(CrawlConfig {
         root: dir.to_path_buf(),
         db_path: db_path(db_dir),
@@ -181,8 +186,9 @@ fn move_to_different_dir_keeps_file_id() {
         )
         .unwrap();
     assert_eq!(new_id, old_id, "file_id must survive move");
-    assert!(std::path::Path::new(&path)
-        .ends_with(std::path::Path::new("other").join("movable.txt")));
+    assert!(
+        std::path::Path::new(&path).ends_with(std::path::Path::new("other").join("movable.txt"))
+    );
 }
 
 // ── 4. Size+mtime fallback when fs_id is NULL ──────────────────────────────
@@ -272,7 +278,11 @@ fn delete_creates_tombstone_not_missing_row() {
     // Also verify there are no live rows.
     let live: i64 = store2
         .conn()
-        .query_row("SELECT COUNT(*) FROM files WHERE deleted_at IS NULL", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(live, 0);
 }
@@ -330,7 +340,10 @@ fn changed_file_keeps_id_and_resets_blake3() {
         )
         .unwrap();
     assert_eq!(id2, file_id, "file_id must not change");
-    assert!(blake3.is_none(), "blake3 must be reset to NULL after change");
+    assert!(
+        blake3.is_none(),
+        "blake3 must be reset to NULL after change"
+    );
     assert!(magic.is_none(), "magic must be reset to NULL after change");
 }
 
@@ -404,8 +417,7 @@ fn hash_skips_large_files() {
     crawl(&d, &db);
 
     // max_size = 1024 bytes → big.txt (2048) should be skipped.
-    let summary =
-        sagasu_core::walk::hash_backfill(&db_path(&db), 1024).unwrap();
+    let summary = sagasu_core::walk::hash_backfill(&db_path(&db), 1024).unwrap();
     assert_eq!(summary.hashed, 1, "small file should be hashed");
     assert_eq!(summary.skipped_too_large, 1, "big file should be skipped");
 
@@ -443,7 +455,10 @@ fn default_excludes_drop_node_modules() {
 
     let skips: HashMap<_, _> = summary.skipped;
     let nm_count = skips.get("node_modules").copied().unwrap_or(0);
-    assert_eq!(nm_count, 1, "node_modules file should be counted as skipped");
+    assert_eq!(
+        nm_count, 1,
+        "node_modules file should be counted as skipped"
+    );
 }
 
 // ── 10. Default excludes keep dot-dirs like .opencode ──────────────────────
@@ -469,12 +484,18 @@ fn cargo_registry_excluded_but_cargo_not() {
 
     let summary = crawl(&d, &db);
     // .cargo/config.toml should be indexed; .cargo/registry file should be skipped.
-    assert_eq!(summary.indexed, 1, "only .cargo/config.toml should be indexed");
+    assert_eq!(
+        summary.indexed, 1,
+        "only .cargo/config.toml should be indexed"
+    );
     assert_eq!(summary.scanned, 2);
 
     let skips: HashMap<_, _> = summary.skipped;
     let cg_count = skips.get(".cargo").copied().unwrap_or(0);
-    assert_eq!(cg_count, 1, ".cargo/registry file should be counted as skipped");
+    assert_eq!(
+        cg_count, 1,
+        ".cargo/registry file should be counted as skipped"
+    );
 }
 
 // ── 12. --exclude adds custom excludes ─────────────────────────────────────
@@ -488,7 +509,10 @@ fn custom_exclude_adds_to_defaults() {
     let summary = crawl_exclude(&d, &db, vec!["build".to_string()], false);
     assert_eq!(summary.indexed, 1, "only a.txt should be indexed");
     let skips: HashMap<_, _> = summary.skipped;
-    assert!(skips.contains_key("build"), "build should appear in skip reasons");
+    assert!(
+        skips.contains_key("build"),
+        "build should appear in skip reasons"
+    );
 }
 
 // ── 13. --no-default-excludes drops the built-in list ──────────────────────
@@ -500,7 +524,10 @@ fn no_default_excludes_indexes_node_modules() {
     write_file(&d, "src/main.rs", "rust");
 
     let summary = crawl_exclude(&d, &db, vec![], true);
-    assert_eq!(summary.indexed, 2, "both files should be indexed with --no-default-excludes");
+    assert_eq!(
+        summary.indexed, 2,
+        "both files should be indexed with --no-default-excludes"
+    );
     assert!(summary.skipped.is_empty());
 }
 
@@ -534,7 +561,10 @@ fn empty_crawl_returns_zero_indexed() {
     write_file(&d, "__pycache__/module.pyc", "pyc");
 
     let summary = crawl(&d, &db);
-    assert_eq!(summary.indexed, 0, "only excluded files → indexed should be 0");
+    assert_eq!(
+        summary.indexed, 0,
+        "only excluded files → indexed should be 0"
+    );
     // The CLI is responsible for non-zero exit; the core returns the summary.
     assert!(!summary.skipped.is_empty(), "should have skip reasons");
 }
@@ -608,8 +638,14 @@ fn index_never_opens_files() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert!(blake3.is_none(), "blake3 must be NULL after index (crawl never opens files)");
-    assert!(magic.is_none(), "magic must be NULL after index (crawl never opens files)");
+    assert!(
+        blake3.is_none(),
+        "blake3 must be NULL after index (crawl never opens files)"
+    );
+    assert!(
+        magic.is_none(),
+        "magic must be NULL after index (crawl never opens files)"
+    );
 }
 
 // ── 20. access_history table exists and record_access works ───────────────
@@ -887,7 +923,10 @@ fn db_inside_crawl_root_is_not_indexed() {
         .filter_map(|r| r.ok())
         .collect();
     assert_eq!(rows.len(), 1);
-    assert!(rows[0].ends_with("real.txt"), "only real.txt indexed: {rows:?}");
+    assert!(
+        rows[0].ends_with("real.txt"),
+        "only real.txt indexed: {rows:?}"
+    );
 
     // A second crawl must not see the db as 'changed' (no self-referential loop).
     let s2 = walk::crawl(CrawlConfig {
@@ -977,7 +1016,8 @@ fn meta_writes_are_transactional() {
     );
     let gen_after_commit = store.get_stats().unwrap().scan_generation;
     assert_eq!(
-        gen_after_commit, gen_after_rollback + 1,
+        gen_after_commit,
+        gen_after_rollback + 1,
         "committed generation bump must persist"
     );
 }

@@ -396,11 +396,14 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
         }
     }
 
-    writer.commit().context("failed to commit the full-text index")?;
+    writer
+        .commit()
+        .context("failed to commit the full-text index")?;
 
     let elapsed_secs = t0.elapsed().as_secs_f64();
     let index_bytes = dir_size(&config.index_dir);
-    let indexed = counters.by_ext.load(Ordering::Relaxed) + counters.by_sniff.load(Ordering::Relaxed);
+    let indexed =
+        counters.by_ext.load(Ordering::Relaxed) + counters.by_sniff.load(Ordering::Relaxed);
 
     // Record the link back to the metadata index so `sagasu status` can show
     // whether the full-text index has fallen behind the crawl.
@@ -573,6 +576,8 @@ pub struct SearchHit {
     pub current_path: Option<String>,
     /// True when SQLite says this `file_id` is a tombstone.
     pub deleted: bool,
+    /// Modification time recorded when the document was indexed (unix ns).
+    pub mtime_ns: i64,
     /// One-line excerpt of the body around the first matched term.
     pub snippet: String,
 }
@@ -588,6 +593,10 @@ impl SearchHit {
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
     pub hits: Vec<SearchHit>,
+    /// The query's analyzed terms, split by boolean polarity. The freshness
+    /// merge ([`crate::fresh`]) applies these to files the index has not seen
+    /// yet, so both sides of a merged result answer the same question.
+    pub terms: LiveTerms,
     /// Documents present in the index.
     pub total_docs: u64,
     /// Matching + ranking latency in milliseconds. This is the number that
@@ -645,7 +654,8 @@ pub fn search(config: &SearchConfig) -> Result<SearchOutcome> {
     let top = searcher.search(&query, &TopDocs::with_limit(config.limit.max(1)))?;
     let match_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    let terms = body_query_terms(&*query, fields.body);
+    let live_terms = split_query_terms(&*query, fields.body);
+    let terms = body_query_terms(&live_terms);
 
     let mut hits = Vec::with_capacity(top.len());
     for (score, addr) in top {
@@ -659,6 +669,10 @@ pub fn search(config: &SearchConfig) -> Result<SearchOutcome> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        let mtime_ns = doc
+            .get_first(fields.mtime_ns)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
 
         let snippet = doc
             .get_first(fields.body)
@@ -683,12 +697,14 @@ pub fn search(config: &SearchConfig) -> Result<SearchOutcome> {
             indexed_path,
             current_path,
             deleted,
+            mtime_ns,
             snippet,
         });
     }
 
     Ok(SearchOutcome {
         hits,
+        terms: live_terms,
         total_docs,
         match_ms,
         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -751,16 +767,131 @@ fn dir_size(dir: &Path) -> u64 {
 /// These are post-analysis terms: Lindera-segmented and lower-cased, exactly as
 /// they appear in the index, which is what makes them findable in the document
 /// text below.
-fn body_query_terms(query: &dyn tantivy::query::Query, field: Field) -> Vec<String> {
-    let mut terms: std::collections::BTreeSet<String> = Default::default();
-    query.query_terms(&mut |term, _| {
-        if term.field() == field {
-            if let Some(s) = term.value().as_str() {
-                terms.insert(s.to_string());
-            }
+pub(crate) fn body_query_terms(terms: &LiveTerms) -> Vec<String> {
+    let mut all: Vec<String> = terms
+        .required
+        .iter()
+        .chain(terms.optional.iter())
+        .cloned()
+        .collect();
+    all.sort();
+    all.dedup();
+    all
+}
+
+/// A parsed query reduced to analyzed terms and their boolean polarity.
+///
+/// This is what lets a file the index has never seen be judged by the *same*
+/// query as the index hits it will be merged with. The terms are post-analysis
+/// (Lindera-segmented, lower-cased), so they are exactly the strings tantivy
+/// matched on.
+///
+/// It is an approximation of the parsed query, and knowingly so: positions are
+/// dropped, which means a phrase query degrades to its terms, and proximity is
+/// not enforced. The alternative — building a throwaway in-RAM tantivy index
+/// over the delta set for exact semantics — costs a Lindera pass over every
+/// changed file on every query, i.e. roughly a hundred times the live grep, and
+/// the delta set is by design a rounding error of the corpus. The merged result
+/// labels which side each hit came from, so the approximation is visible rather
+/// than silent.
+#[derive(Debug, Clone, Default)]
+pub struct LiveTerms {
+    /// Terms every match must contain (`+term`, or all terms of an AND query).
+    pub required: Vec<String>,
+    /// Terms a match should contain at least one of (the default OR case).
+    pub optional: Vec<String>,
+    /// Terms a match must not contain (`-term`).
+    pub excluded: Vec<String>,
+}
+
+impl LiveTerms {
+    /// True when the query analyzed to nothing matchable (an empty or
+    /// stop-word-only query).
+    pub fn is_empty(&self) -> bool {
+        self.required.is_empty() && self.optional.is_empty()
+    }
+
+    /// Score `text` against these terms: total occurrences of the matching
+    /// terms, or `0` when the document does not match at all.
+    ///
+    /// Matching is substring-based over an ASCII-case-folded copy. Terms arrive
+    /// already lower-cased from the analyzer, and non-ASCII scripts (Japanese
+    /// included) have no case to fold — the same trade-off, for the same reason,
+    /// as [`build_snippet`].
+    pub fn score(&self, text: &str) -> u32 {
+        if self.is_empty() {
+            return 0;
         }
-    });
-    terms.into_iter().collect()
+        let hay = text.to_ascii_lowercase();
+        if self.excluded.iter().any(|t| hay.contains(t.as_str())) {
+            return 0;
+        }
+        let count = |t: &String| hay.matches(t.as_str()).count() as u32;
+
+        let required: u32 = self.required.iter().map(count).sum();
+        if !self.required.is_empty() && self.required.iter().any(|t| !hay.contains(t.as_str())) {
+            return 0;
+        }
+        let optional: u32 = self.optional.iter().map(count).sum();
+        if self.required.is_empty() && optional == 0 {
+            return 0;
+        }
+        required + optional
+    }
+}
+
+/// Split a parsed query into required / optional / excluded terms over `field`.
+///
+/// `BooleanQuery` is unwrapped explicitly so `MustNot` clauses land in
+/// `excluded` instead of being counted as things to look for; anything else
+/// (term, phrase, range, …) contributes through `query_terms`, inheriting the
+/// polarity of the clause it sits under.
+fn split_query_terms(query: &dyn tantivy::query::Query, field: Field) -> LiveTerms {
+    use std::collections::BTreeSet;
+    use tantivy::query::{BooleanQuery, Occur};
+
+    #[derive(Default)]
+    struct Buckets {
+        required: BTreeSet<String>,
+        optional: BTreeSet<String>,
+        excluded: BTreeSet<String>,
+    }
+
+    fn walk(q: &dyn tantivy::query::Query, field: Field, occur: Occur, out: &mut Buckets) {
+        if let Some(b) = q.downcast_ref::<BooleanQuery>() {
+            for (sub_occur, sub) in b.clauses() {
+                // A clause under a MustNot stays negated however it is nested.
+                let effective = match (occur, sub_occur) {
+                    (Occur::MustNot, _) => Occur::MustNot,
+                    (_, o) => *o,
+                };
+                walk(sub.as_ref(), field, effective, out);
+            }
+            return;
+        }
+        let bucket = match occur {
+            Occur::Must => &mut out.required,
+            Occur::Should => &mut out.optional,
+            Occur::MustNot => &mut out.excluded,
+        };
+        q.query_terms(&mut |term, _| {
+            if term.field() == field {
+                if let Some(s) = term.value().as_str() {
+                    bucket.insert(s.to_string());
+                }
+            }
+        });
+    }
+
+    let mut buckets = Buckets::default();
+    // A bare query with no boolean wrapper is a single mandatory clause.
+    walk(query, field, Occur::Must, &mut buckets);
+
+    LiveTerms {
+        required: buckets.required.into_iter().collect(),
+        optional: buckets.optional.into_iter().collect(),
+        excluded: buckets.excluded.into_iter().collect(),
+    }
 }
 
 /// Build the displayed snippet: a window of the body around the first query
@@ -772,7 +903,7 @@ fn body_query_terms(query: &dyn tantivy::query::Query, field: Field) -> Vec<Stri
 /// cost of the actual search. Locating the term by substring instead is an
 /// approximation (it can land inside a longer word), but a snippet is a display
 /// affordance, not a matching decision: the hit set is still decided by tantivy.
-fn build_snippet(body: &str, terms: &[String], max_chars: usize) -> String {
+pub(crate) fn build_snippet(body: &str, terms: &[String], max_chars: usize) -> String {
     let text = clean_whitespace(body);
     match find_first_term(&text, terms) {
         Some(at) => snippet_around(&text, at, max_chars),
@@ -893,7 +1024,10 @@ mod tests {
         let snippet = snippet_around(&text, at, 30);
 
         assert!(snippet.contains("目印"), "{snippet}");
-        assert!(snippet.starts_with('…') && snippet.ends_with('…'), "{snippet}");
+        assert!(
+            snippet.starts_with('…') && snippet.ends_with('…'),
+            "{snippet}"
+        );
         // 30 characters of body plus the two ellipses.
         assert_eq!(snippet.chars().count(), 32, "{snippet}");
     }

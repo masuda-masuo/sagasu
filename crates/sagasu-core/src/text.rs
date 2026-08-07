@@ -22,6 +22,11 @@
 /// the sniffing path (see module docs). It deliberately includes the ESM/TSX
 /// family (`mjs`, `cjs`, `jsx`, `tsx`, `mts`, `cts`) that a shorter list dropped
 /// silently in an earlier measurement.
+///
+/// `rustfmt::skip`: the entries are grouped by category behind comments, and
+/// rustfmt would put each of the ~180 extensions on its own line, destroying
+/// both the grouping and any chance of reviewing an addition at a glance.
+#[rustfmt::skip]
 pub const TEXT_EXTS: &[&str] = &[
     // プレーンテキスト・文書
     "txt", "text", "md", "markdown", "mdx", "rst", "adoc", "asciidoc", "org", "tex", "bib", "srt",
@@ -55,6 +60,9 @@ pub const TEXT_EXTS: &[&str] = &[
 /// (PDF / Office) and formats that have no text body at all (media, archives,
 /// binaries). Both are counted under [`crate::fulltext::SkipReason::UnsupportedExt`]
 /// so a user can see *why* a file is missing from the index.
+///
+/// Grouped and `rustfmt::skip`ped for the same reason as [`TEXT_EXTS`].
+#[rustfmt::skip]
 pub const BINARY_EXTS: &[&str] = &[
     // M1 スコープ外の文書形式(後続 issue で本文抽出を実装する)
     "pdf", "doc", "docx", "docm", "xls", "xlsx", "xlsm", "ppt", "pptx", "pptm", "odt", "ods",

@@ -81,6 +81,9 @@ pub struct IndexStats {
     pub root_path: Option<String>,
     pub schema_version: i64,
     pub scan_marker_ns: Option<i64>,
+    /// The delta marker of the last crawl (design.md §5). `None` when the index
+    /// predates the marker or the stored value is unparseable.
+    pub delta_marker: Option<crate::delta::ScanMarker>,
     pub scan_generation: i64,
     pub live_count: i64,
     pub tombstone_count: i64,
@@ -218,9 +221,7 @@ impl Store {
 
     /// Begin a transaction.
     pub fn begin_tx(&self) -> Result<Transaction<'_>> {
-        self.conn
-            .unchecked_transaction()
-            .map_err(Into::into)
+        self.conn.unchecked_transaction().map_err(Into::into)
     }
 
     /// Insert a new file row. Returns the auto-generated `file_id`.
@@ -293,12 +294,7 @@ impl Store {
     }
 
     /// Mark a file as deleted (tombstone).
-    pub fn mark_deleted(
-        &self,
-        tx: &Transaction,
-        file_id: i64,
-        scan_gen: i64,
-    ) -> Result<()> {
+    pub fn mark_deleted(&self, tx: &Transaction, file_id: i64, scan_gen: i64) -> Result<()> {
         tx.execute(
             "UPDATE files SET deleted_at=?1 WHERE file_id=?2 AND deleted_at IS NULL",
             params![scan_gen, file_id],
@@ -360,9 +356,7 @@ impl Store {
 
     /// Return all live file paths as (file_id, path). Used to detect deletions.
     pub fn get_live_paths(&self, tx: &Transaction) -> Result<Vec<(i64, String)>> {
-        let mut stmt = tx.prepare(
-            "SELECT file_id, path FROM files WHERE deleted_at IS NULL",
-        )?;
+        let mut stmt = tx.prepare("SELECT file_id, path FROM files WHERE deleted_at IS NULL")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .filter_map(|r| r.ok())
@@ -417,6 +411,51 @@ impl Store {
         Ok(rows)
     }
 
+    /// Live rows whose path contains `needle`, case-insensitively.
+    ///
+    /// This is the metadata half of the search surface: `sagasu find` answers
+    /// from here and the freshness merge overlays the delta set on top. Ordered
+    /// by `file_id` so the result is stable between runs.
+    ///
+    /// `%` and `_` in the needle are escaped — a user typing a literal `%` is
+    /// searching for a percent sign, not writing SQL.
+    pub fn find_paths_like(&self, needle: &str, limit: i64) -> Result<Vec<FileRow>> {
+        let pattern = format!("%{}%", escape_like(needle));
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, path, ext, size, mtime_ns, ctime_ns, magic, blake3, fs_id,
+                    last_seen_scan, deleted_at
+             FROM files
+             WHERE deleted_at IS NULL AND path LIKE ?1 ESCAPE '\\'
+             ORDER BY file_id
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![pattern, limit], row_to_file_row)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    // ── freshness marker (design.md §5) ─────────────────────────────────────
+
+    /// The delta marker recorded by the last crawl, if it can still be parsed.
+    ///
+    /// `None` means the index predates the marker (or the value is corrupt);
+    /// either way a search has no point in time to ask a delta source about and
+    /// has to report the whole index as of unknown freshness.
+    pub fn delta_marker(&self) -> Result<Option<crate::delta::ScanMarker>> {
+        Ok(self
+            .meta_get("delta_marker")?
+            .as_deref()
+            .and_then(crate::delta::ScanMarker::decode))
+    }
+
+    /// Record a delta marker (used by the crawl; exposed for tests and tools
+    /// that need to simulate an expired or foreign marker).
+    pub fn set_delta_marker(&self, marker: &crate::delta::ScanMarker) -> Result<()> {
+        self.meta_set("delta_marker", &marker.encode())
+    }
+
     // ── hash backfill ───────────────────────────────────────────────────────
 
     /// Return up to `limit` live files where `blake3` IS NULL and
@@ -468,9 +507,8 @@ impl Store {
             .meta_get("schema_version")?
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let scan_marker_ns: Option<i64> = self
-            .meta_get("scan_marker")?
-            .and_then(|s| s.parse().ok());
+        let scan_marker_ns: Option<i64> =
+            self.meta_get("scan_marker")?.and_then(|s| s.parse().ok());
         let scan_generation: i64 = self
             .meta_get("scan_generation")?
             .and_then(|s| s.parse().ok())
@@ -496,6 +534,7 @@ impl Store {
             root_path,
             schema_version,
             scan_marker_ns,
+            delta_marker: self.delta_marker()?,
             scan_generation,
             live_count,
             tombstone_count,
@@ -512,7 +551,8 @@ impl Store {
 
     /// Checkpoint WAL into the main database file.
     pub fn wal_checkpoint(&self) -> Result<()> {
-        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 }
@@ -558,6 +598,19 @@ pub fn fs_id_from_metadata(meta: &std::fs::Metadata) -> Option<Vec<u8>> {
 }
 
 // ── internal helpers ────────────────────────────────────────────────────────
+
+/// Escape the LIKE wildcards `%` and `_` (and the escape character itself) so a
+/// user-typed needle is matched literally.
+fn escape_like(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len());
+    for c in needle.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
 
 fn row_to_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
     Ok(FileRow {

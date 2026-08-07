@@ -12,6 +12,13 @@ blake3 = "1"
 tantivy = "0.25"
 lindera = "4"
 lindera-tantivy = { version = "4.0", features = ["embed-ipadic"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
 
 [profile.release]
 lto = "thin"
