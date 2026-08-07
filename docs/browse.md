@@ -322,7 +322,19 @@ CLI 全体の機械可読出力は issue #6 の論点なので、答えを出す
 
 計測日 2026-08-07、Linux / ext4、release ビルド。
 `--no-fresh -n 0` はデータベースの作業と軸の提示だけを見るため。
-以下のログは**行を落としていない**。落とす場合は必ず `…` を置く。
+
+**転記の規律**: §7-1 の各ブロックは、先頭の鮮度ブロック
+(`tags :` / `snapshot:` / `delta :` とその後の空行)**だけ**を全ブロックから
+落としている。全ステップで同一の 3 行で、内容は §5 で扱っているため。
+それ以外は 1 行も落としていない。§7-2 は抜粋で、落とした箇所には `…` を置く。
+
+参考までに、落としている 3 行は全ブロックでこれである:
+
+```
+tags    : 555664 rows over 63901 files, 4424 distinct, built at scan generation 1
+snapshot: tags describe the corpus as of that scan. Files created or renamed since carry no tags and are not merged in here the way `sagasu find` merges them (issue #5); files deleted since are dropped from a listing by an existence check, and reported.
+delta   : (not probed — --no-fresh)
+```
 
 ```
 $ sagasu index /usr --db usr.db      # 63,901 files, 3.4s
@@ -400,6 +412,7 @@ axes    : 4 of 8 shown, ranked by expected bits over the top 8 value(s)
 files   : (not listed — pass -n/--files N)
 
 next    : sagasu browse --db usr.db --files 0 --no-fresh kind:code
+          (1.00 bits — the step whose outcome is least predictable, leaving 33390 of 63901 file(s))
 ```
 
 `next :` は「画像を探している」という**こちらの事前知識を知らない**ので、
@@ -518,12 +531,35 @@ next    : sagasu browse --db usr.db --files 0 --no-fresh kind:image format:png p
 ```
 
 ```
-$ sagasu browse --db usr.db --no-fresh kind:image format:png path:testdata path:zip
+$ sagasu browse --db usr.db --no-fresh kind:image format:png path:testdata path:zip   # ④ 2 件
+
+select  : kind:image AND format:png AND path:testdata AND path:zip
 matched : 2 of 63901 live files (<1%)
+          (an indexed count — an upper bound; only the previewed rows below are checked against the filesystem)
+label   : path:archive (2/2)  ext:png (2/2)  path:src (2/2)  path:go1 (2/2)  path:local (2/2)
+          (c-TF-IDF over 7 candidate tag(s): share of this group × ln(1 + live files / files carrying the tag))
+shared  : all 2 file(s) in this group carry ext:png, path:archive, path:go1, path:local, path:src — none of these narrows it
+axes    : 1 of 1 shown, ranked by expected bits over the top 8 value(s)
+          (3 further namespace(s) are present in this group but cannot narrow it — every file shares the same value, or the only values left are the ones already selected)
+
+  path    : 1.00 bits, 2 value(s), covers 100% of the group
+            1  path:go1.24.7                    (50% of the group)
+            1  path:go1.25.1                    (50% of the group)
+
 files   : 2 of 2 shown
    10874  /usr/local/go1.25.1/src/archive/zip/testdata/gophercolor16x16.png
    12184  /usr/local/go1.24.7/src/archive/zip/testdata/gophercolor16x16.png
+
+next    : sagasu browse --db usr.db --no-fresh kind:image format:png path:testdata path:zip path:go1.24.7
+          (1.00 bits — the step whose outcome is least predictable, leaving 1 of 2 file(s))
 ```
+
+**左端の `file_id`(`10874` / `12184`)はこのデータベース固有の値**で、
+再現しようとしても一致しない。`file_id` は並列クロールが採番するため、
+同じ `/usr` をもう一度索引すれば別の番号が付く(実測: 同一ツリーの 2 本目の
+索引では `30938` / `55720`)。**パスの方が答え**であり、番号はページの識別子に
+すぎない — §3 の「プレビュー行の並びだけは別の話」を参照。
+「正しい値」に更新するのではなくこの注記を置いたのは、正しい値が存在しないため。
 
 **63,901 → 6,203 → 449 → 110 → 2 の 4 ステップ。**
 `shared :` が「この 110 件はすべて `path:go1/local/src` の下」= Go のソースツリーだと
