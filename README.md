@@ -6,7 +6,35 @@
 
 ## 状態
 
-設計段階。[docs/design.md](docs/design.md) が現時点の設計ドラフト。実装は未着手。
+PoC 段階。M0〜M3 は実装済み(並列クロール + SQLite メタデータ索引 / tantivy + Lindera 全文索引 / 検索時差分マージ / ルールタグ + ファセットドリルダウン)。M4 の Tauri UI は未着手。[docs/design.md](docs/design.md) が設計の正本。
+
+## 使い方
+
+ワークスペースは `crates/sagasu-core`(ロジック)と `crates/sagasu-cli`(バイナリ `sagasu`)の2クレート。
+
+```sh
+cargo build --workspace --release
+```
+
+サブコマンド:
+
+| コマンド | 内容 |
+|---|---|
+| `index` | ディレクトリ木を並列クロールしてメタデータ索引(SQLite)を作る/更新する |
+| `hash` | まだハッシュのないファイルに BLAKE3 のコンテンツハッシュを埋める |
+| `fulltext` | 索引済みファイルから本文を抽出して全文索引を作る |
+| `search` | 全文索引をキーワード検索する(スコア順、パス + スニペット) |
+| `find` | メタデータ索引をパスの部分一致で引く |
+| `tag` | メタデータ索引の上にルールベースの意味タグ層を生成する |
+| `tags` | タグを一覧する / タグでファイルを絞る / 1ファイルのタグを説明する |
+| `browse` | ファセット階層をドリルダウンする(次に何で絞るか) |
+| `status` | 索引の統計を出す |
+
+パイプラインは `index` → (`hash`) → `fulltext` → `search`、タグ層は `index` → `tag` → `tags` / `browse`。`search` と `find` は既定で鮮度マージが効く(`--no-fresh` で無効)。
+
+## prototypes/
+
+技術リスクの高い要素を個別に潰すための使い捨て検証群で、検証は完了済み。正本の実装は `crates/` 側にあり、prototypes/ はルートの workspace から exclude された独立した Cargo ワークスペース。
 
 ## コンセプト(要約)
 
