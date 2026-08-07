@@ -449,7 +449,8 @@ fn the_live_grep_uses_the_same_extension_policy_as_the_index_build() {
     write_file(&d, "custom.obj", "索引を含む拡張子のファイル。\n");
     crawl(&d, &db);
 
-    // The index was told to accept `.obj` (which is on the built-in binary denylist)...
+    // The index was told to accept `.obj`, which is on the built-in binary
+    // denylist. That instruction is recorded in the index (issue #15).
     let mut build = FulltextConfig::new(db_path(&db), &ft);
     build.heap_bytes = 16 * 1024 * 1024;
     build.threads = 2;
@@ -459,18 +460,57 @@ fn the_live_grep_uses_the_same_extension_policy_as_the_index_build() {
 
     write_file(&d, "custom.obj", "書き換えたが索引という語は残す。\n");
 
-    // ...so a search that does not know about `.obj` drops the changed index hit
-    // and has nothing to put in its place.
-    let unaware = fresh::search(&search_config(&db, &ft, "索引"), None).unwrap();
-    assert!(unaware.hits.is_empty(), "{:?}", names(&unaware));
-    assert_eq!(unaware.dropped_changed, 1);
+    // A search told nothing inherits it, and the live side refreshes the file.
+    //
+    // This is the whole point of recording the policy. Before it was recorded,
+    // a search that had not been handed `--ext obj` judged the changed file as
+    // binary, dropped the index hit as stale and put nothing in its place — so
+    // editing a file **removed it from the answer**. The earlier version of
+    // this test asserted that disappearance as if it were the specification.
+    let inherited = fresh::search(&search_config(&db, &ft, "索引"), None).unwrap();
+    // Asserted before the hits: these hold whatever the query matches, so a
+    // tokenizer that cannot analyze the query (the offline-dictionary case)
+    // fails below on the hit list rather than hiding which half broke.
+    assert_eq!(inherited.text_policy.text_exts(), ["obj"]);
+    assert!(
+        inherited.text_policy_notice.is_none(),
+        "inheriting the index's own rule is not something to warn about"
+    );
+    assert_eq!(
+        inherited.live_read, 1,
+        "the live grep must judge `.obj` as text and read its body"
+    );
+    assert_eq!(names(&inherited), vec!["custom.obj".to_string()]);
+    assert_eq!(inherited.hits[0].origin, HitOrigin::Live);
+    assert_eq!(inherited.dropped_changed, 1, "replaced, not merely dropped");
 
-    // Told the same thing the build was told, the live side refreshes it.
-    let mut aware = search_config(&db, &ft, "索引");
-    aware.text_policy.add_text_exts(&["obj".to_string()]);
-    let aware = fresh::search(&aware, None).unwrap();
-    assert_eq!(names(&aware), vec!["custom.obj".to_string()]);
-    assert_eq!(aware.hits[0].origin, HitOrigin::Live);
+    // Saying the same thing again changes nothing and warns about nothing.
+    let mut same = search_config(&db, &ft, "索引");
+    same.text_policy.add_text_exts(&["obj".to_string()]);
+    let same = fresh::search(&same, None).unwrap();
+    assert_eq!(names(&same), vec!["custom.obj".to_string()]);
+    assert!(same.text_policy_notice.is_none());
+
+    // An explicit *disagreeing* policy still wins — `--ext` has to stay an
+    // escape hatch for an index that is already built. `resolve_text_policy`
+    // treats any non-empty policy as explicit, so putting `.obj` on the
+    // denylist is how a caller says "not for this search". The file then
+    // behaves the way it did before the policy was recorded: dropped as
+    // changed, with nothing to replace it. The difference is that this is now
+    // something the caller asked for, and it is reported.
+    let mut overridden = search_config(&db, &ft, "索引");
+    overridden.text_policy.add_binary_exts(&["obj".to_string()]);
+    let overridden = fresh::search(&overridden, None).unwrap();
+    assert!(overridden.hits.is_empty(), "{:?}", names(&overridden));
+    assert_eq!(overridden.dropped_changed, 1);
+    assert!(
+        overridden
+            .text_policy_notice
+            .as_deref()
+            .is_some_and(|n| n.contains("obj")),
+        "a live scan judging files differently from the build must say so: {:?}",
+        overridden.text_policy_notice
+    );
 }
 
 // ── 3. Threshold: truncation is reported, not hidden ────────────────────────
