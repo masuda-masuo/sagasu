@@ -55,8 +55,13 @@ use serde::Deserialize;
 
 use crate::tags::Tag;
 
-/// Filename looked for when no `--rules` is given.
-pub const DEFAULT_RULES_FILE: &str = "sagasu-tags.toml";
+/// The file rules used to be read from, before the two config files were merged
+/// into one (issue #6, docs/cli.md §5).
+///
+/// Kept as a constant because it is still *looked for*: a `sagasu-tags.toml`
+/// left in the working directory is no longer read, and saying so is the whole
+/// point — see [`crate::config::check_no_legacy_config`].
+pub const LEGACY_RULES_FILE: &str = "sagasu-tags.toml";
 
 // ── On-disk shape ───────────────────────────────────────────────────────────
 
@@ -67,18 +72,23 @@ struct RuleFile {
     rule: Vec<RawRule>,
 }
 
+/// One `[[tags.rule]]` table as written on disk.
+///
+/// `pub(crate)` so [`crate::config`] can deserialize the same shape out of the
+/// unified `sagasu.toml` rather than describing the rule format a second time
+/// (two descriptions of one format is how they drift apart).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawRule {
+pub(crate) struct RawRule {
     #[serde(default)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     #[serde(default)]
-    path: Option<String>,
+    pub(crate) path: Option<String>,
     #[serde(default)]
-    file: Option<String>,
+    pub(crate) file: Option<String>,
     #[serde(default)]
-    ext: Vec<String>,
-    tags: Vec<String>,
+    pub(crate) ext: Vec<String>,
+    pub(crate) tags: Vec<String>,
 }
 
 // ── Compiled form ───────────────────────────────────────────────────────────
@@ -179,11 +189,27 @@ impl RuleSet {
     }
 
     /// Compile rules from TOML text (the testable half of [`RuleSet::load`]).
+    ///
+    /// The bare `[[rule]]` shape, which is what [`RuleSet::load`] reads. The
+    /// unified `sagasu.toml` nests the same tables under `[[tags.rule]]` and
+    /// goes through [`crate::config`] instead.
     pub fn parse(text: &str) -> Result<Self> {
         let file: RuleFile = toml::from_str(text)?;
-        let mut rules = Vec::with_capacity(file.rule.len());
+        Self::from_raw(file.rule)
+    }
 
-        for (i, raw) in file.rule.into_iter().enumerate() {
+    /// Record which file this rule set came from, and the digest of its bytes.
+    pub(crate) fn with_origin(mut self, source: PathBuf, digest: String) -> Self {
+        self.source = Some(source);
+        self.digest = Some(digest);
+        self
+    }
+
+    /// Compile already-deserialized rule tables.
+    pub(crate) fn from_raw(raw_rules: Vec<RawRule>) -> Result<Self> {
+        let mut rules = Vec::with_capacity(raw_rules.len());
+
+        for (i, raw) in raw_rules.into_iter().enumerate() {
             let name = raw
                 .name
                 .clone()

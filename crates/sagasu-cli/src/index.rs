@@ -14,12 +14,14 @@ use std::process;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use sagasu_core::config::Config;
 use sagasu_core::fulltext::{self, FulltextConfig};
-use sagasu_core::text::{TextPolicy, DEFAULT_TEXT_CONFIG_FILE};
+use sagasu_core::text::TextPolicy;
 use sagasu_core::walk::{ExcludeSet, HiddenPolicy};
 use sagasu_core::CrawlConfig;
 
-use crate::output::mib;
+use crate::json;
+use crate::output::{mib, Output, Report};
 use crate::DEFAULT_INDEX_DIR;
 
 /// How many entries of the skipped-extension breakdown to print.
@@ -60,7 +62,8 @@ pub struct IndexArgs {
     threads: usize,
 }
 
-pub fn cmd_index(args: IndexArgs) -> Result<()> {
+pub fn cmd_index(args: IndexArgs, mode: Output) -> Result<()> {
+    let mut report = Report::new(mode);
     let root = args
         .root
         .canonicalize()
@@ -72,12 +75,11 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
     // placing the database outside the tree is the supported configuration.
     let db_canon = sagasu_core::walk::canonical_db_path(&args.db);
     if db_canon.starts_with(&root) {
-        eprintln!(
-            "WARNING: database {:?} is inside the crawl root {:?}; the database \
+        report.warn(format!(
+            "database {db_canon:?} is inside the crawl root {root:?}; the database \
              file will be excluded from the index, but placing it outside the \
-             crawl tree is recommended.",
-            db_canon, root
-        );
+             crawl tree is recommended."
+        ));
     }
 
     let hidden = if args.skip_hidden {
@@ -99,11 +101,52 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
     // What the crawl is about to consider out of scope, before it says how much
     // that came to. A count of exclusions without the rule that produced them
     // cannot be argued with; the rule without the count cannot be believed.
-    print_scope(&config, &root)?;
+    //
+    // Built once and used by both renderings. The human one prints it *before*
+    // the walk so a wrong root can be interrupted; the machine one carries it
+    // in the single object at the end, where the ordering buys nothing.
+    let excludes = scope(&config, &root)?;
+    if !report.is_json() {
+        print_scope(&root, &excludes);
+    }
 
     let summary = sagasu_core::walk::crawl(config)?;
 
-    // Print summary.
+    if !report.is_json() {
+        print_crawl_summary(&summary);
+    }
+
+    if summary.errors > 0 {
+        report.warn(format!(
+            "{} entr(ies) could not be read and are missing from the index \
+             along with anything below them. They are not excluded — they were \
+             unreachable — so re-running after fixing permissions will change the \
+             file count.",
+            summary.errors
+        ));
+    }
+
+    // Zero files indexed = warning + non-zero exit.
+    if summary.indexed == 0 {
+        report.warn(
+            "zero files indexed. Check that the root directory is \
+             correct and not entirely excluded.",
+        );
+    }
+
+    if report.is_json() {
+        json::index(&root.display().to_string(), &excludes, &summary, &report);
+    }
+
+    if summary.indexed == 0 {
+        process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// The human rendering of what the crawl did.
+fn print_crawl_summary(summary: &sagasu_core::CrawlSummary) {
     println!("scanned      : {}", summary.scanned);
     println!("indexed      : {}", summary.indexed);
     println!("  added      : {}", summary.added);
@@ -145,41 +188,24 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
     }
 
     println!("elapsed      : {:.3}s", summary.elapsed_secs);
-
-    if summary.errors > 0 {
-        eprintln!(
-            "WARNING: {} entr(ies) could not be read and are missing from the index \
-             along with anything below them. They are not excluded — they were \
-             unreachable — so re-running after fixing permissions will change the \
-             file count.",
-            summary.errors
-        );
-    }
-
-    // Zero files indexed = warning + non-zero exit.
-    if summary.indexed == 0 {
-        eprintln!(
-            "WARNING: zero files indexed. Check that the root directory is \
-             correct and not entirely excluded."
-        );
-        process::exit(1);
-    }
-
-    Ok(())
 }
 
-/// Print the exclusion policy the crawl is about to run under.
+/// Assemble the exclusion policy the crawl is about to run under.
 ///
 /// Rebuilding the [`ExcludeSet`] here rather than having `crawl` hand one back
-/// costs a `.gitignore` read; the alternative is printing the *arguments* and
+/// costs a `.gitignore` read; the alternative is reporting the *arguments* and
 /// hoping they describe the same thing the core assembled. It also surfaces a
 /// broken `.gitignore` before the walk instead of after it.
-fn print_scope(config: &CrawlConfig, root: &Path) -> Result<()> {
+fn scope(config: &CrawlConfig, root: &Path) -> Result<ExcludeSet> {
     let excludes = ExcludeSet::new(&config.exclude, config.no_default_excludes)
         .with_hidden(config.hidden)
         .with_gitignore(root, config.use_gitignore)?;
     excludes.validate()?;
+    Ok(excludes)
+}
 
+/// Print the exclusion policy the crawl is about to run under.
+fn print_scope(root: &Path, excludes: &ExcludeSet) {
     println!("root         : {}", root.display());
     if excludes.names().is_empty() {
         println!("excluded dirs: (none)");
@@ -219,7 +245,6 @@ fn print_scope(config: &CrawlConfig, root: &Path) -> Result<()> {
             "not applied".to_string()
         }
     );
-    Ok(())
 }
 
 // ── hash ────────────────────────────────────────────────────────────────────
@@ -235,12 +260,17 @@ pub struct HashArgs {
     max_size: u64,
 }
 
-pub fn cmd_hash(args: HashArgs) -> Result<()> {
+pub fn cmd_hash(args: HashArgs, mode: Output) -> Result<()> {
+    let report = Report::new(mode);
     let summary = sagasu_core::walk::hash_backfill(&args.db, args.max_size)?;
 
-    println!("hashed             : {}", summary.hashed);
-    println!("skipped (too large): {}", summary.skipped_too_large);
-    println!("skipped (unreadable): {}", summary.skipped_unreadable);
+    if report.is_json() {
+        json::hash(&summary, &report);
+    } else {
+        println!("hashed             : {}", summary.hashed);
+        println!("skipped (too large): {}", summary.skipped_too_large);
+        println!("skipped (unreadable): {}", summary.skipped_unreadable);
+    }
 
     Ok(())
 }
@@ -265,9 +295,14 @@ pub struct FulltextArgs {
     #[arg(long = "ext")]
     ext: Vec<String>,
 
-    /// Text config file extending the extension lists (default:
-    /// ./sagasu-text.toml when present).
-    #[arg(long = "text-config")]
+    /// Config file whose `[text]` section extends the extension lists
+    /// (default: ./sagasu.toml when present). See docs/cli.md §5.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Removed in issue #6: the two config files were merged into `sagasu.toml`
+    /// and this flag became `--config`.
+    #[arg(long = "text-config", hide = true)]
     text_config: Option<PathBuf>,
 
     /// Only trust the extension allowlist; do not sniff unknown formats.
@@ -283,25 +318,40 @@ pub struct FulltextArgs {
     heap_mb: u64,
 }
 
-/// Assemble the extension policy from the config file and the `--ext` flags.
+/// Refuse a flag that issue #6 removed, by name, with the replacement.
 ///
-/// The command line is applied last so it wins over the file. `explicit` is an
-/// error when missing (the user named it); the default file is only used when
-/// it exists, because "no config" is the normal case, not a mistake.
-pub(crate) fn load_text_policy(explicit: Option<&Path>, exts: &[String]) -> Result<TextPolicy> {
-    let mut policy = match explicit {
-        Some(path) => TextPolicy::load(path)?,
-        None if Path::new(DEFAULT_TEXT_CONFIG_FILE).is_file() => {
-            TextPolicy::load(DEFAULT_TEXT_CONFIG_FILE)?
-        }
-        None => TextPolicy::empty(),
-    };
-    policy.add_text_exts(exts);
-    Ok(policy)
+/// clap's own "unexpected argument" would be technically correct and useless:
+/// the user's next question is "then how do I point at my rules", and the
+/// answer is one word. Declared hidden so it does not clutter `--help` with a
+/// flag nobody should learn.
+pub(crate) fn reject_removed_config_flag(old: &str, value: Option<&Path>) -> Result<()> {
+    if value.is_some() {
+        anyhow::bail!(
+            "{old} was removed in issue #6: the two config files were merged into a \
+             single sagasu.toml, so there is one flag for it — `--config <FILE>` \
+             (docs/cli.md §5)."
+        );
+    }
+    Ok(())
 }
 
-pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
-    let text_policy = load_text_policy(args.text_config.as_deref(), &args.ext)?;
+/// Resolve the config file, then apply the `--ext` flags on top.
+///
+/// The command line is applied last so it wins over the file: an already-built
+/// index is the thing `--ext` is an escape hatch from, and a config file cannot
+/// be edited from inside a pipeline.
+pub(crate) fn load_config(explicit: Option<&Path>, exts: &[String]) -> Result<Config> {
+    let mut config = Config::resolve(explicit)?;
+    config.add_text_exts(exts);
+    Ok(config)
+}
+
+pub fn cmd_fulltext(args: FulltextArgs, mode: Output) -> Result<()> {
+    let mut report = Report::new(mode);
+    reject_removed_config_flag("--text-config", args.text_config.as_deref())?;
+    let loaded = load_config(args.config.as_deref(), &args.ext)?;
+    let origin = loaded.origin().clone();
+    let text_policy = loaded.into_text_policy();
 
     let config = FulltextConfig {
         db_path: args.db,
@@ -313,10 +363,48 @@ pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
         heap_bytes: (args.heap_mb as usize) * 1024 * 1024,
     };
 
-    print_text_policy(&config.text_policy);
+    if !report.is_json() {
+        println!("config       : {}", origin.describe());
+        print_text_policy(&config.text_policy);
+    }
 
     let summary = fulltext::build(&config)?;
 
+    if !report.is_json() {
+        print_fulltext_summary(&summary, &config);
+    }
+
+    // An empty index is the failure that is hardest to notice from the outside:
+    // "indexed but not findable" and "never indexed" look identical at search
+    // time. Say so, and exit non-zero.
+    if summary.indexed == 0 {
+        report.warn(
+            "zero documents indexed. Every candidate was skipped (see the \
+             reasons above), or the metadata index is empty — run `sagasu index \
+             <root>` first, and consider `--ext <EXT>` if your text files use an \
+             extension sagasu does not know.",
+        );
+    }
+
+    if report.is_json() {
+        json::fulltext(
+            &config.index_dir.display().to_string(),
+            &origin,
+            &config.text_policy,
+            &summary,
+            &report,
+        );
+    }
+
+    if summary.indexed == 0 {
+        process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// The human rendering of a full-text build.
+fn print_fulltext_summary(summary: &fulltext::FulltextSummary, config: &FulltextConfig) {
     println!("candidates   : {}", summary.candidates);
     println!("indexed      : {}", summary.indexed);
     println!("  by ext     : {}", summary.accepted_by_ext);
@@ -385,21 +473,6 @@ pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
         );
     }
     println!("elapsed      : {:.3}s", summary.elapsed_secs);
-
-    // An empty index is the failure that is hardest to notice from the outside:
-    // "indexed but not findable" and "never indexed" look identical at search
-    // time. Say so, and exit non-zero.
-    if summary.indexed == 0 {
-        eprintln!(
-            "WARNING: zero documents indexed. Every candidate was skipped (see the \
-             reasons above), or the metadata index is empty — run `sagasu index \
-             <root>` first, and consider `--ext <EXT>` if your text files use an \
-             extension sagasu does not know."
-        );
-        process::exit(1);
-    }
-
-    Ok(())
 }
 
 /// Say which extension policy the build ran under.
@@ -408,9 +481,11 @@ pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
 /// in the index, and "I added `.tmpl` to a config file the tool never read" is
 /// otherwise indistinguishable from "sagasu ignored my `.tmpl` files".
 fn print_text_policy(policy: &TextPolicy) {
-    match policy.source() {
-        Some(path) => println!("text config  : {}", path.display()),
-        None => println!("text config  : (none)"),
+    if policy.is_empty() {
+        // Which file was read is the line above this one; this one says what
+        // the file changed, and "nothing" has to be said out loud.
+        println!("text         : (built-in lists only)");
+        return;
     }
     if !policy.text_exts().is_empty() {
         println!("  +text      : {}", policy.text_exts().join(", "));

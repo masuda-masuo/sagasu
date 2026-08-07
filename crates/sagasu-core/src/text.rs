@@ -130,19 +130,29 @@ pub enum ExtVerdict {
 
 // ── User-extensible policy ──────────────────────────────────────────────────
 
-/// Filename looked for when no text config is named explicitly.
-pub const DEFAULT_TEXT_CONFIG_FILE: &str = "sagasu-text.toml";
+/// The file this policy used to be read from, before the two config files were
+/// merged into one (issue #6, docs/cli.md §5).
+///
+/// Kept as a constant because it is still *looked for*: a `sagasu-text.toml`
+/// left in the working directory is no longer read, and saying so is the whole
+/// point — see [`crate::config::check_no_legacy_config`].
+pub const LEGACY_TEXT_CONFIG_FILE: &str = "sagasu-text.toml";
 
-/// On-disk shape of the text config file. Unknown keys are an error for the
-/// same reason [`crate::tagrules`] rejects them: a file where `text_exts` was
-/// typed instead of `text_ext` must not load as a config that does nothing.
-#[derive(Debug, serde::Deserialize)]
+/// On-disk shape of the `[text]` section of `sagasu.toml`. Unknown keys are an
+/// error for the same reason [`crate::tagrules`] rejects them: a file where
+/// `text_exts` was typed instead of `text_ext` must not load as a config that
+/// does nothing.
+///
+/// Lives here rather than in [`crate::config`] so the shape sits next to the
+/// type it configures; `config` composes it with the tag-rule section into the
+/// one file both halves are read from (docs/cli.md §5).
+#[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TextConfigFile {
+pub(crate) struct TextSection {
     #[serde(default)]
-    text_ext: Vec<String>,
+    pub(crate) text_ext: Vec<String>,
     #[serde(default)]
-    binary_ext: Vec<String>,
+    pub(crate) binary_ext: Vec<String>,
 }
 
 /// The extension half of the body-extraction decision, plus the user's
@@ -218,11 +228,26 @@ impl TextPolicy {
 
     /// Compile a policy from TOML text (the testable half of [`TextPolicy::load`]).
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let file: TextConfigFile = toml::from_str(text)?;
+        let section: TextSection = toml::from_str(text)?;
+        Ok(Self::from_section(section))
+    }
+
+    /// Build a policy from an already-deserialized `[text]` section.
+    pub(crate) fn from_section(section: TextSection) -> Self {
         let mut policy = Self::empty();
-        policy.add_text_exts(&file.text_ext);
-        policy.add_binary_exts(&file.binary_ext);
-        Ok(policy)
+        policy.add_text_exts(&section.text_ext);
+        policy.add_binary_exts(&section.binary_ext);
+        policy
+    }
+
+    /// Record which file this policy came from, and the digest of its bytes.
+    ///
+    /// [`TextPolicy::load`] does this for itself; [`crate::config`] needs it
+    /// because it reads one file for two policies and the bytes are hashed once.
+    pub(crate) fn with_origin(mut self, source: std::path::PathBuf, digest: String) -> Self {
+        self.source = Some(source);
+        self.digest = Some(digest);
+        self
     }
 
     /// Extensions the user added to the allowlist.

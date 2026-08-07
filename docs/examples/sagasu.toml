@@ -1,0 +1,95 @@
+# sagasu の設定ファイルの例
+#
+#   sagasu tag      --db index.db --config docs/examples/sagasu.toml
+#   sagasu fulltext --db index.db --config docs/examples/sagasu.toml
+#
+# `--config` を省略すると、カレントディレクトリの `sagasu.toml` が使われる
+# (見つかったかどうかは実行時に必ず表示される)。
+#
+# 設定は1ファイル2セクション(issue #6、docs/cli.md §5):
+#   [text]         … 本文抽出の対象判定を広げる  (sagasu fulltext / sagasu search)
+#   [[tags.rule]]  … ユーザー定義のタグルール    (sagasu tag / sagasu tags)
+#
+# どちらのセクションも省略可。未知のキーはエラーになる —
+# `text_exts` と打ち間違えた設定が「読めたが何もしない」状態になると、
+# 利用者は tool のバグを疑うことになる。
+
+# ── 本文抽出の対象 ───────────────────────────────────────────────────────────
+# 拡張子に先頭のドットは付けても付けなくてもよい。大文字小文字は無視。
+# 優先順位は text_ext > binary_ext > 組み込み許可 > 組み込み拒否 > 内容サンプリング。
+# 詳細は docs/index_scope.md §2-2。
+[text]
+text_ext   = ["tmpl", "hbs", "j2"]
+binary_ext = ["pak"]
+
+# ── タグルール ──────────────────────────────────────────────────────────────
+# 規則:
+#   - 1つのルール内の条件(`path` / `file` / `ext`)は AND
+#   - ルール間は順不同。ファイルはマッチした全ルールのタグの和集合を受け取る
+#   - glob は大文字小文字を区別せず、パスは常にルート相対・'/' 区切り
+#   - 詳細は docs/tag_rules.md
+
+# ── 案件・プロジェクト ───────────────────────────────────────────────────────
+[[tags.rule]]
+name = "顧客案件"
+path = "clients/**"
+tags = ["project:client-work"]
+
+[[tags.rule]]
+name = "acme 案件"
+path = "clients/acme/**"
+tags = ["client:acme", "billing:billable"]
+
+[[tags.rule]]
+name = "社内プロジェクト"
+path = "projects/*/**"
+tags = ["project:internal"]
+
+# ── 作成者 ──────────────────────────────────────────────────────────────────
+# issue #40 以降、`author:` は docx/xlsx/pptx の dc:creator、PDF の /Author、
+# EXIF の Artist からも自動で付く。ルールはその代わりではなく上乗せ:
+# 同じ名前空間なので和集合になり、メタデータを持たないファイルをここで拾える。
+[[tags.rule]]
+name = "masuda の作業ディレクトリ"
+path = "**/masuda/**"
+tags = ["author:masuda"]
+
+# ── 部門・保存義務 ──────────────────────────────────────────────────────────
+[[tags.rule]]
+name = "経理の証憑"
+path = "**/keiri/**"
+ext  = ["pdf", "xlsx", "xls", "csv"]
+tags = ["dept:accounting", "retention:7y"]
+
+[[tags.rule]]
+name = "人事"
+path = "**/{jinji,人事}/**"
+tags = ["dept:hr", "confidential:yes"]
+
+# ── 文書の種類 ──────────────────────────────────────────────────────────────
+[[tags.rule]]
+name = "契約書"
+path = "**/{contracts,契約}/**"
+tags = ["doc-type:contract", "confidential:yes"]
+
+[[tags.rule]]
+name = "請求書"
+file = "*{invoice,請求}*"
+tags = ["doc-type:invoice"]
+
+[[tags.rule]]
+name = "議事録"
+file = "*{minutes,議事録}*"
+tags = ["doc-type:minutes"]
+
+# ── アプリケーション ────────────────────────────────────────────────────────
+[[tags.rule]]
+name = "Photoshop 作業ファイル"
+file = "*.psd"
+tags = ["app:photoshop", "stage:working"]
+
+[[tags.rule]]
+name = "書き出し済み素材"
+path = "**/export/**"
+ext  = ["png", "jpg", "jpeg", "pdf"]
+tags = ["stage:delivered"]

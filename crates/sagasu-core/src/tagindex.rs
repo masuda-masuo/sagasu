@@ -48,7 +48,8 @@ const TAG_META_KEYS: &[&str] = &[
 pub struct TagConfig {
     /// SQLite metadata index to tag.
     pub db_path: PathBuf,
-    /// User rule file. `None` = built-in generators only.
+    /// The config file whose `[[tags.rule]]` tables supply the user rules
+    /// (`sagasu.toml`, issue #6). `None` = built-in generators only.
     pub rules_path: Option<PathBuf>,
     /// Read the leading bytes of files whose `magic` column is still NULL.
     ///
@@ -207,8 +208,12 @@ pub fn build(config: &TagConfig) -> Result<TagSummary> {
     let store = Store::open(&config.db_path)
         .with_context(|| format!("failed to open metadata index {:?}", config.db_path))?;
 
+    // The unified config file, whose `[[tags.rule]]` tables are the user rules
+    // (issue #6). Loaded here rather than handed in already-compiled so the
+    // digest recorded next to the tags is the digest of the bytes that were
+    // actually on disk when the build ran.
     let rules = match &config.rules_path {
-        Some(p) => RuleSet::load(p)?,
+        Some(p) => crate::config::Config::load(p)?.into_rules(),
         None => RuleSet::empty(),
     };
 

@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 
 use sagasu_core::store::Store;
 use sagasu_core::tagindex::{self, TagConfig};
-use sagasu_core::tagrules::RuleSet;
 use sagasu_core::walk::{self, CrawlConfig};
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -358,11 +357,11 @@ fn user_rules_add_tags_and_the_result_does_not_depend_on_rule_order() {
     fs::write(
         &a,
         r#"
-        [[rule]]
+        [[tags.rule]]
         path = "clients/**"
         tags = ["project:client-work"]
 
-        [[rule]]
+        [[tags.rule]]
         path = "clients/acme-corp/**"
         tags = ["client:acme"]
         "#,
@@ -372,11 +371,11 @@ fn user_rules_add_tags_and_the_result_does_not_depend_on_rule_order() {
     fs::write(
         &b,
         r#"
-        [[rule]]
+        [[tags.rule]]
         path = "clients/acme-corp/**"
         tags = ["client:acme"]
 
-        [[rule]]
+        [[tags.rule]]
         path = "clients/**"
         tags = ["project:client-work"]
         "#,
@@ -416,7 +415,7 @@ fn a_broken_rule_file_is_rejected_before_the_build_touches_anything() {
     fs::write(
         &bad,
         r#"
-        [[rule]]
+        [[tags.rule]]
         path = "clients/**"
         tags = ["missing-namespace"]
         "#,
@@ -541,7 +540,7 @@ fn hitting_the_tag_cap_sacrifices_path_tags_not_the_users_own_rules() {
     fs::write(
         &rules_file,
         r#"
-        [[rule]]
+        [[tags.rule]]
         name = "顧客案件"
         ext  = ["txt"]
         tags = ["project:client-work", "client:acme", "retention:7y", "stage:final"]
@@ -582,16 +581,30 @@ fn hitting_the_tag_cap_sacrifices_path_tags_not_the_users_own_rules() {
 }
 
 #[test]
-fn the_documented_example_rule_file_actually_loads() {
+fn the_documented_example_config_file_actually_loads() {
     // A configuration example that does not parse is worse than no example at
     // all: it is copied, it fails, and the failure looks like a tool bug.
     let example = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/examples/sagasu-tags.toml")
+        .join("../../docs/examples/sagasu.toml")
         .canonicalize()
-        .expect("docs/examples/sagasu-tags.toml must exist");
-    let set = RuleSet::load(&example).expect("the documented example must load");
+        .expect("docs/examples/sagasu.toml must exist");
+    let config =
+        sagasu_core::config::Config::load(&example).expect("the documented example must load");
+    let set = config.rules();
     assert!(set.len() >= 5, "the example should carry real rules");
     assert!(set.digest().is_some());
+    // Both halves come out of the one file (issue #6), so an example that only
+    // exercised the tag rules would leave the `[text]` section untested — and
+    // an unparsed section is exactly the failure this test exists to catch.
+    assert!(
+        !config.text_policy().is_empty(),
+        "the example's [text] section must load too"
+    );
+    assert_eq!(
+        config.text_policy().digest(),
+        set.digest(),
+        "one file, one digest"
+    );
 }
 
 // ── 4. Lifecycle: deletion, staleness, atomicity ────────────────────────────
