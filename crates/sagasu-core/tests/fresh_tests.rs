@@ -73,11 +73,45 @@ fn build_ft(db_dir: &Path, index_dir: &Path) {
 
 /// Give the filesystem clock a moment to move past the crawl marker.
 ///
-/// On the nanosecond-resolution filesystems this runs on it is not strictly
-/// needed; it costs nothing and removes the "written in the same tick as the
-/// marker" edge case on coarser ones.
+/// Sized for Windows, where this is not cosmetic: `SystemTime::now()` (the
+/// marker) comes from `GetSystemTimePreciseAsFileTime`, while a file's
+/// LastWriteTime comes from the interrupt-driven system clock at roughly 15.6 ms
+/// granularity. A file written a few milliseconds after the marker can therefore
+/// carry a timestamp *older* than it. 30 ms clears that window with room to
+/// spare; on the nanosecond-resolution filesystems elsewhere it is free.
 fn tick() {
-    std::thread::sleep(std::time::Duration::from_millis(5));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+}
+
+/// Whether the delta source that answered this query can observe a rename.
+///
+/// Branching on the reported capability rather than on `cfg!(windows)` keeps the
+/// assertions tied to what actually ran: the `stat` fallback infers renames from
+/// `st_ctime` and so cannot see them on Windows, while the USN source reports
+/// them everywhere it is enabled.
+fn detects_renames(outcome: &FreshOutcome) -> bool {
+    outcome
+        .delta
+        .as_ref()
+        .map(|d| d.detects_renames)
+        .unwrap_or(false)
+}
+
+/// Describe the delta source in an assertion message, so a failure on a platform
+/// we cannot run locally says which path produced it.
+fn delta_note(outcome: &FreshOutcome) -> String {
+    match &outcome.delta {
+        Some(d) => format!(
+            "source={} renames={} entries={} scanned={} excluded={} status={:?}",
+            d.kind.as_str(),
+            d.detects_renames,
+            d.entries,
+            d.scanned,
+            d.excluded,
+            d.status
+        ),
+        None => "no delta taken".to_string(),
+    }
 }
 
 fn find_config(db_dir: &Path, query: &str) -> FreshConfig {
@@ -181,8 +215,55 @@ fn metadata_search_follows_a_rename_made_after_indexing() {
 
     let outcome = fresh::find(&find_config(&db, "report"), None).unwrap();
     let n = names(&outcome);
-    assert_eq!(n, vec!["final_report.md".to_string()], "{n:?}");
-    assert_eq!(outcome.dropped_deleted, 1, "the old path no longer exists");
+
+    // Either way the stale path must go: returning a file that is no longer
+    // there is the one answer that is always wrong.
+    assert_eq!(
+        outcome.dropped_deleted,
+        1,
+        "the old path no longer exists ({})",
+        delta_note(&outcome)
+    );
+
+    if detects_renames(&outcome) {
+        assert_eq!(
+            n,
+            vec!["final_report.md".to_string()],
+            "{n:?} ({})",
+            delta_note(&outcome)
+        );
+    } else {
+        // A `stat` walk on Windows cannot see this: NTFS leaves LastWriteTime
+        // untouched across a rename and std::fs exposes no ChangeTime, so the
+        // new path is invisible until the next crawl. Documented in
+        // docs/design.md §5-2; the CLI prints the caveat with every result.
+        assert!(n.is_empty(), "{n:?} ({})", delta_note(&outcome));
+    }
+}
+
+#[test]
+fn a_rename_a_source_cannot_see_drops_the_old_path_rather_than_returning_it() {
+    // The Windows `stat` fallback cannot observe a rename, so its delta set is
+    // empty in exactly this situation. Reproducing that precondition here (with
+    // the merge switched off, which empties the delta set the same way) checks
+    // the resulting behaviour on a platform the suite actually runs on, instead
+    // of leaving the Windows branch of the rename tests asserted blind.
+    let (d, db, _) = tmp_dirs("blind_rename");
+    write_file(&d, "draft_report.md", "content");
+    crawl(&d, &db);
+    tick();
+
+    fs::rename(d.join("draft_report.md"), d.join("final_report.md")).unwrap();
+
+    let mut config = find_config(&db, "report");
+    config.no_delta = true;
+    let outcome = fresh::find(&config, None).unwrap();
+
+    // The vanished path must not be returned...
+    assert!(names(&outcome).is_empty(), "{:?}", names(&outcome));
+    assert_eq!(outcome.dropped_deleted, 1);
+    // ...and the answer must admit it is not merged.
+    assert!(outcome.stale.is_some());
 }
 
 // ── 2. Acceptance: full-text search after add / change / delete ─────────────
@@ -267,8 +348,27 @@ fn fulltext_search_follows_a_rename_made_after_indexing() {
     fs::rename(d.join("before.md"), d.join("after.md")).unwrap();
 
     let outcome = fresh::search(&search_config(&db, &ft, "索引"), None).unwrap();
-    assert_eq!(names(&outcome), vec!["after.md".to_string()]);
-    assert_eq!(outcome.hits[0].origin, HitOrigin::Live);
+    let n = names(&outcome);
+
+    assert_eq!(
+        outcome.dropped_deleted,
+        1,
+        "the indexed path no longer exists ({})",
+        delta_note(&outcome)
+    );
+
+    if detects_renames(&outcome) {
+        assert_eq!(
+            n,
+            vec!["after.md".to_string()],
+            "({})",
+            delta_note(&outcome)
+        );
+        assert_eq!(outcome.hits[0].origin, HitOrigin::Live);
+    } else {
+        // See the metadata rename test: invisible to a `stat` walk on Windows.
+        assert!(n.is_empty(), "{n:?} ({})", delta_note(&outcome));
+    }
 }
 
 #[test]
@@ -450,9 +550,16 @@ fn disabling_the_merge_still_says_the_answer_is_unmerged() {
 
 // ── 4. The delta source itself ──────────────────────────────────────────────
 
+/// A delta source over `root`, configured exactly the way `fresh::find` does it.
+///
+/// The root is canonicalized because that is what `sagasu index` stores in
+/// `meta.root_path` and therefore what production always passes. Handing a
+/// source a raw path instead used to exercise a code path the product never
+/// reaches — on Windows `canonicalize` yields a `\\?\` verbatim path, and the
+/// two shapes selected two different sources.
 fn source_for_root(root: &Path, db_dir: &Path) -> Box<dyn DeltaSource> {
     delta::source_for(&delta::DeltaConfig {
-        root: root.to_path_buf(),
+        root: root.canonicalize().unwrap(),
         excludes: ExcludeSet::new(&[], false),
         skip_paths: walk::db_sibling_paths(&db_path(db_dir)),
         threads: 1,
@@ -479,15 +586,21 @@ fn the_delta_set_applies_the_crawls_exclusion_set() {
         .changes_since(&marker, delta::DEFAULT_DELTA_LIMIT)
         .unwrap();
 
+    let note = format!(
+        "source={} scanned={} excluded={} status={:?}",
+        set.kind.as_str(),
+        set.scanned,
+        set.excluded,
+        set.status
+    );
     let paths: Vec<&str> = set.entries.iter().map(|e| e.path.as_str()).collect();
-    assert_eq!(paths.len(), 1, "{paths:?}");
-    assert!(paths[0].ends_with("lib.rs"), "{paths:?}");
+    assert_eq!(paths.len(), 1, "{paths:?} ({note})");
+    assert!(paths[0].ends_with("lib.rs"), "{paths:?} ({note})");
     assert!(
         set.excluded >= 2,
-        "excluded files must be counted, not just dropped: {}",
-        set.excluded
+        "excluded files must be counted, not just dropped ({note})"
     );
-    assert_eq!(set.status, DeltaStatus::Complete);
+    assert_eq!(set.status, DeltaStatus::Complete, "({note})");
 }
 
 #[test]
@@ -514,7 +627,7 @@ fn the_delta_set_never_contains_our_own_database() {
     drop(store);
 
     let source = delta::source_for(&delta::DeltaConfig {
-        root: d.clone(),
+        root: d.canonicalize().unwrap(),
         excludes: ExcludeSet::new(&[], false),
         skip_paths: walk::db_sibling_paths(&inner_db),
         threads: 1,

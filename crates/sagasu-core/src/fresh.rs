@@ -212,6 +212,10 @@ impl FreshTiming {
 pub struct DeltaReport {
     /// Which mechanism ran.
     pub kind: DeltaSourceKind,
+    /// Whether that mechanism can see renames at all. False means a file
+    /// renamed since the crawl is missing from the answer rather than moved in
+    /// it — see [`crate::delta::DeltaSource::detects_renames`].
+    pub detects_renames: bool,
     /// Completeness of the delta set.
     pub status: DeltaStatus,
     /// Files in the delta set after exclusion.
@@ -567,6 +571,7 @@ impl DeltaContext {
     fn report(&self) -> Option<DeltaReport> {
         self.set.as_ref().map(|s| DeltaReport {
             kind: s.kind,
+            detects_renames: s.detects_renames,
             status: s.status,
             entries: s.entries.len(),
             scanned: s.scanned,

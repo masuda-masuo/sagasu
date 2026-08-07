@@ -42,10 +42,21 @@
 //! All three are [`DeltaStatus::RescanRequired`], which is a different branch
 //! from hitting the delta cap: this one cannot be fixed by raising a limit.
 //!
-//! ## Verification status
+//! ## Verification status — this source is opt-in
 //!
 //! Compiled for `x86_64-pc-windows-*`; **not** exercised on real hardware — the
-//! development environment is Linux. The mtime fallback is the tested path.
+//! development environment is Linux. [`crate::delta::source_for`] therefore only
+//! selects it when `SAGASU_DELTA_SOURCE=usn` is set, and the `stat` fallback is
+//! the default on every platform.
+//!
+//! That gate exists because of what happened without it. `sagasu index`
+//! canonicalizes its root, and `std::fs::canonicalize` on Windows returns a
+//! `\\?\C:\…` verbatim path — which [`volume_of`] rejected, so production never
+//! reached this source at all. The single test that happened to pass a raw
+//! `C:\…` root did reach it, and got an empty delta set back. Both bugs are
+//! fixed, but "compiles and is therefore the default on a whole platform" is
+//! exactly the reasoning that produced a search silently returning nothing.
+//! The gate comes off when the path has run against a real NTFS volume.
 
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -99,9 +110,18 @@ impl UsnDeltaSource {
     /// rights). The caller falls back to the mtime walk.
     pub fn for_config(config: &DeltaConfig) -> Option<Self> {
         let volume = volume_of(&config.root)?;
+        // Compare records against the same shape of path the journal hands
+        // back. `GetFinalPathNameByHandleW(FILE_NAME_NORMALIZED)` returns the
+        // long form, so a root still holding an 8.3 short component (as
+        // `%TEMP%` often does) would match nothing at all.
+        let root = config
+            .root
+            .canonicalize()
+            .map(|p| strip_extended_prefix(&p.to_string_lossy()))
+            .unwrap_or_else(|_| config.root.clone());
         let source = Self {
             volume,
-            root: config.root.clone(),
+            root,
             excludes: config.excludes.clone(),
             skip_paths: config.skip_paths.clone(),
         };
@@ -123,7 +143,7 @@ impl UsnDeltaSource {
 
     /// True when a resolved path belongs to the indexed set.
     fn accepts(&self, path: &Path) -> bool {
-        path.starts_with(&self.root)
+        crate::delta::path_under(&self.root, path)
             && self.excludes.matched_dir(path, &self.root).is_none()
             && !self
                 .skip_paths
@@ -135,6 +155,13 @@ impl UsnDeltaSource {
 impl DeltaSource for UsnDeltaSource {
     fn kind(&self) -> DeltaSourceKind {
         DeltaSourceKind::Usn
+    }
+
+    /// The journal carries `RENAME_OLD_NAME` / `RENAME_NEW_NAME` records, so a
+    /// rename is an observable event rather than something to infer from
+    /// timestamps.
+    fn detects_renames(&self) -> bool {
+        true
     }
 
     fn current_marker(&self) -> Result<ScanMarker> {
@@ -161,10 +188,10 @@ impl DeltaSource for UsnDeltaSource {
             ..
         } = marker
         else {
-            return Ok(failed(marker, RescanReason::MarkerMissing, t0));
+            return Ok(failed(marker, RescanReason::MarkerKindMismatch, t0));
         };
         if !volume.eq_ignore_ascii_case(&self.volume) {
-            return Ok(failed(marker, RescanReason::MarkerMissing, t0));
+            return Ok(failed(marker, RescanReason::MarkerKindMismatch, t0));
         }
 
         self.with_volume(|handle| {
@@ -343,6 +370,7 @@ impl UsnDeltaSource {
                 DeltaStatus::Complete
             },
             kind: DeltaSourceKind::Usn,
+            detects_renames: true,
             scanned,
             excluded,
             elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -359,6 +387,7 @@ fn failed(marker: &ScanMarker, reason: RescanReason, t0: Instant) -> DeltaSet {
         entries: Vec::new(),
         status: DeltaStatus::RescanRequired(reason),
         kind: DeltaSourceKind::Usn,
+        detects_renames: false,
         scanned: 0,
         excluded: 0,
         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -367,12 +396,20 @@ fn failed(marker: &ScanMarker, reason: RescanReason, t0: Instant) -> DeltaSet {
 }
 
 /// The volume specifier (`C:`) a path lives on, if it has a drive letter.
-/// UNC paths have no USN Journal we can open, so they get `None` and the mtime
-/// fallback.
+///
+/// The `\\?\` extended-length prefix is stripped first. That is not a nicety:
+/// `sagasu index` canonicalizes its root before storing it, and
+/// `std::fs::canonicalize` on Windows *always* returns a `\\?\C:\…` verbatim
+/// path — so a check that only looked at byte 0 rejected every root the product
+/// actually passes, and the USN source could never be selected in production.
+///
+/// `\\?\UNC\server\share` and plain UNC paths keep returning `None`: there is no
+/// local volume handle to open, so they take the mtime fallback.
 fn volume_of(path: &Path) -> Option<String> {
     let s = path.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
     let bytes = s.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' && (bytes[0] as char).is_ascii_alphabetic() {
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
         Some(s[..2].to_string())
     } else {
         None

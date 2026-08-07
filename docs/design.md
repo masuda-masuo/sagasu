@@ -166,12 +166,46 @@ PowerShell 一時ファイルで差分集合が埋まる。除外件数は集計
 (20k で 32ms、100k で 165ms)。単発クエリでは体感不能だが、キーストローク毎に
 走らせるには重い — これが USN 経路と `DeltaCache` の両方が要る理由そのもの。
 
+### 5-1-1. 差分源の選択と、経路ごとの検出能力
+
+**USN 経路は既定で使わない(opt-in)**。`SAGASU_DELTA_SOURCE=usn` を設定したときだけ
+`delta::source_for` が USN を試し、それ以外は全プラットフォームで mtime 走査を使う。
+
+理由は「コンパイルが通るから既定にする」を一度やって壊したから。`sagasu index` は
+ルートを canonicalize して保存するが、Windows の `std::fs::canonicalize` は
+`\\?\C:\…` 形式(extended length path)を返す。`usn::volume_of` はドライブレターを
+先頭バイトで判定していたためこれを弾き、**製品経路では USN が一度も選ばれていなかった**。
+一方 canonicalize を通さない生の `C:\…` を渡していたテスト1本だけが USN に到達し、
+空の差分集合を返して落ちた(PR #36 の Windows CI)。`volume_of` は修正したが、
+実機未検証の経路をプラットフォーム全体の既定にするのは「検索が黙って何も返さない」
+を作る手順そのものなので、実機で走らせるまでゲートを外さない。
+
+**リネーム検出能力は経路ごとに違う**。`DeltaSource::detects_renames()` で公開し、
+`DeltaSet` / `DeltaReport` を通じて CLI まで伝える。
+
+| 経路 | リネーム検出 | 理由 |
+|---|---|---|
+| mtime (Unix) | ○ | `rename(2)` は mtime を変えないが `st_ctime` を必ず変える |
+| mtime (Windows) | **×** | NTFS のリネームは LastWriteTime を変えず、ChangeTime は `std::fs` から取れない |
+| USN | ○ | `RENAME_OLD_NAME` / `RENAME_NEW_NAME` レコードが出る |
+
+検出できない場合、リネームされたファイルは答えから**移動するのではなく消える**
+(旧パスのインデックスヒットは存在確認で落ち、新パスは誰も知らない)。
+これは「該当ファイルなし」と見分けが付かないので、CLI は結果ごとに注意書きを出す。
+黙って欠けるのが本設計で最も避けたい失敗なので、能力そのものを表に出す形にした。
+
 ### 5-2. M2 で残した論点
 
-- **FRN → フルパス解決の実機検証**。親 FRN を `OpenFileById` +
-  `GetFinalPathNameByHandleW` で解決し、レコードのファイル名を連結する方式で実装した
-  (削除済みファイルでも親ディレクトリは残っているのでこの向きにした)。
-  Windows 実機での検証は未了
+- **USN 経路の実機検証**。opt-in ゲート(§5-1-1)を外すための前提。特に:
+  - **FRN → フルパス解決**。親 FRN を `OpenFileById` + `GetFinalPathNameByHandleW` で
+    解決し、レコードのファイル名を連結する方式で実装した(削除済みファイルでも
+    親ディレクトリは残っているのでこの向きにした)。実機未検証
+  - **パス表記の突き合わせ**。`GetFinalPathNameByHandleW(FILE_NAME_NORMALIZED)` は
+    ロング形式を返すので、ルートも canonicalize して `\\?\` を剥がした形に揃え、
+    比較は NTFS に合わせて ASCII 大文字小文字を無視する(`delta::path_under`)。
+    8.3 短縮名の `%TEMP%` 配下で実際に一致するかは実機で確認が要る
+- **Windows でリネームが検出できない**(§5-1-1)。USN 経路が既定になれば解消する。
+  それまでは「リネームされたファイルは再索引まで答えから消える」が仕様
 - **マーカー寿命の能動的な警告**。`estimate_lifetime` は用意したが、
   `sagasu status` は現在の NextUsn を取りに行かない(read-only を保つため)。
   残り寿命に基づく事前警告は後続

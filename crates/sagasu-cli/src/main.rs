@@ -480,6 +480,16 @@ fn print_fresh(outcome: &FreshOutcome) {
         if let DeltaStatus::RescanRequired(reason) = d.status {
             println!("          rescan required: {}", reason.as_str());
         }
+        // A source that cannot see renames makes a renamed file vanish from the
+        // answer instead of moving in it. Saying so once beats letting the gap
+        // read as "no such file".
+        if !d.detects_renames {
+            println!(
+                "          note: the {} source cannot detect renames on this platform; \
+                 a file renamed since the last crawl will be missing until you re-index",
+                d.kind.as_str()
+            );
+        }
     }
 
     let t = &outcome.timing;

@@ -273,6 +273,9 @@ pub enum RescanReason {
     JournalUnavailable,
     /// No marker was recorded, or the recorded one could not be parsed.
     MarkerMissing,
+    /// The marker was taken by a different delta source (or on another volume),
+    /// so its position means nothing to this one.
+    MarkerKindMismatch,
 }
 
 impl RescanReason {
@@ -286,6 +289,9 @@ impl RescanReason {
             }
             RescanReason::JournalUnavailable => "USN journal unavailable",
             RescanReason::MarkerMissing => "no usable index marker",
+            RescanReason::MarkerKindMismatch => {
+                "index marker was taken by a different delta source"
+            }
         }
     }
 }
@@ -323,6 +329,11 @@ pub struct DeltaSet {
     pub status: DeltaStatus,
     /// Which source produced it.
     pub kind: DeltaSourceKind,
+    /// Whether the producing source can see a rename at all — see
+    /// [`DeltaSource::detects_renames`]. When false, a file renamed since the
+    /// crawl disappears from the answer rather than moving in it, and callers
+    /// must not read "not in the delta set" as "not renamed".
+    pub detects_renames: bool,
     /// Files stat'ed (mtime source) or journal records read (USN source).
     pub scanned: u64,
     /// Candidates dropped by the exclusion set. `excluded / (excluded +
@@ -343,6 +354,9 @@ impl DeltaSet {
             entries: Vec::new(),
             status: DeltaStatus::RescanRequired(reason),
             kind,
+            // Nothing was determined at all, so claiming rename coverage would
+            // be the wrong kind of optimism.
+            detects_renames: false,
             scanned: 0,
             excluded: 0,
             elapsed_ms: ms,
@@ -412,11 +426,40 @@ impl DeltaConfig {
 
     /// True when `path` belongs to the indexed set: under the root, not under an
     /// excluded directory, and not one of our own database files.
-    fn accepts(&self, path: &Path) -> bool {
-        path.starts_with(&self.root)
+    pub(crate) fn accepts(&self, path: &Path) -> bool {
+        path_under(&self.root, path)
             && self.excludes.matched_dir(path, &self.root).is_none()
             && !self.skip_paths.iter().any(|p| walk::same_path(p, path))
     }
+}
+
+/// Whether `path` lies inside `root`, on a whole-component boundary.
+///
+/// [`Path::starts_with`] is case-*sensitive* on every platform, but NTFS is
+/// case-insensitive: a path the OS resolved for us (a USN record run back
+/// through `GetFinalPathNameByHandleW`) can differ in case from the root the
+/// user configured, and rejecting it would silently empty the delta set. On Unix
+/// the case fold would be wrong, so it is not applied there.
+pub(crate) fn path_under(root: &Path, path: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    cfg!(windows) && starts_with_ignore_ascii_case(root, path)
+}
+
+/// Component-boundary prefix test with ASCII case folding.
+///
+/// Split out from [`path_under`] so the comparison itself is exercised by the
+/// unit tests on any host, even though only Windows calls it.
+fn starts_with_ignore_ascii_case(root: &Path, path: &Path) -> bool {
+    let root = root.to_string_lossy();
+    let path = path.to_string_lossy();
+    let root = root.trim_end_matches(['\\', '/']).as_bytes();
+    let path = path.as_bytes();
+
+    root.len() < path.len()
+        && path[..root.len()].eq_ignore_ascii_case(root)
+        && matches!(path[root.len()], b'\\' | b'/')
 }
 
 /// A source of "what changed since the marker".
@@ -440,19 +483,52 @@ pub trait DeltaSource: Send + Sync {
     /// and the caller has to *report* it, not abort on it. `Err` is reserved for
     /// failures that say nothing about freshness.
     fn changes_since(&self, marker: &ScanMarker, limit: usize) -> Result<DeltaSet>;
+
+    /// Whether this source can observe a rename.
+    ///
+    /// Not a detail: when it is false, a file renamed since the crawl leaves the
+    /// answer entirely — the index hit is dropped because its old path is gone,
+    /// and nothing takes its place. Callers surface it rather than letting the
+    /// gap look like "no such file".
+    ///
+    /// The USN Journal reports renames explicitly. The `stat` walk infers them
+    /// from the inode change time, which exists on Unix and has no `std::fs`
+    /// equivalent on Windows (NTFS leaves LastWriteTime untouched across a
+    /// rename, and ChangeTime is not exposed).
+    fn detects_renames(&self) -> bool;
 }
 
-/// The best delta source available for this platform and configuration.
+/// Environment variable that opts in to the USN Journal source.
 ///
-/// Windows prefers the USN Journal and falls back to the mtime walk when the
-/// journal cannot be opened (non-NTFS volume, no administrator rights); every
-/// other platform gets the mtime walk. The fallback is silent by design — it is
-/// slower, not wrong, and [`DeltaSet::kind`] reports which one ran.
+/// See [`source_for`] for why the fast path is not the default one.
+pub const DELTA_SOURCE_ENV: &str = "SAGASU_DELTA_SOURCE";
+
+/// The delta source to use for this platform and configuration.
+///
+/// Returns the `stat` walk unless `SAGASU_DELTA_SOURCE=usn` is set *and* the USN
+/// Journal can actually be opened (Windows, NTFS, administrator rights); the
+/// fallback is silent by design, since it is slower rather than wrong, and
+/// [`DeltaSet::kind`] reports which one ran.
+///
+/// ## Why the fast path is opt-in
+///
+/// The USN source has never been executed against a real NTFS volume — the
+/// development environment is Linux, and CI only compiles it. Making unverified
+/// code the default on a whole platform is how you ship a search that quietly
+/// returns nothing: the first time the USN source ran anywhere, it produced an
+/// empty delta set, and the only reason the rest of the suite stayed green is
+/// that `sagasu index` canonicalizes its root, which on Windows yields a `\\?\`
+/// verbatim path that the volume test rejected — so production never reached it
+/// either. Both of those are fixed; the gate stays until the path is exercised
+/// on real hardware, and then it becomes the Windows default.
 pub fn source_for(config: &DeltaConfig) -> Box<dyn DeltaSource> {
     #[cfg(windows)]
     {
-        if let Some(src) = crate::usn::UsnDeltaSource::for_config(config) {
-            return Box::new(src);
+        let opted_in = std::env::var(DELTA_SOURCE_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("usn"));
+        if opted_in {
+            if let Some(src) = crate::usn::UsnDeltaSource::for_config(config) {
+                return Box::new(src);
+            }
         }
     }
     Box::new(MtimeDeltaSource::new(config.clone()))
@@ -484,6 +560,13 @@ impl MtimeDeltaSource {
 impl DeltaSource for MtimeDeltaSource {
     fn kind(&self) -> DeltaSourceKind {
         DeltaSourceKind::Mtime
+    }
+
+    /// Unix only, and via [`changed_since`]'s `st_ctime` check rather than
+    /// mtime: on Windows a rename leaves every timestamp `std::fs` can read
+    /// untouched, so this source cannot see one at all.
+    fn detects_renames(&self) -> bool {
+        cfg!(unix)
     }
 
     fn current_marker(&self) -> Result<ScanMarker> {
@@ -586,6 +669,7 @@ impl DeltaSource for MtimeDeltaSource {
             entries,
             status,
             kind: DeltaSourceKind::Mtime,
+            detects_renames: self.detects_renames(),
             scanned: scanned.load(Ordering::Relaxed),
             excluded: excluded.load(Ordering::Relaxed),
             elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -613,6 +697,10 @@ impl NullDeltaSource {
 impl DeltaSource for NullDeltaSource {
     fn kind(&self) -> DeltaSourceKind {
         self.kind
+    }
+
+    fn detects_renames(&self) -> bool {
+        false
     }
 
     fn current_marker(&self) -> Result<ScanMarker> {
@@ -868,6 +956,49 @@ mod tests {
     fn lifetime_estimate_is_meaningless_for_a_wall_clock_marker() {
         let marker = ScanMarker::Mtime { started_ns: 0 };
         assert!(estimate_lifetime(&marker, 1, 1).is_none());
+    }
+
+    #[test]
+    fn case_folded_containment_respects_component_boundaries() {
+        let root = Path::new(r"C:\Users\RUNNER\data");
+
+        assert!(starts_with_ignore_ascii_case(
+            root,
+            Path::new(r"C:\users\runner\DATA\src\lib.rs")
+        ));
+        // A trailing separator on the root must not change the answer.
+        assert!(starts_with_ignore_ascii_case(
+            Path::new(r"C:\Users\RUNNER\data\"),
+            Path::new(r"C:\Users\RUNNER\data\a.txt")
+        ));
+        // `data2` is a sibling, not a child: prefix matching alone would say yes.
+        assert!(!starts_with_ignore_ascii_case(
+            root,
+            Path::new(r"C:\Users\RUNNER\data2\a.txt")
+        ));
+        // The root itself is not *under* the root.
+        assert!(!starts_with_ignore_ascii_case(root, root));
+    }
+
+    #[test]
+    fn path_under_never_folds_case_on_unix() {
+        let root = Path::new("/srv/data");
+        assert!(path_under(root, Path::new("/srv/data/a.txt")));
+        assert!(!path_under(root, Path::new("/srv/data2/a.txt")));
+        // Two files that differ only in case are two different files on Unix.
+        assert_eq!(
+            path_under(root, Path::new("/srv/DATA/a.txt")),
+            cfg!(windows)
+        );
+    }
+
+    #[test]
+    fn the_default_source_is_the_verified_one() {
+        // The USN path is opt-in until it has been exercised on real hardware,
+        // so an unconfigured process gets the `stat` walk on every platform.
+        let source = source_for(&DeltaConfig::new("."));
+        assert_eq!(source.kind(), DeltaSourceKind::Mtime);
+        assert_eq!(source.detects_renames(), cfg!(unix));
     }
 
     #[test]
