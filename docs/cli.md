@@ -200,7 +200,8 @@ PoC 段階なので**破壊的変更はありうる**。そのうえで最低限
 {"type":"warning","message":"index is stale: more than 10000 files changed …"}
 ```
 
-`sagasu status --json`(サマリ系):
+`sagasu status --json`(サマリ系。以下は読みやすさのため整形してあるが、
+**実出力は §4-1 の規約どおり 1 行の compact 形式**):
 
 ```json
 {
