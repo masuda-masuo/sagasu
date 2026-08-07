@@ -585,14 +585,24 @@ fn strip_verbatim(s: &str) -> String {
     }
 }
 
-/// `path` expressed relative to `root` with `/` separators, or `None` when it
-/// is not under `root` at all. `Some("")` means "is the root".
+/// `path` expressed relative to `root` with `/` separators, or `None` when the
+/// two cannot be related. `Some("")` means "is the root".
 ///
 /// This is what gitignore rules are matched against, and it is a pure string
-/// function on purpose: the anchoring of a rule like `/dist` depends entirely
+/// comparison on purpose: the anchoring of a rule like `/dist` depends entirely
 /// on getting this relation right, and the platform where it is easiest to get
 /// wrong (Windows, where the two spellings of a root differ by a prefix and by
 /// case) is the one that cannot be exercised here.
+///
+/// Being a string comparison, it relates only paths that are already written
+/// the same way. A remainder containing a `.` or `..` component is **refused**
+/// rather than normalized: `/a/./b` would otherwise come back as `./b` and slip
+/// past an anchored `/b` rule. Normalizing instead would be a lie in the
+/// presence of symlinks — `a/b/../c` is not `a/c` when `b` is one — and this
+/// function has no filesystem to check with. Every production caller passes a
+/// canonicalized root and paths the walker produced from it, so neither form
+/// arises there; refusing keeps the public [`ExcludeSet::reason_for_path`] from
+/// answering confidently about a path it cannot actually place.
 pub(crate) fn relative_slash_path(root: &Path, path: &Path) -> Option<String> {
     let root_s = strip_verbatim(&root.to_string_lossy());
     let path_s = strip_verbatim(&path.to_string_lossy());
@@ -614,7 +624,11 @@ pub(crate) fn relative_slash_path(root: &Path, path: &Path) -> Option<String> {
     if !rest.starts_with('/') && !rest.starts_with('\\') {
         return None;
     }
-    Some(rest.trim_start_matches(['/', '\\']).replace('\\', "/"))
+    let rel = rest.trim_start_matches(['/', '\\']).replace('\\', "/");
+    if rel.split('/').any(|c| c == "." || c == "..") {
+        return None;
+    }
+    Some(rel)
 }
 
 /// Resolve a database path to its canonical (absolute) form, tolerating a file
@@ -1483,7 +1497,7 @@ mod scope_tests {
     // ── F7: relating two spellings of the same root ─────────────────────────
 
     #[test]
-    fn a_path_is_related_to_its_root_by_components_not_by_string_prefix() {
+    fn a_root_is_matched_as_a_whole_path_component_not_as_a_string_prefix() {
         let rel = |root: &str, path: &str| relative_slash_path(Path::new(root), Path::new(path));
 
         assert_eq!(rel("/a/b", "/a/b/c/d.txt").as_deref(), Some("c/d.txt"));
@@ -1492,6 +1506,42 @@ mod scope_tests {
         // A sibling that merely shares a string prefix is not under the root.
         assert_eq!(rel("/a/b", "/a/bc/d.txt"), None);
         assert_eq!(rel("/a/b", "/x/y"), None);
+    }
+
+    #[test]
+    fn an_unnormalized_path_is_refused_rather_than_placed_wrongly() {
+        let rel = |root: &str, path: &str| relative_slash_path(Path::new(root), Path::new(path));
+
+        // `/a/./b` used to come back as `./b`, which slips past an anchored
+        // `/b` rule — the rule would look applied and quietly match nothing.
+        assert_eq!(rel("/a", "/a/./b"), None);
+        assert_eq!(rel("/a", "/a/b/../c"), None);
+        assert_eq!(rel("/a", "/a/.."), None);
+        // A leading dot in a *name* is not a `.` component and stays fine.
+        assert_eq!(
+            rel("/a", "/a/.github/ci.yml").as_deref(),
+            Some(".github/ci.yml")
+        );
+        assert_eq!(rel("/a", "/a/..hidden").as_deref(), Some("..hidden"));
+    }
+
+    #[test]
+    fn an_anchored_rule_is_not_slipped_past_by_an_unnormalized_path() {
+        let set = ExcludeSet::new(&[], false)
+            .with_gitignore_lines(&["/dist".to_string()], None)
+            .unwrap();
+        let root = Path::new("/proj");
+
+        assert_eq!(
+            set.reason_for_path(&root.join("dist").join("a.js"), root),
+            Some(ExcludeReason::Gitignore)
+        );
+        // Refused, not silently included under a rule that did not match.
+        assert_eq!(
+            relative_slash_path(root, Path::new("/proj/./dist")),
+            None,
+            "the caller is told it cannot place this path"
+        );
     }
 
     #[test]

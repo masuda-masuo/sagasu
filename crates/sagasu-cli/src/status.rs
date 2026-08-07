@@ -24,6 +24,21 @@ pub struct StatusArgs {
     db: PathBuf,
 }
 
+/// What the index says about the exclusion policy it was crawled with.
+///
+/// The three states are kept apart because they mean three different things at
+/// query time, and only one of them is fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyState {
+    /// Recorded and readable: every query replays exactly what the crawl used.
+    Present,
+    /// No row at all (an older build wrote this index). Queries still merge
+    /// changes, filtered with the built-in defaults.
+    NotRecorded,
+    /// A row that will not parse. Queries skip the delta merge entirely.
+    Unreadable,
+}
+
 pub fn cmd_status(args: StatusArgs) -> Result<()> {
     let store = Store::open(&args.db)?;
     let stats = store.get_stats()?;
@@ -73,7 +88,9 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
     // The exclusion policy the crawl ran under, replayed from what it stored.
     // Every query replays this too (design.md §5-1), so a surprising file count
     // is explainable from this report alone rather than from shell history.
-    let mut policy_missing = false;
+    // Two different failures with two different consequences at query time —
+    // see the warnings at the end of this function.
+    let mut policy_state = PolicyState::Present;
     match store.meta_get(walk::EXCLUDE_POLICY_KEY)? {
         Some(encoded) => match ExcludeSet::decode(&encoded) {
             Ok(excludes) => {
@@ -96,12 +113,12 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
                 );
             }
             Err(e) => {
-                policy_missing = true;
+                policy_state = PolicyState::Unreadable;
                 println!("exclusion      : (unreadable policy: {e:#})");
             }
         },
         None => {
-            policy_missing = true;
+            policy_state = PolicyState::NotRecorded;
             println!("exclusion      : (not recorded — crawled by an older sagasu)");
         }
     }
@@ -173,18 +190,34 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
     // indistinguishable. `index` and `fulltext` warn at build time, but the
     // build scrolls away and this report is what someone comes back to
     // (issue #15). Warnings go to stderr so the report itself stays parseable.
-    if policy_missing && stats.root_path.is_some() {
-        // The delta path falls back to the *default* set when no policy is
-        // recorded, which is only right for an index that was crawled with the
-        // defaults. An index built with `--exclude`, `--skip-hidden` or
-        // `--use-gitignore` by an older build disagrees with every query it
-        // now answers, and nothing else in this report would say so.
-        eprintln!(
-            "WARNING: this index does not carry a readable exclusion policy, so searches \
-             filter their live scan with the built-in defaults. If it was crawled with \
-             --exclude / --skip-hidden / --use-gitignore, those files can come back as \
-             live hits with no index row behind them — re-run `sagasu index <root>`."
-        );
+    if stats.root_path.is_some() {
+        // The two branches lead to different query behaviour, so they get
+        // different warnings. Sharing one sentence made this report describe
+        // something the `unreadable` case does not do.
+        match policy_state {
+            // No policy row: the delta path *does* run, filtered with the
+            // built-in defaults. That is only right for an index crawled with
+            // the defaults — an older build accepted `--exclude` and recorded
+            // nothing, so such an index disagrees with every answer it gives.
+            PolicyState::NotRecorded => eprintln!(
+                "WARNING: this index records no exclusion policy, so searches still merge \
+                 changes but filter their live scan with the built-in defaults. If it was \
+                 crawled with --exclude / --skip-hidden / --use-gitignore, files it never \
+                 indexed can come back as live hits with no index row behind them — \
+                 re-run `sagasu index <root>`."
+            ),
+            // A policy that exists but cannot be parsed: the delta query is not
+            // run at all, because filtering it differently from the crawl is
+            // the failure the policy exists to prevent. Searches answer from
+            // the index alone and say so.
+            PolicyState::Unreadable => eprintln!(
+                "WARNING: this index's exclusion policy cannot be read back, so searches \
+                 skip the delta query entirely and answer from the index alone (marked \
+                 stale). Anything created, edited or deleted since the crawl is missing \
+                 from every answer — re-run `sagasu index <root>`."
+            ),
+            PolicyState::Present => {}
+        }
     }
 
     if stats.root_path.is_none() {
