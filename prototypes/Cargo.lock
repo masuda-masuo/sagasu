@@ -3195,6 +3195,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-ftcompare"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ignore",
+ "lindera",
+ "lindera-tantivy",
+ "rusqlite",
+ "tantivy",
+ "winresource",
+]
+
+[[package]]
 name = "proto-fulltext"
 version = "0.1.0"
 dependencies = [
