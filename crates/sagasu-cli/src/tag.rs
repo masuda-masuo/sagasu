@@ -238,14 +238,23 @@ pub fn cmd_tags(args: TagsArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     let rows = tagindex::files_with_tags(&store, &tags, args.limit as i64)?;
+    let total = tagindex::count_files_with_tags(&store, &tags)?;
     let labels: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
     println!("tags    : {}", labels.join(" AND "));
-    println!("hits    : {}", rows.len());
+    // `N of M`, matching `sagasu search`. Printing the page length alone would
+    // present a `--limit` truncation as the answer, which is the same silent
+    // omission the freshness design exists to prevent — just at the other end.
+    println!("hits    : {} of {} files", rows.len(), total);
     for row in &rows {
         println!("{:>8}  {}", row.file_id, row.path);
     }
     if rows.is_empty() {
         println!("          (no live file carries all of these tags)");
+    } else if total > rows.len() as i64 {
+        println!(
+            "          ({} more — raise --limit/-n to see them)",
+            total - rows.len() as i64
+        );
     }
     Ok(())
 }
@@ -266,27 +275,40 @@ fn list_namespaces(store: &Store, limit: usize) -> Result<()> {
     }
     println!();
     println!("top tags (all namespaces):");
-    for tc in tagindex::tag_counts(store, None, limit as i64)? {
+    print_tag_counts(store, None, limit)
+}
+
+/// Print one facet list, saying how much of it is not on screen.
+fn print_tag_counts(store: &Store, namespace: Option<&str>, limit: usize) -> Result<()> {
+    let counts = tagindex::tag_counts(store, namespace, limit as i64)?;
+    let total = tagindex::tag_counts_total(store, namespace)?;
+    for tc in &counts {
         println!("  {:>7}  {}", tc.files, tc.tag);
+    }
+    // A facet list cut at `--limit` with nothing said about it reads as the
+    // whole axis, and "the tag I wanted is not in this namespace" is exactly
+    // the wrong conclusion to lead someone to.
+    if total > counts.len() as i64 {
+        println!(
+            "          ({} of {} tags shown — raise --limit/-n for the rest)",
+            counts.len(),
+            total
+        );
     }
     Ok(())
 }
 
 /// Print the values inside one namespace.
 fn list_tags(store: &Store, namespace: Option<&str>, limit: usize) -> Result<()> {
-    let counts = tagindex::tag_counts(store, namespace, limit as i64)?;
     match namespace {
         Some(ns) => println!("namespace: {ns}"),
         None => println!("namespace: (all)"),
     }
-    if counts.is_empty() {
+    if tagindex::tag_counts_total(store, namespace)? == 0 {
         println!("  (no tags — is the namespace spelled correctly? `sagasu tags` lists them)");
         return Ok(());
     }
-    for tc in counts {
-        println!("  {:>7}  {}", tc.files, tc.tag);
-    }
-    Ok(())
+    print_tag_counts(store, namespace, limit)
 }
 
 /// Explain one file: stored tags beside freshly computed ones.

@@ -449,36 +449,69 @@ pub fn tag_counts(store: &Store, namespace: Option<&str>, limit: i64) -> Result<
         .collect())
 }
 
-/// Live files carrying **all** of `tags`, ordered by `file_id`.
-pub fn files_with_tags(store: &Store, tags: &[Tag], limit: i64) -> Result<Vec<FileRow>> {
-    if tags.is_empty() {
-        bail!("no tags given");
-    }
+/// Drop repeated tags, keeping the first occurrence.
+///
+/// `sagasu tags kind:image kind:image` is a filter for one tag written twice,
+/// not an unsatisfiable one — but the `HAVING COUNT(DISTINCT t.tag_id) = N` test
+/// below counts *distinct* tag ids against the number of arguments, so a repeat
+/// makes the condition permanently unreachable and the answer a confident
+/// `hits: 0`. Removing the duplicate at the door is the only place the two
+/// numbers can be brought back into agreement.
+fn dedup_tags(tags: &[Tag]) -> Vec<Tag> {
+    let mut seen: std::collections::HashSet<&Tag> = std::collections::HashSet::new();
+    tags.iter()
+        .filter(|t| seen.insert(t))
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+/// The `file_id`s of live files carrying every one of `tags`, as a subquery and
+/// its bound values. Parameters `1..=2n` are the tag halves and `2n+1` is the
+/// count; a caller may bind `2n+2` for its own use.
+fn all_tags_subquery(tags: &[Tag]) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     let placeholders = (0..tags.len())
         .map(|i| format!("(?{}, ?{})", i * 2 + 1, i * 2 + 2))
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT f.file_id, f.path, f.ext, f.size, f.mtime_ns, f.ctime_ns, f.magic, f.blake3,
-                f.fs_id, f.last_seen_scan, f.deleted_at
-         FROM files f
-         JOIN file_tags ft ON ft.file_id = f.file_id
+        "SELECT ft.file_id
+         FROM file_tags ft
          JOIN tags t ON t.tag_id = ft.tag_id
+         JOIN files f ON f.file_id = ft.file_id
          WHERE f.deleted_at IS NULL AND (t.namespace, t.value) IN ({placeholders})
-         GROUP BY f.file_id
-         HAVING COUNT(DISTINCT t.tag_id) = ?{}
-         ORDER BY f.file_id
-         LIMIT ?{}",
-        tags.len() * 2 + 1,
-        tags.len() * 2 + 2
+         GROUP BY ft.file_id
+         HAVING COUNT(DISTINCT t.tag_id) = ?{}",
+        tags.len() * 2 + 1
     );
-
     let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(tags.len() * 2 + 2);
     for tag in tags {
         values.push(Box::new(tag.namespace().to_string()));
         values.push(Box::new(tag.value().to_string()));
     }
     values.push(Box::new(tags.len() as i64));
+    (sql, values)
+}
+
+/// Live files carrying **all** of `tags`, ordered by `file_id`, at most `limit`.
+///
+/// Pair this with [`count_files_with_tags`]: the length of what comes back is
+/// the size of the *page*, and reporting that as the number of matches is the
+/// same silent-omission failure the freshness design exists to prevent.
+pub fn files_with_tags(store: &Store, tags: &[Tag], limit: i64) -> Result<Vec<FileRow>> {
+    if tags.is_empty() {
+        bail!("no tags given");
+    }
+    let tags = dedup_tags(tags);
+    let (sub, mut values) = all_tags_subquery(&tags);
+    let sql = format!(
+        "SELECT f.file_id, f.path, f.ext, f.size, f.mtime_ns, f.ctime_ns, f.magic, f.blake3,
+                f.fs_id, f.last_seen_scan, f.deleted_at
+         FROM files f
+         WHERE f.file_id IN ({sub})
+         ORDER BY f.file_id
+         LIMIT ?{}",
+        tags.len() * 2 + 2
+    );
     values.push(Box::new(limit));
 
     let mut stmt = store.conn().prepare(&sql)?;
@@ -487,6 +520,37 @@ pub fn files_with_tags(store: &Store, tags: &[Tag], limit: i64) -> Result<Vec<Fi
         .query_map(params.as_slice(), crate::store::row_to_file_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// How many live files carry **all** of `tags` — the total behind the page
+/// [`files_with_tags`] returns.
+pub fn count_files_with_tags(store: &Store, tags: &[Tag]) -> Result<i64> {
+    if tags.is_empty() {
+        bail!("no tags given");
+    }
+    let tags = dedup_tags(tags);
+    let (sub, values) = all_tags_subquery(&tags);
+    let sql = format!("SELECT COUNT(*) FROM ({sub})");
+    let params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
+    let n = store
+        .conn()
+        .query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(n)
+}
+
+/// How many distinct tags [`tag_counts`] would have to choose from, before its
+/// `limit` cuts the list. A facet list that shows twenty of a hundred and eleven
+/// buckets without saying so reads as the whole axis.
+pub fn tag_counts_total(store: &Store, namespace: Option<&str>) -> Result<i64> {
+    let n = store.conn().query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT t.tag_id FROM tags t JOIN file_tags ft ON ft.tag_id = t.tag_id
+             WHERE (?1 IS NULL OR t.namespace = ?1)
+             GROUP BY t.tag_id)",
+        params![namespace],
+        |row| row.get(0),
+    )?;
+    Ok(n)
 }
 
 /// The stored tags of one file, with their source masks, in tag order.

@@ -615,6 +615,71 @@ fn filtering_by_several_tags_requires_all_of_them() {
 }
 
 #[test]
+fn the_same_tag_given_twice_is_one_condition_not_an_impossible_one() {
+    let (d, db) = tmp_dirs("dup_query");
+    build_corpus(&d);
+    crawl(&d, &db);
+    tag(&db, true);
+
+    let store = Store::open(db_path(&db)).unwrap();
+    let acme = sagasu_core::Tag::parse("path:acme-corp").unwrap();
+    let once = tagindex::files_with_tags(&store, std::slice::from_ref(&acme), 100).unwrap();
+    let twice = tagindex::files_with_tags(&store, &[acme.clone(), acme.clone(), acme.clone()], 100)
+        .unwrap();
+
+    // `HAVING COUNT(DISTINCT tag_id) = <argument count>` used to make a repeated
+    // argument unsatisfiable, so this answered a confident `hits: 0`.
+    assert_eq!(
+        once.iter().map(|r| r.file_id).collect::<Vec<_>>(),
+        twice.iter().map(|r| r.file_id).collect::<Vec<_>>(),
+        "writing a tag twice must not change the answer"
+    );
+    assert!(!twice.is_empty());
+    assert_eq!(
+        tagindex::count_files_with_tags(&store, &[acme.clone(), acme]).unwrap(),
+        once.len() as i64
+    );
+}
+
+#[test]
+fn the_hit_count_is_the_total_not_the_page() {
+    let (d, db) = tmp_dirs("hit_total");
+    for i in 0..7 {
+        write(&d, &format!("reports/r{i}.txt"), "body");
+    }
+    crawl(&d, &db);
+    tag(&db, true);
+
+    let store = Store::open(db_path(&db)).unwrap();
+    let tag = sagasu_core::Tag::parse("path:reports").unwrap();
+    let total = tagindex::count_files_with_tags(&store, std::slice::from_ref(&tag)).unwrap();
+    assert_eq!(total, 7);
+
+    // A page smaller than the match set must not be able to pass itself off as
+    // the match set: the count is what `sagasu tags` prints as `N of M`.
+    let page = tagindex::files_with_tags(&store, std::slice::from_ref(&tag), 3).unwrap();
+    assert_eq!(page.len(), 3);
+    assert_eq!(
+        tagindex::count_files_with_tags(&store, std::slice::from_ref(&tag)).unwrap(),
+        total,
+        "the total must not move with the page size"
+    );
+
+    // Same for the facet list: `tag_counts` is capped, `tag_counts_total` is not.
+    let all_path = tagindex::tag_counts_total(&store, Some("path")).unwrap();
+    assert!(all_path >= 1);
+    assert_eq!(
+        tagindex::tag_counts(&store, Some("path"), 1).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        tagindex::tag_counts_total(&store, None).unwrap(),
+        tagindex::tag_counts(&store, None, 10_000).unwrap().len() as i64,
+        "the uncapped list and the total must agree"
+    );
+}
+
+#[test]
 fn namespace_and_tag_counts_agree_with_what_was_written() {
     let (d, db) = tmp_dirs("counts");
     build_corpus(&d);
