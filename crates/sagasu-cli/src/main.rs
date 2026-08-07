@@ -1,9 +1,17 @@
 //! sagasu CLI — local file search engine.
 //!
 //! Subcommands:
-//! - `index`:  parallel metadata crawl + SQLite index.
-//! - `hash`:   backfill BLAKE3 content hashes for unhashed files.
-//! - `status`: print index statistics.
+//! - `index`:    parallel metadata crawl + SQLite index.
+//! - `hash`:     backfill BLAKE3 content hashes for unhashed files.
+//! - `fulltext`: extract bodies from the indexed files and build the tantivy
+//!   (Lindera) full-text index.
+//! - `search`:   keyword search over the full-text index, score-ordered.
+//! - `status`:   print index statistics.
+//!
+//! The pipeline order is `index` → (`hash`) → `fulltext` → `search`:
+//! `fulltext` reads the live rows of the metadata index rather than walking the
+//! filesystem again, so both stages share one exclusion set and one set of
+//! stable file IDs.
 
 use std::path::PathBuf;
 use std::process;
@@ -11,6 +19,7 @@ use std::process;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use sagasu_core::fulltext::{self, FulltextConfig, SearchConfig};
 use sagasu_core::{self, CrawlConfig, Store};
 
 #[derive(Parser)]
@@ -26,9 +35,16 @@ enum Command {
     Index(IndexArgs),
     /// Backfill BLAKE3 content hashes for files that don't have one yet.
     Hash(HashArgs),
+    /// Extract bodies from the indexed files and build the full-text index.
+    Fulltext(FulltextArgs),
+    /// Search the full-text index (score order, path + snippet).
+    Search(SearchArgs),
     /// Print index statistics.
     Status(StatusArgs),
 }
+
+/// Default location of the tantivy index, used by both `fulltext` and `search`.
+const DEFAULT_INDEX_DIR: &str = "fulltext-index";
 
 // ── index ───────────────────────────────────────────────────────────────────
 
@@ -139,6 +155,181 @@ fn cmd_hash(args: HashArgs) -> Result<()> {
     Ok(())
 }
 
+// ── fulltext ────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct FulltextArgs {
+    /// Path to the SQLite database file (source of the files to index).
+    #[arg(long, default_value = "index.db")]
+    db: PathBuf,
+
+    /// Directory the tantivy index is (re)built in.
+    #[arg(long, default_value = DEFAULT_INDEX_DIR)]
+    index_dir: PathBuf,
+
+    /// Skip files larger than this (bytes). Default 2 MiB.
+    #[arg(long, default_value_t = fulltext::DEFAULT_MAX_SIZE)]
+    max_size: u64,
+
+    /// Additional extension to treat as text (repeatable, no leading dot).
+    #[arg(long = "ext")]
+    ext: Vec<String>,
+
+    /// Only trust the extension allowlist; do not sniff unknown formats.
+    #[arg(long)]
+    no_sniff: bool,
+
+    /// Number of file-reading threads (0 = auto).
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+
+    /// tantivy writer memory budget in MiB.
+    #[arg(long, default_value_t = (fulltext::DEFAULT_HEAP_BYTES / (1024 * 1024)) as u64)]
+    heap_mb: u64,
+}
+
+fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
+    let config = FulltextConfig {
+        db_path: args.db,
+        index_dir: args.index_dir,
+        max_size: args.max_size,
+        extra_exts: args.ext,
+        no_sniff: args.no_sniff,
+        threads: args.threads,
+        heap_bytes: (args.heap_mb as usize) * 1024 * 1024,
+    };
+
+    let summary = fulltext::build(&config)?;
+
+    println!("candidates   : {}", summary.candidates);
+    println!("indexed      : {}", summary.indexed);
+    println!("  by ext     : {}", summary.accepted_by_ext);
+    println!("  by sniff   : {}", summary.accepted_by_sniff);
+
+    // Nothing is dropped silently: every candidate is either indexed or shows
+    // up here with a reason.
+    if !summary.skipped.is_empty() {
+        println!("skipped      : {}", summary.skipped_total());
+        for (reason, count) in &summary.skipped {
+            println!("  {}: {count}", reason.as_str());
+        }
+    }
+
+    println!("text bytes   : {:.1} MiB", mib(summary.text_bytes));
+    println!(
+        "index size   : {:.1} MiB ({})",
+        mib(summary.index_bytes),
+        config.index_dir.display()
+    );
+    if summary.text_bytes > 0 {
+        println!(
+            "index ratio  : {:.0}% of extracted text",
+            100.0 * summary.index_bytes as f64 / summary.text_bytes as f64
+        );
+    }
+    println!("elapsed      : {:.3}s", summary.elapsed_secs);
+
+    // An empty index is the failure that is hardest to notice from the outside:
+    // "indexed but not findable" and "never indexed" look identical at search
+    // time. Say so, and exit non-zero.
+    if summary.indexed == 0 {
+        eprintln!(
+            "WARNING: zero documents indexed. Every candidate was skipped (see the \
+             reasons above), or the metadata index is empty — run `sagasu index \
+             <root>` first, and consider `--ext <EXT>` if your text files use an \
+             extension sagasu does not know."
+        );
+        process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Bytes → MiB, for reporting.
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+// ── search ──────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct SearchArgs {
+    /// Query string (tantivy syntax: `AND` / `OR` / `"phrase"` / `-negation`).
+    query: String,
+
+    /// Directory of the tantivy index.
+    #[arg(long, default_value = DEFAULT_INDEX_DIR)]
+    index_dir: PathBuf,
+
+    /// Metadata database used to resolve hits back to their current path.
+    #[arg(long, default_value = "index.db")]
+    db: PathBuf,
+
+    /// Do not consult the metadata database (search the index alone).
+    #[arg(long)]
+    no_db: bool,
+
+    /// Maximum number of hits.
+    #[arg(long, short = 'n', default_value_t = 10)]
+    limit: usize,
+
+    /// Maximum snippet length in characters.
+    #[arg(long, default_value_t = 160)]
+    snippet_chars: usize,
+}
+
+fn cmd_search(args: SearchArgs) -> Result<()> {
+    // Resolving file_id → current path needs the database; skip it silently when
+    // the default path does not exist so a bare index directory still works.
+    let db_path = if args.no_db || !args.db.exists() {
+        None
+    } else {
+        Some(args.db)
+    };
+
+    let config = SearchConfig {
+        index_dir: args.index_dir,
+        db_path,
+        query: args.query,
+        limit: args.limit,
+        snippet_chars: args.snippet_chars,
+    };
+
+    let outcome = fulltext::search(&config)?;
+
+    println!("query   : {}", config.query);
+    println!(
+        "hits    : {} of {} docs ({:.1}ms match, {:.1}ms total)",
+        outcome.hits.len(),
+        outcome.total_docs,
+        outcome.match_ms,
+        outcome.elapsed_ms
+    );
+
+    for hit in &outcome.hits {
+        let mark = if hit.deleted { " [deleted]" } else { "" };
+        println!("{:>8.3}  {}{}", hit.score, hit.display_path(), mark);
+        // A moved file still resolves through its stable file_id; show where it
+        // went rather than printing a path that no longer exists.
+        if hit.current_path.is_some() {
+            println!("          (indexed as {})", hit.indexed_path);
+        }
+        if !hit.snippet.is_empty() {
+            println!("          {}", hit.snippet);
+        }
+    }
+
+    if outcome.total_docs == 0 {
+        eprintln!(
+            "WARNING: the full-text index is empty. Run `sagasu index <root>` then \
+             `sagasu fulltext`."
+        );
+        process::exit(1);
+    }
+
+    Ok(())
+}
+
 // ── status ──────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -171,6 +362,25 @@ fn cmd_status(args: StatusArgs) -> Result<()> {
     println!("tombstones     : {}", stats.tombstone_count);
     println!("NULL hashes    : {}", stats.null_hash_count);
 
+    // Full-text index state. Showing the generation it was built from makes a
+    // stale full-text index visible instead of leaving it to guesswork.
+    match stats.fulltext_dir {
+        Some(dir) => {
+            println!("full-text index: {dir}");
+            println!("  documents    : {}", stats.fulltext_docs.unwrap_or(0));
+            let ft_gen = stats.fulltext_scan_generation.unwrap_or(0);
+            let behind = stats.scan_generation - ft_gen;
+            if behind > 0 {
+                println!(
+                    "  built at gen : {ft_gen} ({behind} scan(s) behind — re-run `sagasu fulltext`)"
+                );
+            } else {
+                println!("  built at gen : {ft_gen} (current)");
+            }
+        }
+        None => println!("full-text index: (not built)"),
+    }
+
     Ok(())
 }
 
@@ -182,6 +392,8 @@ fn main() {
     let result = match cli.command {
         Command::Index(args) => cmd_index(args),
         Command::Hash(args) => cmd_hash(args),
+        Command::Fulltext(args) => cmd_fulltext(args),
+        Command::Search(args) => cmd_search(args),
         Command::Status(args) => cmd_status(args),
     };
 

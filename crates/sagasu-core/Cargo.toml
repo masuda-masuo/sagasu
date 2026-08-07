@@ -9,3 +9,6 @@ anyhow = { workspace = true }
 ignore = { workspace = true }
 rusqlite = { workspace = true }
 blake3 = { workspace = true }
+tantivy = { workspace = true }
+lindera = { workspace = true }
+lindera-tantivy = { workspace = true }

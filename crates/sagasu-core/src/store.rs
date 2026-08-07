@@ -85,6 +85,14 @@ pub struct IndexStats {
     pub live_count: i64,
     pub tombstone_count: i64,
     pub null_hash_count: i64,
+    /// Directory of the full-text (tantivy) index, if one has been built.
+    pub fulltext_dir: Option<String>,
+    /// Number of documents in the full-text index at build time.
+    pub fulltext_docs: Option<i64>,
+    /// Scan generation the full-text index was built from. Compare against
+    /// `scan_generation` to see whether the full-text index is behind the
+    /// metadata index.
+    pub fulltext_scan_generation: Option<i64>,
 }
 
 // ── Store ───────────────────────────────────────────────────────────────────
@@ -136,6 +144,13 @@ impl Store {
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    /// Remove a key from the `meta` table. Missing keys are a no-op.
+    pub fn meta_delete(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", params![key])?;
         Ok(())
     }
 
@@ -365,6 +380,43 @@ impl Store {
         Ok(n as u64)
     }
 
+    /// Look up any file (live or tombstoned) by its stable `file_id`.
+    ///
+    /// This is the SQLite side of the metadata ↔ full-text ID link: a tantivy
+    /// document carries `file_id`, and a search resolves it back through here to
+    /// get the *current* path and liveness.
+    pub fn find_by_file_id(&self, file_id: i64) -> Result<Option<FileRow>> {
+        self.conn
+            .query_row(
+                "SELECT file_id, path, ext, size, mtime_ns, ctime_ns, magic, blake3, fs_id,
+                        last_seen_scan, deleted_at
+                 FROM files WHERE file_id=?1",
+                params![file_id],
+                row_to_file_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Return up to `limit` live files with `file_id > after_id`, ordered by
+    /// `file_id`. Cursor-paged so the full-text builder can stream a large index
+    /// without materialising every row (and every 512-byte `magic` blob) at once.
+    pub fn get_live_files_batch(&self, after_id: i64, limit: i64) -> Result<Vec<FileRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, path, ext, size, mtime_ns, ctime_ns, magic, blake3, fs_id,
+                    last_seen_scan, deleted_at
+             FROM files
+             WHERE deleted_at IS NULL AND file_id > ?1
+             ORDER BY file_id
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![after_id, limit], row_to_file_row)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     // ── hash backfill ───────────────────────────────────────────────────────
 
     /// Return up to `limit` live files where `blake3` IS NULL and
@@ -448,6 +500,11 @@ impl Store {
             live_count,
             tombstone_count,
             null_hash_count,
+            fulltext_dir: self.meta_get("fulltext_dir")?,
+            fulltext_docs: self.meta_get("fulltext_docs")?.and_then(|s| s.parse().ok()),
+            fulltext_scan_generation: self
+                .meta_get("fulltext_scan_generation")?
+                .and_then(|s| s.parse().ok()),
         })
     }
 

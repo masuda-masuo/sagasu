@@ -44,6 +44,33 @@ CREATE TABLE IF NOT EXISTS access_history (
 | `magic` | `BLOB NULL` | `NULL` = not yet read. Non-`NULL` = first 512 bytes of file content. Filled only by `sagasu hash`. |
 | `fs_id` | `BLOB NULL` | Platform file identity. Unix: 16-byte `(dev_be, ino_be)`. Windows M0: `NULL`. Primary key for rename/move detection. |
 
+## `meta` keys
+
+| Key | Written by | Meaning |
+|-----|------------|---------|
+| `schema_version` | `sagasu index` | DDL version of this database. |
+| `root_path` | `sagasu index` | Canonical root of the last crawl. |
+| `scan_marker` | `sagasu index` | Unix ns at which the last crawl *started* (freshness marker, design.md §5). |
+| `scan_generation` | `sagasu index` | Monotonic crawl counter; `last_seen_scan` / `deleted_at` are stamped with it. |
+| `fulltext_dir` | `sagasu fulltext` | Canonical directory of the tantivy index built from this database. |
+| `fulltext_marker` | `sagasu fulltext` | Unix ns at which the full-text build started. |
+| `fulltext_docs` | `sagasu fulltext` | Number of documents written in that build. |
+| `fulltext_scan_generation` | `sagasu fulltext` | `scan_generation` the full-text index was built from. Less than `scan_generation` → the full-text index is behind the metadata index. |
+
+## Metadata ↔ full-text link
+
+The tantivy index stores `file_id`, `path`, `mtime_ns` and the extracted `body`.
+`file_id` is the join key: it is stable across rename and move and survives
+deletion as a tombstone, so a full-text hit produced by an older build still
+resolves to the current path (or is reported as deleted) without rebuilding the
+index. `sagasu search --db <db>` performs that resolution; without `--db` the
+path recorded at build time is shown as-is.
+
+The full-text stage reads live rows from this table rather than walking the
+filesystem, so the crawl's exclusion set is the *only* exclusion set. Which
+files get a body is then decided by extension allowlist → extension denylist →
+content sniffing, and every rejection is reported with a reason.
+
 ## Tombstone rule
 
 Deleted files become tombstones (`deleted_at` set to the scan generation in which they disappeared). Rows are **never** deleted.
