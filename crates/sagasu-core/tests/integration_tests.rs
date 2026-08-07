@@ -44,6 +44,8 @@ fn crawl(dir: &Path, db_dir: &Path) -> walk::CrawlSummary {
         db_path: db_path(db_dir),
         exclude: vec![],
         no_default_excludes: false,
+        hidden: Default::default(),
+        use_gitignore: false,
         threads: 1,
     })
     .unwrap()
@@ -61,6 +63,8 @@ fn crawl_exclude(
         db_path: db_path(db_dir),
         exclude,
         no_default_excludes: no_default,
+        hidden: Default::default(),
+        use_gitignore: false,
         threads: 1,
     })
     .unwrap()
@@ -905,6 +909,8 @@ fn db_inside_crawl_root_is_not_indexed() {
         db_path: db_file.clone(),
         exclude: vec![],
         no_default_excludes: false,
+        hidden: Default::default(),
+        use_gitignore: false,
         threads: 1,
     })
     .unwrap();
@@ -934,6 +940,8 @@ fn db_inside_crawl_root_is_not_indexed() {
         db_path: db_file.clone(),
         exclude: vec![],
         no_default_excludes: false,
+        hidden: Default::default(),
+        use_gitignore: false,
         threads: 1,
     })
     .unwrap();
@@ -961,6 +969,8 @@ fn failed_crawl_leaves_meta_intact() {
         db_path: db_path(&db),
         exclude: vec![],
         no_default_excludes: false,
+        hidden: Default::default(),
+        use_gitignore: false,
         threads: 1,
     });
     assert!(err.is_err(), "crawl of a missing root must fail");
@@ -1020,4 +1030,317 @@ fn meta_writes_are_transactional() {
         gen_after_rollback + 1,
         "committed generation bump must persist"
     );
+}
+
+// ── 31. A .gitignore is not consulted unless it is asked for (#14) ─────────
+
+/// Crawl with the exclusion knobs #14 introduced.
+fn crawl_scoped(
+    dir: &Path,
+    db_dir: &Path,
+    hidden: walk::HiddenPolicy,
+    use_gitignore: bool,
+) -> walk::CrawlSummary {
+    walk::crawl(CrawlConfig {
+        root: dir.to_path_buf(),
+        db_path: db_path(db_dir),
+        exclude: vec![],
+        no_default_excludes: false,
+        hidden,
+        use_gitignore,
+        threads: 1,
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_gitignore_is_ignored_by_default_and_only_prunes_directories_when_asked() {
+    let (d, db) = tmp_dir("gitignore");
+    // A realistic root .gitignore: one generated directory, one class of file
+    // people do not commit, one secret.
+    write_file(&d, ".gitignore", "dist/\n*.log\n.env\n");
+    write_file(&d, "dist/bundle.js", "generated");
+    write_file(&d, "app.log", "line one\n");
+    write_file(&d, ".env", "TOKEN=1\n");
+    write_file(&d, "README.md", "# hi\n");
+
+    // Default: the version-control rules say nothing about what is findable.
+    let s = crawl_scoped(&d, &db, walk::HiddenPolicy::Include, false);
+    assert_eq!(
+        s.indexed, 5,
+        "nothing is dropped by a .gitignore by default"
+    );
+    assert_eq!(s.skipped_gitignore, 0);
+
+    // Opt in: the generated *directory* goes, the files stay. "Do not commit"
+    // is not "do not find" — a log and a .env are things people search for.
+    let (d2, db2) = tmp_dir("gitignore_on");
+    write_file(&d2, ".gitignore", "dist/\n*.log\n.env\n");
+    write_file(&d2, "dist/bundle.js", "generated");
+    write_file(&d2, "app.log", "line one\n");
+    write_file(&d2, ".env", "TOKEN=1\n");
+    write_file(&d2, "README.md", "# hi\n");
+
+    let s2 = crawl_scoped(&d2, &db2, walk::HiddenPolicy::Include, true);
+    assert_eq!(s2.indexed, 4, "only dist/ is pruned");
+    assert_eq!(s2.skipped_gitignore, 1);
+    assert_eq!(s2.skipped_total(), 1);
+
+    let store = open_store(&db2);
+    let paths: Vec<String> = store
+        .find_paths_like("", 100)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    assert!(paths.iter().any(|p| p.ends_with("app.log")), "{paths:?}");
+    assert!(paths.iter().any(|p| p.ends_with(".env")), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("bundle.js")), "{paths:?}");
+}
+
+// ── 32. Dot directories are content, on every platform (#14) ──────────────
+
+#[test]
+fn dot_directories_are_indexed_even_when_hidden_entries_are_skipped() {
+    let (d, db) = tmp_dir("dotdirs");
+    write_file(&d, ".github/workflows/ci.yml", "on: push\n");
+    write_file(&d, ".config/app.toml", "[a]\n");
+    write_file(&d, ".opencode/notes.md", "# rule\n");
+    write_file(&d, "src/main.rs", "fn main() {}\n");
+
+    // Even with `--skip-hidden`, a leading dot is not a hidden attribute: this
+    // is the distinction issue #14 is about, and it must hold on Windows too,
+    // where the walker would otherwise inherit the `ignore` crate's default.
+    let s = crawl_scoped(&d, &db, walk::HiddenPolicy::SkipOsHidden, false);
+    assert_eq!(s.indexed, 4, "dot directories are content");
+    assert_eq!(s.skipped_hidden, 0);
+    assert_eq!(s.skipped_total(), 0);
+
+    let store = open_store(&db);
+    let hits = store.find_paths_like(".github", 10).unwrap();
+    assert_eq!(hits.len(), 1, "a file under .github must be findable");
+}
+
+// ── 33. The crawl's exclusion policy is what queries replay (#14) ─────────
+
+#[test]
+fn the_exclusion_policy_is_recorded_and_replayed_by_the_delta_path() {
+    use sagasu_core::delta::DeltaConfig;
+
+    let (d, db) = tmp_dir("policy_replay");
+    write_file(&d, "a.txt", "hi");
+    write_file(&d, "scratch/b.txt", "hi");
+    write_file(&d, ".gitignore", "dist/\n");
+
+    let summary = walk::crawl(CrawlConfig {
+        root: d.clone(),
+        db_path: db_path(&db),
+        exclude: vec!["scratch".to_string()],
+        no_default_excludes: false,
+        hidden: walk::HiddenPolicy::SkipOsHidden,
+        use_gitignore: true,
+        threads: 1,
+    })
+    .unwrap();
+    assert_eq!(summary.indexed, 2, "a.txt and .gitignore");
+
+    // The delta side must reconstruct the *same* set. Rebuilding "the defaults"
+    // instead is how `--exclude` used to disagree with every later query: the
+    // crawl never saw scratch/, the delta scan did, and a live hit appeared for
+    // a path with no index row behind it.
+    let store = open_store(&db);
+    let config = DeltaConfig::from_index(&store, &db_path(&db))
+        .unwrap()
+        .expect("the crawl recorded a root");
+    assert!(config.excludes.contains("scratch"));
+    assert_eq!(
+        config.excludes.hidden_policy(),
+        walk::HiddenPolicy::SkipOsHidden
+    );
+    assert!(config.excludes.uses_gitignore());
+    assert_eq!(
+        config
+            .excludes
+            .reason_for_path(&d.join("scratch/b.txt"), &d),
+        Some(walk::ExcludeReason::Name("scratch".to_string()))
+    );
+    assert_eq!(
+        config.excludes.reason_for_path(&d.join("dist/x.js"), &d),
+        Some(walk::ExcludeReason::Gitignore)
+    );
+    assert_eq!(config.excludes.reason_for_path(&d.join("a.txt"), &d), None);
+}
+
+// ── 34. An index written before policies existed still answers (#14) ──────
+
+#[test]
+fn an_index_without_a_recorded_policy_falls_back_to_the_defaults() {
+    use sagasu_core::delta::DeltaConfig;
+
+    let (d, db) = tmp_dir("policy_absent");
+    write_file(&d, "a.txt", "hi");
+    crawl(&d, &db);
+
+    // Simulate a database from before the policy row existed.
+    let store = open_store(&db);
+    store
+        .conn()
+        .execute("DELETE FROM meta WHERE key = 'exclude_policy'", [])
+        .unwrap();
+
+    let config = DeltaConfig::from_index(&store, &db_path(&db))
+        .unwrap()
+        .expect("root is still recorded");
+    assert!(config.excludes.contains("node_modules"));
+    assert_eq!(config.excludes.hidden_policy(), walk::HiddenPolicy::Include);
+    assert!(!config.excludes.uses_gitignore());
+}
+
+// ── 35. A query outlives an edited .gitignore (#14) ────────────────────────
+
+#[test]
+fn queries_keep_working_when_the_gitignore_changes_after_the_crawl() {
+    use sagasu_core::delta::DeltaConfig;
+
+    let (d, db) = tmp_dir("gitignore_edit");
+    write_file(&d, ".gitignore", "dist/\n");
+    write_file(&d, "dist/bundle.js", "generated");
+    write_file(&d, "README.md", "# hi\n");
+
+    let summary = crawl_scoped(&d, &db, walk::HiddenPolicy::Include, true);
+    assert_eq!(summary.indexed, 2);
+    assert_eq!(summary.skipped_gitignore, 1);
+
+    let root = open_store(&db)
+        .meta_get("root_path")
+        .unwrap()
+        .map(PathBuf::from)
+        .unwrap();
+
+    // Break it. The rules are the index's, not the file's, so nothing moves.
+    write_file(&d, ".gitignore", "build/{tmp\n");
+    let store = open_store(&db);
+    let config = DeltaConfig::from_index(&store, &db_path(&db))
+        .expect("an unparsable file on disk must not fail the query")
+        .unwrap();
+    assert_eq!(
+        config
+            .excludes
+            .reason_for_path(&root.join("dist").join("bundle.js"), &root),
+        Some(walk::ExcludeReason::Gitignore),
+    );
+
+    // Delete it. The delta scan must not suddenly widen to include the
+    // directory the crawl pruned — that would put a live hit on the screen for
+    // a file with no index row behind it.
+    fs::remove_file(d.join(".gitignore")).unwrap();
+    let config = DeltaConfig::from_index(&store, &db_path(&db))
+        .expect("a missing file must not fail the query")
+        .unwrap();
+    assert_eq!(config.excludes.gitignore_rules(), 1);
+    assert_eq!(
+        config
+            .excludes
+            .reason_for_path(&root.join("dist").join("bundle.js"), &root),
+        Some(walk::ExcludeReason::Gitignore),
+    );
+}
+
+// ── 36. An unreplayable exclusion policy is refused at crawl time (#14) ────
+
+#[test]
+fn an_exclude_name_that_cannot_be_replayed_fails_the_crawl_before_it_writes() {
+    let (d, db) = tmp_dir("bad_exclude");
+    write_file(&d, "a.txt", "hi");
+
+    let err = walk::crawl(CrawlConfig {
+        root: d.clone(),
+        db_path: db_path(&db),
+        exclude: vec!["foo\nbar".to_string()],
+        no_default_excludes: false,
+        hidden: Default::default(),
+        use_gitignore: false,
+        threads: 1,
+    })
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("line break"),
+        "unexpected error: {err:#}"
+    );
+
+    // And nothing was written: a crawl that reported success while making every
+    // later query fail is the failure this check exists to prevent.
+    let store = open_store(&db);
+    assert!(store.meta_get("root_path").unwrap().is_none());
+    assert!(store.meta_get(walk::EXCLUDE_POLICY_KEY).unwrap().is_none());
+}
+
+// ── 37. Unreadable entries are counted, not silently dropped (#14) ────────
+
+#[test]
+fn a_walk_error_is_counted_and_kept_out_of_the_skip_totals() {
+    let (d, db) = tmp_dir("walk_errors");
+    write_file(&d, "visible.txt", "hi");
+    write_file(&d, "locked/secret.txt", "hi");
+
+    // Only meaningful without the privilege that overrides file permissions;
+    // as root (and on Windows) a mode-000 directory is still readable, so the
+    // precondition is checked rather than assumed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = d.join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = fs::read_dir(&locked).is_err();
+
+        let summary = crawl(&d, &db);
+        // Restore before asserting so a failure does not leave an undeletable
+        // directory behind.
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+        if unreadable {
+            assert_eq!(summary.indexed, 1, "only visible.txt is reachable");
+            assert_eq!(summary.errors, 1, "the unopenable directory is counted");
+            assert_eq!(
+                summary.skipped_total(),
+                0,
+                "an unreadable entry is not an exclusion — nobody asked for it"
+            );
+            assert!(
+                summary.error_samples.iter().any(|s| s.contains("locked")),
+                "the sample must name the path: {:?}",
+                summary.error_samples
+            );
+            assert_eq!(
+                summary.scanned,
+                summary.indexed + summary.skipped_total() + summary.errors,
+                "scanned = indexed + skipped + errors"
+            );
+            // And it survives into the report someone reads later.
+            let store = open_store(&db);
+            assert_eq!(
+                store.meta_get(walk::SCAN_ERRORS_KEY).unwrap().as_deref(),
+                Some("1")
+            );
+        } else {
+            // Running with a privilege that ignores the mode: the walk sees
+            // everything, which is itself the identity we care about.
+            assert_eq!(summary.indexed, 2);
+            assert_eq!(summary.errors, 0);
+            assert_eq!(
+                summary.scanned,
+                summary.indexed + summary.skipped_total() + summary.errors
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let summary = crawl(&d, &db);
+        assert_eq!(
+            summary.scanned,
+            summary.indexed + summary.skipped_total() + summary.errors,
+            "scanned = indexed + skipped + errors"
+        );
+    }
 }

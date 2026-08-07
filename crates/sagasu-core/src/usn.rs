@@ -142,9 +142,14 @@ impl UsnDeltaSource {
     }
 
     /// True when a resolved path belongs to the indexed set.
+    ///
+    /// The full crawl policy, not just the name list: the journal is
+    /// volume-wide, so anything the crawl declined to index — a hidden tree, a
+    /// gitignored build directory — arrives here too and must be dropped by the
+    /// same rule that dropped it there.
     fn accepts(&self, path: &Path) -> bool {
         crate::delta::path_under(&self.root, path)
-            && self.excludes.matched_dir(path, &self.root).is_none()
+            && self.excludes.reason_for_path(path, &self.root).is_none()
             && !self
                 .skip_paths
                 .iter()
@@ -373,6 +378,10 @@ impl UsnDeltaSource {
             detects_renames: true,
             scanned,
             excluded,
+            // The journal read either succeeds or fails as a whole; there is no
+            // per-entry read to fail the way a directory walk has.
+            errors: 0,
+            error_samples: Vec::new(),
             elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
             marker: marker.clone(),
         })
@@ -390,6 +399,8 @@ fn failed(marker: &ScanMarker, reason: RescanReason, t0: Instant) -> DeltaSet {
         detects_renames: false,
         scanned: 0,
         excluded: 0,
+        errors: 0,
+        error_samples: Vec::new(),
         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
         marker: marker.clone(),
     }

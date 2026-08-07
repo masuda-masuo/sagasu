@@ -61,7 +61,6 @@ use crate::delta::{self, DeltaCache, DeltaSet, DeltaSourceKind, DeltaStatus, Res
 use crate::fulltext::{self, SearchConfig};
 use crate::store::{FileRow, Store};
 use crate::text::{self, ExtVerdict};
-use crate::walk::{self, ExcludeSet};
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -88,13 +87,14 @@ pub struct FreshConfig {
     pub snippet_chars: usize,
     /// Body-extraction size limit for the live grep ([`search`] only).
     pub max_size: u64,
-    /// Extra extensions the live grep treats as text ([`search`] only).
+    /// The extension policy the live grep judges changed files by ([`search`]
+    /// only).
     ///
-    /// Must match what `sagasu fulltext --ext` was built with. If the index
-    /// contains `.foo` files because the user asked for them, but the live grep
-    /// does not know about `.foo`, then editing one makes it vanish from the
-    /// result: the index hit is dropped as changed and no live hit replaces it.
-    pub extra_exts: Vec<String>,
+    /// Must match what `sagasu fulltext` was built with. If the index contains
+    /// `.foo` files because the user asked for them, but the live grep does not
+    /// know about `.foo`, then editing one makes it vanish from the result: the
+    /// index hit is dropped as changed and no live hit replaces it.
+    pub text_policy: text::TextPolicy,
 }
 
 impl FreshConfig {
@@ -109,7 +109,7 @@ impl FreshConfig {
             no_delta: false,
             snippet_chars: 160,
             max_size: fulltext::DEFAULT_MAX_SIZE,
-            extra_exts: Vec::new(),
+            text_policy: text::TextPolicy::empty(),
         }
     }
 }
@@ -224,6 +224,9 @@ pub struct DeltaReport {
     pub scanned: u64,
     /// Candidates dropped by the exclusion set (issue #16's noise ratio).
     pub excluded: u64,
+    /// Entries the scan could not read. Not exclusions: a directory the live
+    /// scan cannot open may hold changes this answer does not know about.
+    pub errors: u64,
     /// True when the set came from a [`DeltaCache`] rather than the source.
     pub cached: bool,
 }
@@ -250,6 +253,16 @@ pub struct FreshOutcome {
     pub live_read: usize,
     /// Documents in the full-text index ([`search`] only).
     pub total_docs: u64,
+    /// The extension rule the live grep actually applied ([`search`] only).
+    ///
+    /// Reported rather than assumed: which rule is in force decides whether an
+    /// edited file comes back refreshed or disappears, so the caller has to be
+    /// able to print it next to the answer.
+    pub text_policy: text::TextPolicy,
+    /// Set when the caller's extension rule and the one the index was built
+    /// with disagree ([`search`] only). Print it — a live grep that judges
+    /// files differently from the build is exactly how a file goes missing.
+    pub text_policy_notice: Option<String>,
     /// Stage-by-stage latency.
     pub timing: FreshTiming,
 }
@@ -349,6 +362,10 @@ pub fn find(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshOut
         dropped_deleted,
         live_read: 0,
         total_docs: 0,
+        // `find` matches on paths and never reads a body, so no extension rule
+        // is applied and none is claimed.
+        text_policy: text::TextPolicy::empty(),
+        text_policy_notice: None,
         timing,
     })
 }
@@ -380,6 +397,11 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
     };
     let ctx = DeltaContext::acquire(&store, config, cache, &mut timing)?;
 
+    // The extension rule the live grep judges changed files by. It comes from
+    // the index unless the caller stated one, so that a search run from another
+    // directory applies the same rule the build did (issue #15).
+    let (text_policy, text_policy_notice) = resolve_text_policy(&store, &config.text_policy);
+
     // Same over-fetch reasoning as `find`, plus tantivy's own limit semantics:
     // asking for exactly `limit` and then dropping half of them would silently
     // shorten the page.
@@ -405,8 +427,7 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
         if !entry.exists {
             continue;
         }
-        let Some(body) = read_body(&entry.path, entry.size, config.max_size, &config.extra_exts)
-        else {
+        let Some(body) = read_body(&entry.path, entry.size, config.max_size, &text_policy) else {
             continue;
         };
         live_read += 1;
@@ -481,8 +502,55 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
         dropped_deleted,
         live_read,
         total_docs: indexed.total_docs,
+        text_policy,
+        text_policy_notice,
         timing,
     })
+}
+
+/// Decide which extension rule the live grep applies, and whether to say
+/// something about it.
+///
+/// - The caller stated nothing → use what the full-text build recorded. This is
+///   the case that used to break: `sagasu fulltext` picks up `./sagasu-text.toml`
+///   automatically, and a `sagasu search` run from anywhere else did not, so the
+///   two sides silently disagreed.
+/// - The caller stated something → it wins, because an explicit `--ext` is the
+///   escape hatch for an index that is already built. Say so when it disagrees.
+/// - The recorded rule is unreadable → fall back to the caller's, and say so.
+///   A search that refuses to run is worse than one that explains itself.
+fn resolve_text_policy(
+    store: &Store,
+    requested: &text::TextPolicy,
+) -> (text::TextPolicy, Option<String>) {
+    let stored = match text::TextPolicy::from_index(store) {
+        Ok(stored) => stored,
+        Err(e) => {
+            return (
+                requested.clone(),
+                Some(format!(
+                    "the full-text index's extension policy could not be read back ({e:#}); \
+                     the live scan used {} instead",
+                    requested.describe()
+                )),
+            )
+        }
+    };
+
+    match stored {
+        Some(stored) if requested.is_empty() => (stored, None),
+        Some(stored) if !stored.agrees_with(requested) => {
+            let notice = format!(
+                "the full-text index was built with {} but this search was given {}; \
+                 the live scan used the latter, so a file the two disagree about is \
+                 answered differently depending on whether it changed since the build",
+                stored.describe(),
+                requested.describe()
+            );
+            (requested.clone(), Some(notice))
+        }
+        _ => (requested.clone(), None),
+    }
 }
 
 // ── Delta acquisition ───────────────────────────────────────────────────────
@@ -498,6 +566,12 @@ struct DeltaContext {
     cached: bool,
     /// Set when there is no usable marker: no delta can be taken at all.
     missing_marker: bool,
+    /// Set when the crawl's exclusion policy could not be read back, with the
+    /// reason. The query still answers — from the index alone, marked stale —
+    /// because refusing to search at all is a worse answer than an honestly
+    /// labelled partial one, and this failure can be caused by nothing more
+    /// than opening a newer index with an older binary.
+    policy_error: Option<String>,
 }
 
 impl DeltaContext {
@@ -512,6 +586,7 @@ impl DeltaContext {
                 set: None,
                 cached: false,
                 missing_marker: false,
+                policy_error: None,
             });
         }
 
@@ -520,23 +595,29 @@ impl DeltaContext {
                 set: None,
                 cached: false,
                 missing_marker: true,
+                policy_error: None,
             });
         };
-        let Some(root) = store.meta_get("root_path")? else {
-            return Ok(Self {
-                set: None,
-                cached: false,
-                missing_marker: true,
-            });
-        };
-
-        let delta_config = delta::DeltaConfig {
-            root: PathBuf::from(root),
-            // The crawl's own exclusion set. `sagasu index --exclude` is not
-            // replayed here yet — see the note in docs/design.md §5.
-            excludes: ExcludeSet::new(&[], false),
-            skip_paths: walk::db_sibling_paths(&config.db_path),
-            threads: 0,
+        // The crawl's own exclusion policy, replayed exactly — including
+        // `--exclude`, `--skip-hidden` and `--use-gitignore` (design.md §5-1).
+        let delta_config = match delta::DeltaConfig::from_index(store, &config.db_path) {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                return Ok(Self {
+                    set: None,
+                    cached: false,
+                    missing_marker: true,
+                    policy_error: None,
+                })
+            }
+            Err(e) => {
+                return Ok(Self {
+                    set: None,
+                    cached: false,
+                    missing_marker: false,
+                    policy_error: Some(format!("{e:#}")),
+                })
+            }
         };
         let source = delta::source_for(&delta_config);
 
@@ -554,6 +635,7 @@ impl DeltaContext {
             set: Some(set),
             cached,
             missing_marker: false,
+            policy_error: None,
         })
     }
 
@@ -576,11 +658,22 @@ impl DeltaContext {
             entries: s.entries.len(),
             scanned: s.scanned,
             excluded: s.excluded,
+            errors: s.errors,
             cached: self.cached,
         })
     }
 
     fn stale_notice(&self) -> Option<StaleNotice> {
+        if let Some(reason) = &self.policy_error {
+            return Some(StaleNotice {
+                kind: StaleKind::RescanRequired(RescanReason::PolicyUnreadable),
+                message: format!(
+                    "index is stale: the crawl's exclusion policy could not be read back \
+                     ({reason}), so changes since the crawl were not merged — \
+                     re-run `sagasu index <root>`"
+                ),
+            });
+        }
         if self.missing_marker {
             return Some(StaleNotice {
                 kind: StaleKind::RescanRequired(RescanReason::MarkerMissing),
@@ -710,17 +803,16 @@ fn order_and_truncate(
 /// Returning `None` (too large, binary, unreadable) is not a failure: it means
 /// the file has no body the full-text index would have contained either, so
 /// leaving it out of the live result keeps both sides of the merge consistent.
-fn read_body(path: &str, size: i64, max_size: u64, extra_exts: &[String]) -> Option<String> {
+fn read_body(path: &str, size: i64, max_size: u64, policy: &text::TextPolicy) -> Option<String> {
     if size <= 0 || size as u64 > max_size {
         return None;
     }
-    match text::classify_ext(
+    match policy.classify_ext(
         Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_lowercase)
             .as_deref(),
-        extra_exts,
     ) {
         ExtVerdict::Binary => None,
         ExtVerdict::Text => std::fs::read(path).ok().map(|b| text::decode(&b)),
@@ -729,5 +821,100 @@ fn read_body(path: &str, size: i64, max_size: u64, extra_exts: &[String]) -> Opt
             let head = &bytes[..text::SNIFF_LEN.min(bytes.len())];
             text::sniff_is_text(head).then(|| text::decode(&bytes))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with(policy: Option<&str>) -> (Store, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "sagasu_fresh_policy_{}_{:p}.db",
+            std::process::id(),
+            policy
+                .as_ref()
+                .map(|s| s.as_ptr())
+                .unwrap_or(std::ptr::null())
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        store.ensure_schema_version().unwrap();
+        if let Some(p) = policy {
+            store.meta_set(text::TEXT_POLICY_KEY, p).unwrap();
+        }
+        (store, path)
+    }
+
+    fn policy(exts: &[&str]) -> text::TextPolicy {
+        let mut p = text::TextPolicy::empty();
+        p.add_text_exts(&exts.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        p
+    }
+
+    #[test]
+    fn a_search_that_states_nothing_inherits_the_rule_the_index_was_built_with() {
+        // The case that used to break: `sagasu fulltext` picks up
+        // ./sagasu-text.toml, and a `sagasu search` run from another directory
+        // found no file and silently reverted to the built-in lists — so an
+        // edited `.tmpl` was judged binary by the live grep and disappeared
+        // from the answer instead of being refreshed (issue #15).
+        let (store, path) = store_with(Some(&policy(&["tmpl"]).encode()));
+        let (effective, notice) = resolve_text_policy(&store, &text::TextPolicy::empty());
+
+        assert_eq!(effective.text_exts(), ["tmpl"]);
+        assert!(notice.is_none(), "inheriting the index's rule is not news");
+        assert_eq!(effective.classify_ext(Some("tmpl")), text::ExtVerdict::Text);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_explicit_rule_wins_but_the_disagreement_is_reported() {
+        let (store, path) = store_with(Some(&policy(&["tmpl"]).encode()));
+        let (effective, notice) = resolve_text_policy(&store, &policy(&["hbs"]));
+
+        assert_eq!(
+            effective.text_exts(),
+            ["hbs"],
+            "--ext stays an escape hatch"
+        );
+        let notice = notice.expect("a disagreement must be reported");
+        assert!(
+            notice.contains("tmpl") && notice.contains("hbs"),
+            "{notice}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stating_the_same_rule_the_index_holds_is_not_a_disagreement() {
+        let (store, path) = store_with(Some(&policy(&["tmpl"]).encode()));
+        let (_, notice) = resolve_text_policy(&store, &policy(&[".TMPL"]));
+        assert!(notice.is_none(), "compared by effect, not by spelling");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_unreadable_recorded_rule_degrades_instead_of_failing_the_search() {
+        let (store, path) = store_with(Some("v99\ntext=tmpl\n"));
+        let (effective, notice) = resolve_text_policy(&store, &policy(&["hbs"]));
+
+        assert_eq!(effective.text_exts(), ["hbs"]);
+        assert!(
+            notice
+                .expect("must say so")
+                .contains("could not be read back"),
+            "a search that refuses to run is worse than one that explains itself"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_index_with_no_recorded_rule_leaves_the_caller_alone() {
+        let (store, path) = store_with(None);
+        let (effective, notice) = resolve_text_policy(&store, &policy(&["hbs"]));
+        assert_eq!(effective.text_exts(), ["hbs"]);
+        assert!(notice.is_none());
+        let _ = std::fs::remove_file(path);
     }
 }

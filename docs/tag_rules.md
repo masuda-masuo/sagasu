@@ -133,6 +133,11 @@ tags = ["doc-type:contract", "confidential:yes"]
 `--rules` を省略した場合はカレントディレクトリの `sagasu-tags.toml` を探し、
 **見つかっても見つからなくても、どちらだったかを 1 行目に出す**。
 
+このファイルはタグ生成だけの設定で、本文抽出の対象判定には効かない。
+拡張子の許可リストを広げるのは**別ファイル** `sagasu-text.toml` で、
+読むのも別のコマンド (`sagasu fulltext` / `sagasu search`) — `docs/index_scope.md` §2-2。
+形式は同じ TOML で、未知のキーがエラーなのも同じ理由による。
+
 ### 2-1. マッチの規則
 
 | キー | 意味 | 省略時 |

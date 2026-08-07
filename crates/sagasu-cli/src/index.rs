@@ -8,17 +8,22 @@
 //! work was performed", which is the failure that is otherwise invisible until
 //! query time.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
 use sagasu_core::fulltext::{self, FulltextConfig};
+use sagasu_core::text::{TextPolicy, DEFAULT_TEXT_CONFIG_FILE};
+use sagasu_core::walk::{ExcludeSet, HiddenPolicy};
 use sagasu_core::CrawlConfig;
 
 use crate::output::mib;
 use crate::DEFAULT_INDEX_DIR;
+
+/// How many entries of the skipped-extension breakdown to print.
+const SKIPPED_EXT_ROWS: usize = 8;
 
 // ── index ───────────────────────────────────────────────────────────────────
 
@@ -38,6 +43,17 @@ pub struct IndexArgs {
     /// Drop the built-in exclusion list (node_modules, target, .git, ...).
     #[arg(long)]
     no_default_excludes: bool,
+
+    /// Skip entries the OS marks hidden. Windows only in effect: a leading dot
+    /// is a naming convention, not a hidden attribute, and `.github/` and
+    /// `.config/` stay indexed on every platform.
+    #[arg(long)]
+    skip_hidden: bool,
+
+    /// Also apply the crawl root's .gitignore — directory rules only. Off by
+    /// default: "do not commit this" is not "do not find this".
+    #[arg(long)]
+    use_gitignore: bool,
 
     /// Number of walker threads (0 = auto).
     #[arg(long, default_value_t = 0)]
@@ -64,13 +80,26 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
         );
     }
 
+    let hidden = if args.skip_hidden {
+        HiddenPolicy::SkipOsHidden
+    } else {
+        HiddenPolicy::Include
+    };
+
     let config = CrawlConfig {
-        root,
+        root: root.clone(),
         db_path: args.db,
-        exclude: args.exclude,
+        exclude: args.exclude.clone(),
         no_default_excludes: args.no_default_excludes,
+        hidden,
+        use_gitignore: args.use_gitignore,
         threads: args.threads,
     };
+
+    // What the crawl is about to consider out of scope, before it says how much
+    // that came to. A count of exclusions without the rule that produced them
+    // cannot be argued with; the rule without the count cannot be believed.
+    print_scope(&config, &root)?;
 
     let summary = sagasu_core::walk::crawl(config)?;
 
@@ -82,17 +111,50 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
     println!("  renamed    : {}", summary.renamed);
     println!("  deleted    : {}", summary.deleted);
 
-    if !summary.skipped.is_empty() {
+    let skipped_total = summary.skipped_total();
+    if skipped_total > 0 {
+        println!("skipped      : {skipped_total}");
         // Sort by count descending, then by name.
         let mut skips: Vec<_> = summary.skipped.iter().collect();
         skips.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        println!("skipped      :");
         for (name, count) in skips {
             println!("  {name}: {count}");
+        }
+        if summary.skipped_hidden > 0 {
+            println!("  (os hidden): {}", summary.skipped_hidden);
+        }
+        if summary.skipped_gitignore > 0 {
+            println!("  (gitignore): {}", summary.skipped_gitignore);
+        }
+    }
+
+    // Not an exclusion: nobody asked for these to be dropped. An unreadable
+    // directory takes its whole subtree with it, and without this line the
+    // summary still adds up and the exit code is still 0.
+    if summary.errors > 0 {
+        println!("unreadable   : {}", summary.errors);
+        for sample in &summary.error_samples {
+            println!("  {sample}");
+        }
+        if summary.errors as usize > summary.error_samples.len() {
+            println!(
+                "  ({} more)",
+                summary.errors as usize - summary.error_samples.len()
+            );
         }
     }
 
     println!("elapsed      : {:.3}s", summary.elapsed_secs);
+
+    if summary.errors > 0 {
+        eprintln!(
+            "WARNING: {} entr(ies) could not be read and are missing from the index \
+             along with anything below them. They are not excluded — they were \
+             unreachable — so re-running after fixing permissions will change the \
+             file count.",
+            summary.errors
+        );
+    }
 
     // Zero files indexed = warning + non-zero exit.
     if summary.indexed == 0 {
@@ -103,6 +165,60 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
         process::exit(1);
     }
 
+    Ok(())
+}
+
+/// Print the exclusion policy the crawl is about to run under.
+///
+/// Rebuilding the [`ExcludeSet`] here rather than having `crawl` hand one back
+/// costs a `.gitignore` read; the alternative is printing the *arguments* and
+/// hoping they describe the same thing the core assembled. It also surfaces a
+/// broken `.gitignore` before the walk instead of after it.
+fn print_scope(config: &CrawlConfig, root: &Path) -> Result<()> {
+    let excludes = ExcludeSet::new(&config.exclude, config.no_default_excludes)
+        .with_hidden(config.hidden)
+        .with_gitignore(root, config.use_gitignore)?;
+    excludes.validate()?;
+
+    println!("root         : {}", root.display());
+    if excludes.names().is_empty() {
+        println!("excluded dirs: (none)");
+    } else {
+        println!("excluded dirs: {}", excludes.names().join(", "));
+    }
+    println!(
+        "hidden       : {}",
+        match excludes.hidden_policy() {
+            HiddenPolicy::Include => "indexed (dot-directories are content)".to_string(),
+            // Saying "skipped" on a platform with no hidden attribute would be a
+            // claim about a filter that cannot fire.
+            HiddenPolicy::SkipOsHidden if cfg!(windows) =>
+                "skipped when the OS marks them hidden".to_string(),
+            HiddenPolicy::SkipOsHidden => format!(
+                "--skip-hidden has no effect on {}: only Windows has a hidden attribute \
+                 (a leading dot is not one)",
+                std::env::consts::OS
+            ),
+        }
+    );
+    println!(
+        "gitignore    : {}",
+        if excludes.uses_gitignore() {
+            format!(
+                "{} rule(s) from the root .gitignore, directories only{}",
+                excludes.gitignore_rules(),
+                match excludes.gitignore_digest() {
+                    // The rules are copied into the index, so the file may
+                    // change afterwards without changing the answer. The digest
+                    // is what lets someone check which version was baked in.
+                    Some(d) => format!(" (digest {})", &d[..d.len().min(12)]),
+                    None => " (no .gitignore at the root)".to_string(),
+                }
+            )
+        } else {
+            "not applied".to_string()
+        }
+    );
     Ok(())
 }
 
@@ -149,6 +265,11 @@ pub struct FulltextArgs {
     #[arg(long = "ext")]
     ext: Vec<String>,
 
+    /// Text config file extending the extension lists (default:
+    /// ./sagasu-text.toml when present).
+    #[arg(long = "text-config")]
+    text_config: Option<PathBuf>,
+
     /// Only trust the extension allowlist; do not sniff unknown formats.
     #[arg(long)]
     no_sniff: bool,
@@ -162,16 +283,37 @@ pub struct FulltextArgs {
     heap_mb: u64,
 }
 
+/// Assemble the extension policy from the config file and the `--ext` flags.
+///
+/// The command line is applied last so it wins over the file. `explicit` is an
+/// error when missing (the user named it); the default file is only used when
+/// it exists, because "no config" is the normal case, not a mistake.
+pub(crate) fn load_text_policy(explicit: Option<&Path>, exts: &[String]) -> Result<TextPolicy> {
+    let mut policy = match explicit {
+        Some(path) => TextPolicy::load(path)?,
+        None if Path::new(DEFAULT_TEXT_CONFIG_FILE).is_file() => {
+            TextPolicy::load(DEFAULT_TEXT_CONFIG_FILE)?
+        }
+        None => TextPolicy::empty(),
+    };
+    policy.add_text_exts(exts);
+    Ok(policy)
+}
+
 pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
+    let text_policy = load_text_policy(args.text_config.as_deref(), &args.ext)?;
+
     let config = FulltextConfig {
         db_path: args.db,
         index_dir: args.index_dir,
         max_size: args.max_size,
-        extra_exts: args.ext,
+        text_policy,
         no_sniff: args.no_sniff,
         threads: args.threads,
         heap_bytes: (args.heap_mb as usize) * 1024 * 1024,
     };
+
+    print_text_policy(&config.text_policy);
 
     let summary = fulltext::build(&config)?;
 
@@ -186,6 +328,27 @@ pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
         println!("skipped      : {}", summary.skipped_total());
         for (reason, count) in &summary.skipped {
             println!("  {}: {count}", reason.as_str());
+        }
+    }
+
+    // …and the format skips are broken down by extension, because that is the
+    // form the user can act on: `--ext mjs`, or a line in the text config.
+    if !summary.skipped_exts.is_empty() {
+        println!("  by extension:");
+        for (ext, count) in summary.skipped_exts.iter().take(SKIPPED_EXT_ROWS) {
+            let label = if ext.is_empty() {
+                "(no extension)".to_string()
+            } else {
+                format!(".{ext}")
+            };
+            println!("    {label}: {count}");
+        }
+        let shown = SKIPPED_EXT_ROWS.min(summary.skipped_exts.len());
+        if summary.skipped_exts.len() > shown {
+            println!(
+                "    ({} more extension(s))",
+                summary.skipped_exts.len() - shown
+            );
         }
     }
 
@@ -217,4 +380,22 @@ pub fn cmd_fulltext(args: FulltextArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Say which extension policy the build ran under.
+///
+/// Printed even when it is empty. The lists are the reason a file is or is not
+/// in the index, and "I added `.tmpl` to a config file the tool never read" is
+/// otherwise indistinguishable from "sagasu ignored my `.tmpl` files".
+fn print_text_policy(policy: &TextPolicy) {
+    match policy.source() {
+        Some(path) => println!("text config  : {}", path.display()),
+        None => println!("text config  : (none)"),
+    }
+    if !policy.text_exts().is_empty() {
+        println!("  +text      : {}", policy.text_exts().join(", "));
+    }
+    if !policy.binary_exts().is_empty() {
+        println!("  +binary    : {}", policy.binary_exts().join(", "));
+    }
 }

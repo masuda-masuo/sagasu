@@ -76,6 +76,7 @@ const FULLTEXT_META_KEYS: &[&str] = &[
     "fulltext_marker",
     "fulltext_docs",
     "fulltext_scan_generation",
+    text::TEXT_POLICY_KEY,
 ];
 
 // ── Skip reasons ────────────────────────────────────────────────────────────
@@ -145,8 +146,9 @@ pub struct FulltextConfig {
     pub index_dir: PathBuf,
     /// Body-extraction size limit in bytes.
     pub max_size: u64,
-    /// Extra extensions to treat as text (extends the built-in allowlist).
-    pub extra_exts: Vec<String>,
+    /// The user's additions to the extension allow/denylists (`--ext` and the
+    /// text config file). The built-in lists always apply underneath.
+    pub text_policy: text::TextPolicy,
     /// Disable content sniffing: only the extension allowlist decides.
     pub no_sniff: bool,
     /// File-reading threads (0 = auto).
@@ -162,7 +164,7 @@ impl FulltextConfig {
             db_path: db_path.into(),
             index_dir: index_dir.into(),
             max_size: DEFAULT_MAX_SIZE,
-            extra_exts: Vec::new(),
+            text_policy: text::TextPolicy::empty(),
             no_sniff: false,
             threads: 0,
             heap_bytes: DEFAULT_HEAP_BYTES,
@@ -184,6 +186,15 @@ pub struct FulltextSummary {
     pub accepted_by_sniff: u64,
     /// Per-reason skip counts. Reasons with zero hits are omitted.
     pub skipped: BTreeMap<SkipReason, u64>,
+    /// Extensions of the files skipped for a *format* reason
+    /// ([`SkipReason::UnsupportedExt`] / [`SkipReason::BinaryContent`]),
+    /// most frequent first; `""` stands for "no extension".
+    ///
+    /// This is the actionable half of the skip report. "41 files skipped" does
+    /// not tell anyone what to do; "41 of them are `.mjs`" names the exact
+    /// `--ext` argument that changes the answer, which is the gap issue #15 was
+    /// opened about.
+    pub skipped_exts: Vec<(String, u64)>,
     /// Total decoded body bytes fed to the indexer.
     pub text_bytes: u64,
     /// On-disk size of the index directory after commit.
@@ -270,25 +281,37 @@ fn register_ja_tokenizer(index: &Index) -> Result<()> {
 
 // ── Build ───────────────────────────────────────────────────────────────────
 
-/// Shared, lock-free counters for the parallel extraction workers.
+/// Shared counters for the parallel extraction workers.
+///
+/// Lock-free apart from `skipped_exts`, which only a skipped file touches and
+/// which is what turns a count into something a user can act on.
 #[derive(Default)]
 struct Counters {
     by_ext: AtomicU64,
     by_sniff: AtomicU64,
     text_bytes: AtomicU64,
     skipped: [AtomicU64; 5],
+    skipped_exts: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Counters {
     fn skip(&self, reason: SkipReason) {
         self.skipped[reason.idx()].fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Record a skip that was a judgement about the file's *format*, keeping
+    /// the extension so the report can name it.
+    fn skip_format(&self, reason: SkipReason, ext: Option<&str>) {
+        self.skip(reason);
+        let key = ext.unwrap_or_default().to_string();
+        *self.skipped_exts.lock().unwrap().entry(key).or_insert(0) += 1;
+    }
 }
 
 /// Options the per-file extraction needs (a trimmed-down [`FulltextConfig`]).
 struct ExtractOpts {
     max_size: u64,
-    extra_exts: Vec<String>,
+    text_policy: text::TextPolicy,
     no_sniff: bool,
 }
 
@@ -344,7 +367,7 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
 
     let opts = ExtractOpts {
         max_size: config.max_size,
-        extra_exts: config.extra_exts.clone(),
+        text_policy: config.text_policy.clone(),
         no_sniff: config.no_sniff,
     };
     let counters = Counters::default();
@@ -418,6 +441,11 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
         "fulltext_scan_generation",
         &store.scan_generation().to_string(),
     )?;
+    // The rule this index was built under, so a later search judges a changed
+    // file the same way (issue #15). Without it the live grep falls back to the
+    // built-in lists whenever it is run from a directory with no config file in
+    // it, and an edit to a `.tmpl` deletes that file from the answer.
+    store.meta_set(text::TEXT_POLICY_KEY, &config.text_policy.encode())?;
     store.wal_checkpoint()?;
 
     let mut skipped = BTreeMap::new();
@@ -428,12 +456,24 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
         }
     }
 
+    // Most frequent first; ties broken by extension so the report is
+    // deterministic for the same corpus.
+    let mut skipped_exts: Vec<(String, u64)> = counters
+        .skipped_exts
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    skipped_exts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
     Ok(FulltextSummary {
         candidates,
         indexed,
         accepted_by_ext: counters.by_ext.load(Ordering::Relaxed),
         accepted_by_sniff: counters.by_sniff.load(Ordering::Relaxed),
         skipped,
+        skipped_exts,
         text_bytes: counters.text_bytes.load(Ordering::Relaxed),
         index_bytes,
         elapsed_secs,
@@ -460,9 +500,9 @@ fn extract_and_add(
         return Ok(());
     }
 
-    let (bytes, by_ext) = match text::classify_ext(row.ext.as_deref(), &opts.extra_exts) {
+    let (bytes, by_ext) = match opts.text_policy.classify_ext(row.ext.as_deref()) {
         ExtVerdict::Binary => {
-            counters.skip(SkipReason::UnsupportedExt);
+            counters.skip_format(SkipReason::UnsupportedExt, row.ext.as_deref());
             return Ok(());
         }
         ExtVerdict::Text => match std::fs::read(&row.path) {
@@ -474,7 +514,7 @@ fn extract_and_add(
         },
         ExtVerdict::Unknown => {
             if opts.no_sniff {
-                counters.skip(SkipReason::UnsupportedExt);
+                counters.skip_format(SkipReason::UnsupportedExt, row.ext.as_deref());
                 return Ok(());
             }
             // Prefer the `magic` bytes already captured by `sagasu hash`: when
@@ -490,7 +530,7 @@ fn extract_and_add(
                 },
             };
             if !text::sniff_is_text(&sample) {
-                counters.skip(SkipReason::BinaryContent);
+                counters.skip_format(SkipReason::BinaryContent, row.ext.as_deref());
                 return Ok(());
             }
             match std::fs::read(&row.path) {

@@ -105,27 +105,285 @@ pub enum ExtVerdict {
     Unknown,
 }
 
-/// Classify a file by extension alone.
-///
-/// `ext` is expected lowercased (the crawler stores it that way); the comparison
-/// is case-insensitive regardless. `extra` holds user-supplied extensions that
-/// extend the allowlist and always win over the denylist.
-pub fn classify_ext(ext: Option<&str>, extra: &[String]) -> ExtVerdict {
-    let Some(ext) = ext else {
-        // No extension at all (`Makefile`, `LICENSE`, `Dockerfile`, ...).
-        return ExtVerdict::Unknown;
-    };
+// ── User-extensible policy ──────────────────────────────────────────────────
 
-    if extra.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-        return ExtVerdict::Text;
+/// Filename looked for when no text config is named explicitly.
+pub const DEFAULT_TEXT_CONFIG_FILE: &str = "sagasu-text.toml";
+
+/// On-disk shape of the text config file. Unknown keys are an error for the
+/// same reason [`crate::tagrules`] rejects them: a file where `text_exts` was
+/// typed instead of `text_ext` must not load as a config that does nothing.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextConfigFile {
+    #[serde(default)]
+    text_ext: Vec<String>,
+    #[serde(default)]
+    binary_ext: Vec<String>,
+}
+
+/// The extension half of the body-extraction decision, plus the user's
+/// additions to it.
+///
+/// The built-in lists are long but they will always be a snapshot of the
+/// formats someone thought of. This type is how a user says "`.tmpl` is text
+/// here" without waiting for a release — issue #15's requirement that the
+/// allowlist be extensible, and the reason the sniffing path is a safety net
+/// rather than the only escape hatch.
+///
+/// Precedence, highest first:
+///
+/// 1. user text extensions — they override everything, including the built-in
+///    denylist, because the user is looking at the files and we are not;
+/// 2. user binary extensions;
+/// 3. the built-in [`TEXT_EXTS`] allowlist;
+/// 4. the built-in [`BINARY_EXTS`] denylist;
+/// 5. otherwise [`ExtVerdict::Unknown`] — the content decides.
+#[derive(Debug, Clone, Default)]
+pub struct TextPolicy {
+    text_ext: Vec<String>,
+    binary_ext: Vec<String>,
+    source: Option<std::path::PathBuf>,
+    digest: Option<String>,
+}
+
+impl TextPolicy {
+    /// The built-in lists with nothing added.
+    pub fn empty() -> Self {
+        Self::default()
     }
-    if TEXT_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-        return ExtVerdict::Text;
+
+    /// Add extensions to the allowlist (what `--ext` on the command line does).
+    /// A leading dot is tolerated so `--ext .mjs` behaves like `--ext mjs`.
+    pub fn add_text_exts(&mut self, exts: &[String]) {
+        for e in exts {
+            let e = normalize_ext(e);
+            if !e.is_empty() && !self.text_ext.iter().any(|x| x.eq_ignore_ascii_case(&e)) {
+                self.text_ext.push(e);
+            }
+        }
     }
-    if BINARY_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-        return ExtVerdict::Binary;
+
+    /// Add extensions to the denylist.
+    pub fn add_binary_exts(&mut self, exts: &[String]) {
+        for e in exts {
+            let e = normalize_ext(e);
+            if !e.is_empty() && !self.binary_ext.iter().any(|x| x.eq_ignore_ascii_case(&e)) {
+                self.binary_ext.push(e);
+            }
+        }
     }
-    ExtVerdict::Unknown
+
+    /// Load a text config file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or is not valid TOML with
+    /// only the known keys.
+    pub fn load(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read text config {}", path.display()))?;
+        let digest = blake3::hash(text.as_bytes()).to_hex().to_string();
+        let mut policy = Self::parse(&text)
+            .with_context(|| format!("invalid text config in {}", path.display()))?;
+        policy.source = Some(path.to_path_buf());
+        policy.digest = Some(digest);
+        Ok(policy)
+    }
+
+    /// Compile a policy from TOML text (the testable half of [`TextPolicy::load`]).
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let file: TextConfigFile = toml::from_str(text)?;
+        let mut policy = Self::empty();
+        policy.add_text_exts(&file.text_ext);
+        policy.add_binary_exts(&file.binary_ext);
+        Ok(policy)
+    }
+
+    /// Extensions the user added to the allowlist.
+    pub fn text_exts(&self) -> &[String] {
+        &self.text_ext
+    }
+
+    /// Extensions the user added to the denylist.
+    pub fn binary_exts(&self) -> &[String] {
+        &self.binary_ext
+    }
+
+    /// Whether the user added anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.text_ext.is_empty() && self.binary_ext.is_empty()
+    }
+
+    /// The file this policy was loaded from, if any.
+    pub fn source(&self) -> Option<&std::path::Path> {
+        self.source.as_deref()
+    }
+
+    /// BLAKE3 (hex) of the config file's bytes.
+    pub fn digest(&self) -> Option<&str> {
+        self.digest.as_deref()
+    }
+
+    /// Classify a file by extension alone.
+    ///
+    /// `ext` is expected lowercased (the crawler stores it that way); the
+    /// comparison is case-insensitive regardless.
+    pub fn classify_ext(&self, ext: Option<&str>) -> ExtVerdict {
+        let Some(ext) = ext else {
+            // No extension at all (`Makefile`, `LICENSE`, `Dockerfile`, ...).
+            return ExtVerdict::Unknown;
+        };
+
+        if self.text_ext.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+            return ExtVerdict::Text;
+        }
+        if self.binary_ext.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+            return ExtVerdict::Binary;
+        }
+        if TEXT_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+            return ExtVerdict::Text;
+        }
+        if BINARY_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+            return ExtVerdict::Binary;
+        }
+        ExtVerdict::Unknown
+    }
+}
+
+/// Lowercase an extension and drop a leading dot.
+fn normalize_ext(raw: &str) -> String {
+    raw.trim().trim_start_matches('.').to_lowercase()
+}
+
+/// Name of the `meta` row a [`TextPolicy`] is persisted under.
+pub const TEXT_POLICY_KEY: &str = "text_policy";
+
+impl TextPolicy {
+    /// Serialize for the `meta` table.
+    ///
+    /// The full-text index has to carry the rule it was built under, for the
+    /// same reason the crawl carries its exclusion policy: a live grep that
+    /// judges a changed file differently makes that file **disappear** from the
+    /// answer the moment it is edited — the index hit is dropped as changed and
+    /// no live hit replaces it. Auto-discovering `./sagasu-text.toml` at query
+    /// time cannot do that job, because a search run from another directory
+    /// finds no file and silently reverts to the built-in lists.
+    ///
+    /// Extensions are normalized to `[a-z0-9…]` with no whitespace, so the
+    /// line format needs no escaping.
+    pub fn encode(&self) -> String {
+        let mut out = String::from("v1\n");
+        if let Some(digest) = &self.digest {
+            out.push_str(&format!("digest={digest}\n"));
+        }
+        if let Some(source) = &self.source {
+            // Informational only — never re-read. It answers "which file was
+            // this?" in a report, not "what are the rules?".
+            out.push_str(&format!("source={}\n", source.display()));
+        }
+        for e in &self.text_ext {
+            out.push_str(&format!("text={e}\n"));
+        }
+        for e in &self.binary_ext {
+            out.push_str(&format!("binary={e}\n"));
+        }
+        out
+    }
+
+    /// Rebuild a policy written by [`TextPolicy::encode`]. Reads no files.
+    ///
+    /// Unknown keys and versions are errors, for the reasons spelled out on
+    /// [`crate::walk::ExcludeSet::decode`]; the caller degrades rather than
+    /// failing the query.
+    pub fn decode(text: &str) -> anyhow::Result<Self> {
+        use anyhow::bail;
+        let mut lines = text.lines();
+        match lines.next() {
+            Some("v1") => {}
+            other => bail!(
+                "unsupported text policy format {other:?} — this index was written by a \
+                 newer sagasu. Re-run `sagasu fulltext` with this build, or upgrade."
+            ),
+        }
+        let mut policy = Self::empty();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                bail!("malformed text policy line: {line:?}");
+            };
+            match key {
+                "digest" => policy.digest = Some(value.to_string()),
+                "source" => policy.source = Some(std::path::PathBuf::from(value)),
+                "text" => policy.text_ext.push(value.to_string()),
+                "binary" => policy.binary_ext.push(value.to_string()),
+                other => bail!(
+                    "unknown text policy key {other:?} — this index was written by a \
+                     newer sagasu. Re-run `sagasu fulltext` with this build, or upgrade."
+                ),
+            }
+        }
+        Ok(policy)
+    }
+
+    /// The policy the full-text index at `store` was built with, if it recorded
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row exists but cannot be parsed.
+    pub fn from_index(store: &crate::Store) -> anyhow::Result<Option<Self>> {
+        match store.meta_get(TEXT_POLICY_KEY)? {
+            Some(encoded) => Ok(Some(Self::decode(&encoded)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether two policies would classify every extension the same way.
+    ///
+    /// Compared by effect, not by provenance: two config files with different
+    /// names and the same lists agree, and that is the only thing a warning
+    /// about disagreement should care about.
+    pub fn agrees_with(&self, other: &Self) -> bool {
+        let norm = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v.dedup();
+            v
+        };
+        norm(&self.text_ext) == norm(&other.text_ext)
+            && norm(&self.binary_ext) == norm(&other.binary_ext)
+    }
+
+    /// One-line description for a report.
+    pub fn describe(&self) -> String {
+        if self.is_empty() {
+            return "built-in lists only".to_string();
+        }
+        let mut parts = Vec::new();
+        if !self.text_ext.is_empty() {
+            parts.push(format!("+text {}", self.text_ext.join(",")));
+        }
+        if !self.binary_ext.is_empty() {
+            parts.push(format!("+binary {}", self.binary_ext.join(",")));
+        }
+        match &self.source {
+            Some(p) => format!("{} ({})", parts.join(", "), p.display()),
+            None => parts.join(", "),
+        }
+    }
+}
+
+/// Classify a file by extension alone under the built-in lists only.
+///
+/// The shorthand for callers with no user policy to apply; everything that has
+/// one goes through [`TextPolicy::classify_ext`].
+pub fn classify_ext(ext: Option<&str>) -> ExtVerdict {
+    TextPolicy::empty().classify_ext(ext)
 }
 
 /// Decide whether a leading byte sample looks like UTF-8 text.
@@ -152,12 +410,28 @@ pub fn sniff_is_text(sample: &[u8]) -> bool {
         return false;
     }
 
-    // Control characters other than tab/LF/CR/FF/ESC should be rare in text.
+    // Control characters other than tab / LF / VT / FF / CR / ESC should be
+    // rare in text.
+    //
+    // ESC (0x1B) is deliberately *not* counted. An ANSI-coloured log or a
+    // terminal capture is full of it and is exactly the kind of file someone
+    // greps their own disk for; the earlier version counted it, which
+    // contradicted this comment and pushed the judgement in the direction of
+    // dropping text — the failure this project treats as the worst one.
+    //
+    // The denominator has a floor of [`SNIFF_LEN`]. Without it the ratio is
+    // brutal on short files: a 40-byte file with one stray control byte would
+    // be called binary, because one is more than 1% of forty. Reading it as
+    // "at most one control character per 512 bytes examined" keeps the same
+    // rule for a full sample and stops a tiny file from being judged on one
+    // byte.
     let control = sample
         .iter()
-        .filter(|&&b| (b < 0x09) || (0x0E..0x20).contains(&b) || b == 0x7F)
+        .filter(|&&b| {
+            (b < 0x09) || (0x0E..0x1B).contains(&b) || (0x1C..0x20).contains(&b) || b == 0x7F
+        })
         .count();
-    if control * 100 > sample.len() {
+    if control * 100 > sample.len().max(SNIFF_LEN) {
         return false;
     }
 
@@ -183,11 +457,17 @@ pub fn decode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn policy_with_text(exts: &[&str]) -> TextPolicy {
+        let mut p = TextPolicy::empty();
+        p.add_text_exts(&exts.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        p
+    }
+
     #[test]
     fn ext_allowlist_covers_the_esm_family() {
         for ext in ["mjs", "cjs", "jsx", "tsx", "mts", "cts"] {
             assert_eq!(
-                classify_ext(Some(ext), &[]),
+                classify_ext(Some(ext)),
                 ExtVerdict::Text,
                 "{ext} must be on the allowlist"
             );
@@ -197,21 +477,62 @@ mod tests {
     #[test]
     fn office_and_pdf_are_denylisted_not_unknown() {
         for ext in ["pdf", "docx", "xlsx", "pptx"] {
-            assert_eq!(classify_ext(Some(ext), &[]), ExtVerdict::Binary);
+            assert_eq!(classify_ext(Some(ext)), ExtVerdict::Binary);
         }
     }
 
     #[test]
     fn unknown_extension_falls_through_to_sniffing() {
-        assert_eq!(classify_ext(Some("wat"), &[]), ExtVerdict::Unknown);
-        assert_eq!(classify_ext(None, &[]), ExtVerdict::Unknown);
+        assert_eq!(classify_ext(Some("wat")), ExtVerdict::Unknown);
+        assert_eq!(classify_ext(None), ExtVerdict::Unknown);
     }
 
     #[test]
     fn user_extension_overrides_denylist() {
-        let extra = vec!["obj".to_string()];
-        assert_eq!(classify_ext(Some("obj"), &[]), ExtVerdict::Binary);
-        assert_eq!(classify_ext(Some("obj"), &extra), ExtVerdict::Text);
+        assert_eq!(classify_ext(Some("obj")), ExtVerdict::Binary);
+        assert_eq!(
+            policy_with_text(&["obj"]).classify_ext(Some("obj")),
+            ExtVerdict::Text
+        );
+    }
+
+    #[test]
+    fn a_leading_dot_and_upper_case_are_accepted_in_user_extensions() {
+        let p = policy_with_text(&[".TMPL"]);
+        assert_eq!(p.text_exts(), ["tmpl"]);
+        assert_eq!(p.classify_ext(Some("tmpl")), ExtVerdict::Text);
+        assert_eq!(p.classify_ext(Some("TMPL")), ExtVerdict::Text);
+    }
+
+    #[test]
+    fn a_config_file_extends_both_lists() {
+        let p = TextPolicy::parse(
+            r#"
+            text_ext   = ["tmpl", "ndjson"]
+            binary_ext = ["dat"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(p.classify_ext(Some("tmpl")), ExtVerdict::Text);
+        assert_eq!(p.classify_ext(Some("dat")), ExtVerdict::Binary);
+        // Something already on the built-in allowlist stays there.
+        assert_eq!(p.classify_ext(Some("md")), ExtVerdict::Text);
+    }
+
+    #[test]
+    fn a_typo_in_a_text_config_key_is_an_error_not_a_dead_config() {
+        // `text_exts` instead of `text_ext`: the file would otherwise load and
+        // silently add nothing, and the user would blame the sniffer.
+        let err = TextPolicy::parse(r#"text_exts = ["tmpl"]"#).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_text_config_is_valid_and_adds_nothing() {
+        assert!(TextPolicy::parse("").unwrap().is_empty());
     }
 
     #[test]
@@ -234,5 +555,49 @@ mod tests {
         let mut bytes = BOM_UTF8.to_vec();
         bytes.extend_from_slice("見出し".as_bytes());
         assert_eq!(decode(&bytes), "見出し");
+    }
+}
+
+#[cfg(test)]
+mod sniff_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn escape_sequences_do_not_make_a_coloured_log_binary() {
+        // An ANSI-coloured log is text someone greps their own disk for. The
+        // comment above `sniff_is_text` always said ESC was allowed; the code
+        // counted it, and the disagreement pushed the judgement toward dropping
+        // text — the failure this project treats as the worst one.
+        let mut log = Vec::new();
+        for i in 0..40 {
+            log.extend_from_slice(format!("\x1b[32mINFO\x1b[0m line {i}\n").as_bytes());
+        }
+        assert!(sniff_is_text(&log));
+    }
+
+    #[test]
+    fn a_short_file_is_not_condemned_by_a_single_control_byte() {
+        // `control * 100 > len` on a 40-byte file means one control character
+        // is more than 1% and the file is called binary. The floor of SNIFF_LEN
+        // reads the rule as "at most one per 512 bytes examined" instead.
+        let short = b"short text\x01 with one stray byte\n";
+        assert!(short.len() < SNIFF_LEN);
+        assert!(sniff_is_text(short));
+    }
+
+    #[test]
+    fn a_control_dense_sample_is_still_rejected() {
+        // The floor must not turn the check off: a small blob that is mostly
+        // control bytes is still binary.
+        let dense: Vec<u8> = (0..64)
+            .map(|i| if i % 2 == 0 { 0x01 } else { b'a' })
+            .collect();
+        assert!(!sniff_is_text(&dense));
+        // …and so is a full-length sample over the ratio.
+        let mut long = vec![b'a'; SNIFF_LEN];
+        for slot in long.iter_mut().take(8) {
+            *slot = 0x02;
+        }
+        assert!(!sniff_is_text(&long));
     }
 }

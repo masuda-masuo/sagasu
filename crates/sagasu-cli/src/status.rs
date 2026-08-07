@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
+use sagasu_core::walk::{self, ExcludeSet};
 use sagasu_core::Store;
 
 use crate::output::mib;
@@ -21,6 +22,21 @@ pub struct StatusArgs {
     /// Path to the SQLite database file.
     #[arg(long, default_value = "index.db")]
     db: PathBuf,
+}
+
+/// What the index says about the exclusion policy it was crawled with.
+///
+/// The three states are kept apart because they mean three different things at
+/// query time, and only one of them is fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyState {
+    /// Recorded and readable: every query replays exactly what the crawl used.
+    Present,
+    /// No row at all (an older build wrote this index). Queries still merge
+    /// changes, filtered with the built-in defaults.
+    NotRecorded,
+    /// A row that will not parse. Queries skip the delta merge entirely.
+    Unreadable,
 }
 
 pub fn cmd_status(args: StatusArgs) -> Result<()> {
@@ -69,6 +85,54 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
         None => println!("delta marker   : (none — searches cannot merge changes)"),
     }
 
+    // The exclusion policy the crawl ran under, replayed from what it stored.
+    // Every query replays this too (design.md §5-1), so a surprising file count
+    // is explainable from this report alone rather than from shell history.
+    // Two different failures with two different consequences at query time —
+    // see the warnings at the end of this function.
+    let mut policy_state = PolicyState::Present;
+    match store.meta_get(walk::EXCLUDE_POLICY_KEY)? {
+        Some(encoded) => match ExcludeSet::decode(&encoded) {
+            Ok(excludes) => {
+                println!("exclusion      : {} dir name(s)", excludes.names().len());
+                println!("  hidden       : {}", excludes.hidden_policy().as_str());
+                println!(
+                    "  gitignore    : {}",
+                    if excludes.uses_gitignore() {
+                        format!(
+                            "{} rule(s) baked in, directories only{}",
+                            excludes.gitignore_rules(),
+                            match excludes.gitignore_digest() {
+                                Some(d) => format!(" (digest {})", &d[..d.len().min(12)]),
+                                None => String::new(),
+                            }
+                        )
+                    } else {
+                        "not applied".to_string()
+                    }
+                );
+            }
+            Err(e) => {
+                policy_state = PolicyState::Unreadable;
+                println!("exclusion      : (unreadable policy: {e:#})");
+            }
+        },
+        None => {
+            policy_state = PolicyState::NotRecorded;
+            println!("exclusion      : (not recorded — crawled by an older sagasu)");
+        }
+    }
+
+    // Entries the last crawl could not read. Persisted because the crawl's own
+    // warning scrolls away and this is the report someone comes back to.
+    match store
+        .meta_get(walk::SCAN_ERRORS_KEY)?
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(n) if n > 0 => println!("unreadable     : {n} (as of the last crawl)"),
+        _ => {}
+    }
+
     println!("scan generation: {}", stats.scan_generation);
     println!("live files     : {}", stats.live_count);
     println!("tombstones     : {}", stats.tombstone_count);
@@ -76,10 +140,12 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
 
     // Full-text index state. Showing the generation it was built from makes a
     // stale full-text index visible instead of leaving it to guesswork.
-    match stats.fulltext_dir {
+    let fulltext_built = stats.fulltext_dir.is_some();
+    let fulltext_docs = stats.fulltext_docs.unwrap_or(0);
+    match &stats.fulltext_dir {
         Some(dir) => {
             println!("full-text index: {dir}");
-            println!("  documents    : {}", stats.fulltext_docs.unwrap_or(0));
+            println!("  documents    : {fulltext_docs}");
             let ft_gen = stats.fulltext_scan_generation.unwrap_or(0);
             let behind = stats.scan_generation - ft_gen;
             if behind > 0 {
@@ -115,6 +181,59 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
             }
         }
         None => println!("tags           : (not built)"),
+    }
+
+    // ── The empty index ─────────────────────────────────────────────────────
+    //
+    // A stage that indexed nothing reports a perfectly healthy-looking zero,
+    // and at query time "indexed but not findable" and "never indexed" are
+    // indistinguishable. `index` and `fulltext` warn at build time, but the
+    // build scrolls away and this report is what someone comes back to
+    // (issue #15). Warnings go to stderr so the report itself stays parseable.
+    if stats.root_path.is_some() {
+        // The two branches lead to different query behaviour, so they get
+        // different warnings. Sharing one sentence made this report describe
+        // something the `unreadable` case does not do.
+        match policy_state {
+            // No policy row: the delta path *does* run, filtered with the
+            // built-in defaults. That is only right for an index crawled with
+            // the defaults — an older build accepted `--exclude` and recorded
+            // nothing, so such an index disagrees with every answer it gives.
+            PolicyState::NotRecorded => eprintln!(
+                "WARNING: this index records no exclusion policy, so searches still merge \
+                 changes but filter their live scan with the built-in defaults. If it was \
+                 crawled with --exclude / --skip-hidden / --use-gitignore, files it never \
+                 indexed can come back as live hits with no index row behind them — \
+                 re-run `sagasu index <root>`."
+            ),
+            // A policy that exists but cannot be parsed: the delta query is not
+            // run at all, because filtering it differently from the crawl is
+            // the failure the policy exists to prevent. Searches answer from
+            // the index alone and say so.
+            PolicyState::Unreadable => eprintln!(
+                "WARNING: this index's exclusion policy cannot be read back, so searches \
+                 skip the delta query entirely and answer from the index alone (marked \
+                 stale). Anything created, edited or deleted since the crawl is missing \
+                 from every answer — re-run `sagasu index <root>`."
+            ),
+            PolicyState::Present => {}
+        }
+    }
+
+    if stats.root_path.is_none() {
+        eprintln!("WARNING: this database holds no crawl — run `sagasu index <root>` first.");
+    } else if stats.live_count == 0 {
+        eprintln!(
+            "WARNING: the metadata index contains zero live files. The root may be \
+             wrong, or the exclusion policy above may cover all of it — re-run \
+             `sagasu index <root>` and read the `skipped` breakdown."
+        );
+    } else if fulltext_built && fulltext_docs == 0 {
+        eprintln!(
+            "WARNING: the full-text index exists but holds zero documents, so every \
+             `sagasu search` answers empty. Re-run `sagasu fulltext` and read the \
+             `skipped` breakdown — `--ext <EXT>` or a text config file may be needed."
+        );
     }
 
     Ok(())

@@ -10,12 +10,11 @@
 //! and the stale notice are one thing the user reads as one block; splitting it
 //! per command is how a stale notice goes missing from one of them.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use sagasu_core::delta::{self, DeltaStatus};
 use sagasu_core::fresh::{FreshOutcome, HitOrigin};
 use sagasu_core::store::{IndexStats, Store};
-use sagasu_core::ExcludeSet;
 
 /// Bytes → MiB, for reporting.
 pub(crate) fn mib(bytes: u64) -> f64 {
@@ -43,6 +42,15 @@ pub(crate) fn print_fresh(outcome: &FreshOutcome) {
         );
         if let DeltaStatus::RescanRequired(reason) = d.status {
             println!("          rescan required: {}", reason.as_str());
+        }
+        // Unreadable entries are not exclusions: a directory the live scan
+        // could not open may hold changes this answer does not know about.
+        if d.errors > 0 {
+            println!(
+                "          note: {} entr(ies) were unreadable during the live scan, so \
+                 changes below them are not in this answer",
+                d.errors
+            );
         }
         // A source that cannot see renames makes a renamed file vanish from the
         // answer instead of moving in it. Saying so once beats letting the gap
@@ -202,8 +210,18 @@ fn print_tag_delta(store: &Store, opts: &TagFreshness<'_>, behind: i64) {
         return;
     }
 
-    let (marker, root) = match (store.delta_marker(), store.meta_get("root_path")) {
-        (Ok(Some(marker)), Ok(Some(root))) => (marker, root),
+    // The crawl's own exclusion policy, replayed from what it recorded — the
+    // same set the index was built with, not "the defaults" (design.md §5-1).
+    let (marker, config) = match (
+        store.delta_marker(),
+        delta::DeltaConfig::from_index(store, opts.db),
+    ) {
+        (Ok(Some(marker)), Ok(Some(config))) => (marker, config),
+        (_, Err(e)) => {
+            println!("delta   : (probe failed: {e:#})");
+            eprintln!("WARNING: could not replay the crawl's exclusion policy: {e:#}");
+            return;
+        }
         _ => {
             println!("delta   : (no freshness marker — cannot tell what changed)");
             eprintln!(
@@ -212,13 +230,6 @@ fn print_tag_delta(store: &Store, opts: &TagFreshness<'_>, behind: i64) {
             );
             return;
         }
-    };
-
-    let config = delta::DeltaConfig {
-        root: PathBuf::from(root),
-        excludes: ExcludeSet::new(&[], false),
-        skip_paths: sagasu_core::walk::db_sibling_paths(opts.db),
-        threads: 0,
     };
     let set = match delta::source_for(&config).changes_since(&marker, opts.delta_limit) {
         Ok(set) => set,
