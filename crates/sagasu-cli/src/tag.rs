@@ -14,13 +14,17 @@ use std::process;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use sagasu_core::config::Config;
 use sagasu_core::delta;
 use sagasu_core::store::Store;
 use sagasu_core::tagindex::{self, TagConfig};
-use sagasu_core::tagrules::{RuleSet, DEFAULT_RULES_FILE};
 use sagasu_core::tags::{self, Tag, TagSource};
 
-use crate::output::{print_tag_freshness, TagFreshness};
+use crate::index::{load_config, reject_removed_config_flag};
+use crate::json;
+use crate::output::{
+    print_tag_freshness, tag_freshness, Output, Report, TagFreshness, TagFreshnessReport,
+};
 
 // ── sagasu tag ──────────────────────────────────────────────────────────────
 
@@ -31,9 +35,15 @@ pub struct TagArgs {
     #[arg(long, default_value = "index.db")]
     db: PathBuf,
 
-    /// User-defined rule file (TOML). Defaults to `./sagasu-tags.toml` when it
-    /// exists; the summary always says which file was used, or that none was.
+    /// Config file whose `[[tags.rule]]` tables define the user rules
+    /// (default: ./sagasu.toml when it exists). The summary always says which
+    /// file was used, or that none was. See docs/cli.md §5.
     #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Removed in issue #6: the two config files were merged into `sagasu.toml`
+    /// and this flag became `--config`.
+    #[arg(long, hide = true)]
     rules: Option<PathBuf>,
 
     /// Do **not** read the leading bytes of files whose `magic` column is NULL.
@@ -69,44 +79,25 @@ pub struct TagArgs {
     embedded_max_size: u64,
 }
 
-/// Resolve the rule file: explicit flag, else the conventional file in the
-/// working directory, else none. Returns the path and whether it was discovered
-/// rather than named.
-fn resolve_rules(explicit: Option<PathBuf>) -> (Option<PathBuf>, bool) {
-    match explicit {
-        Some(p) => (Some(p), false),
-        None => {
-            let candidate = PathBuf::from(DEFAULT_RULES_FILE);
-            if candidate.is_file() {
-                (Some(candidate), true)
-            } else {
-                (None, false)
-            }
-        }
-    }
-}
-
 /// Run `sagasu tag`.
-pub fn cmd_tag(args: TagArgs) -> Result<()> {
-    let (rules_path, discovered) = resolve_rules(args.rules);
+pub fn cmd_tag(args: TagArgs, mode: Output) -> Result<()> {
+    let mut report = Report::new(mode);
+    reject_removed_config_flag("--rules", args.rules.as_deref())?;
 
-    // Say what rule set is in force *before* the pass, not only after: a run
-    // that quietly used no rules and a run that used the wrong ones look the
-    // same in the numbers afterwards.
-    match (&rules_path, discovered) {
-        (Some(p), true) => println!(
-            "rules        : {} (found in the working directory)",
-            p.display()
-        ),
-        (Some(p), false) => println!("rules        : {}", p.display()),
-        (None, _) => {
-            println!("rules        : (none — pass --rules <FILE> or put {DEFAULT_RULES_FILE} here)")
-        }
+    // Resolved here rather than inside the build so the report can name the
+    // file *before* the pass, not only after: a run that quietly used no rules
+    // and a run that used the wrong ones look the same in the numbers.
+    // `Config::resolve` is also what refuses to run next to a pre-#6 config
+    // file, and that has to happen before anything is written.
+    let origin = Config::resolve(args.config.as_deref())?.origin().clone();
+
+    if !report.is_json() {
+        println!("config       : {}", origin.describe());
     }
 
     let config = TagConfig {
         db_path: args.db,
-        rules_path,
+        rules_path: origin.path().map(|p| p.to_path_buf()),
         read_magic: !args.no_read_magic,
         magic_max_size: args.magic_max_size,
         read_embedded: !args.no_read_embedded,
@@ -115,6 +106,37 @@ pub fn cmd_tag(args: TagArgs) -> Result<()> {
 
     let summary = tagindex::build(&config)?;
 
+    if !report.is_json() {
+        print_tag_summary(&summary, &config);
+    }
+
+    // An index whose tags are all empty is indistinguishable at query time from
+    // one that was never tagged. Say which it is.
+    if summary.files == 0 {
+        report.warn("the metadata index holds no live files. Run `sagasu index <root>` first.");
+    } else if summary.tagged == 0 {
+        report.warn("no file received a tag. This is almost certainly a bug — report it.");
+    }
+
+    if report.is_json() {
+        json::tag(
+            &origin,
+            &summary,
+            config.read_magic,
+            config.read_embedded,
+            &report,
+        );
+    }
+
+    if summary.files == 0 || summary.tagged == 0 {
+        process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// The human rendering of a tag build.
+fn print_tag_summary(summary: &sagasu_core::TagSummary, config: &TagConfig) {
     println!("files        : {}", summary.files);
     println!(
         "tagged       : {} ({:.1}%)",
@@ -207,21 +229,6 @@ pub fn cmd_tag(args: TagArgs) -> Result<()> {
     }
 
     println!("elapsed      : {:.3}s", summary.elapsed_secs);
-
-    // An index whose tags are all empty is indistinguishable at query time from
-    // one that was never tagged. Say which it is.
-    if summary.files == 0 {
-        eprintln!(
-            "WARNING: the metadata index holds no live files. Run `sagasu index <root>` first."
-        );
-        process::exit(1);
-    }
-    if summary.tagged == 0 {
-        eprintln!("WARNING: no file received a tag. This is almost certainly a bug — report it.");
-        process::exit(1);
-    }
-
-    Ok(())
 }
 
 // ── sagasu tags ─────────────────────────────────────────────────────────────
@@ -243,8 +250,14 @@ pub struct TagsArgs {
     #[arg(long)]
     file: Option<PathBuf>,
 
-    /// Rule file used when explaining a file (same defaulting as `sagasu tag`).
+    /// Config file used when explaining a file (same defaulting as
+    /// `sagasu tag`). See docs/cli.md §5.
     #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Removed in issue #6: the two config files were merged into `sagasu.toml`
+    /// and this flag became `--config`.
+    #[arg(long, hide = true)]
     rules: Option<PathBuf>,
 
     /// Maximum number of rows.
@@ -262,12 +275,16 @@ pub struct TagsArgs {
 }
 
 /// Run `sagasu tags`.
-pub fn cmd_tags(args: TagsArgs) -> Result<()> {
+pub fn cmd_tags(args: TagsArgs, mode: Output) -> Result<()> {
+    let mut report = Report::new(mode);
+    reject_removed_config_flag("--rules", args.rules.as_deref())?;
+
     let store = Store::open(&args.db)
         .with_context(|| format!("failed to open metadata index {:?}", args.db))?;
+    let db = args.db.display().to_string();
 
     let stats = store.get_stats()?;
-    print_tag_freshness(
+    let freshness = tag_freshness(
         &store,
         &stats,
         &TagFreshness {
@@ -275,10 +292,21 @@ pub fn cmd_tags(args: TagsArgs) -> Result<()> {
             no_fresh: args.no_fresh,
             delta_limit: args.delta_limit,
         },
+        &mut report,
     );
+    if !report.is_json() {
+        print_tag_freshness(&freshness);
+    }
 
     if let Some(file) = &args.file {
-        return explain_file(&store, file, args.rules.clone());
+        return explain_file(
+            &store,
+            file,
+            args.config.as_deref(),
+            &db,
+            &freshness,
+            &mut report,
+        );
     }
 
     // `namespace:` (empty value) means "list this namespace".
@@ -288,12 +316,10 @@ pub fn cmd_tags(args: TagsArgs) -> Result<()> {
     };
 
     if args.query.is_empty() {
-        list_namespaces(&store, args.limit)?;
-        return Ok(());
+        return list_namespaces(&store, args.limit, &db, &freshness, &mut report);
     }
     if let Some(ns) = namespace_only {
-        list_tags(&store, Some(ns), args.limit)?;
-        return Ok(());
+        return list_tags(&store, Some(ns), args.limit, &db, &freshness, &mut report);
     }
 
     // Otherwise: files carrying all of the given tags.
@@ -318,80 +344,117 @@ pub fn cmd_tags(args: TagsArgs) -> Result<()> {
         tagindex::partition_existing(page)
     };
 
-    let labels: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
-    println!("tags    : {}", labels.join(" AND "));
-    // `N of M`, matching `sagasu search`. Printing the page length alone would
-    // present a `--limit` truncation as the answer, which is the same silent
-    // omission the freshness design exists to prevent — just at the other end.
-    println!("hits    : {} of {} files", rows.len(), total);
-    for row in &rows {
-        println!("{:>8}  {}", row.file_id, row.path);
-    }
+    if report.is_json() {
+        json::tags_files(&db, &tags, &freshness, &rows, &gone, total, fetched);
+    } else {
+        let labels: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
+        println!("tags    : {}", labels.join(" AND "));
+        // `N of M`, matching `sagasu search`. Printing the page length alone
+        // would present a `--limit` truncation as the answer, which is the same
+        // silent omission the freshness design exists to prevent — just at the
+        // other end.
+        println!("hits    : {} of {} files", rows.len(), total);
+        for row in &rows {
+            println!("{:>8}  {}", row.file_id, row.path);
+        }
 
-    if !gone.is_empty() {
-        // Named, not just counted: "two rows were stale" and "these two paths no
-        // longer exist" are different amounts of help when the next step is
-        // deciding whether to re-index.
-        println!(
-            "dropped : {} of the {fetched} row(s) on this page no longer exist on disk",
-            gone.len()
-        );
-        for row in &gone {
+        if !gone.is_empty() {
+            // Named, not just counted: "two rows were stale" and "these two
+            // paths no longer exist" are different amounts of help when the next
+            // step is deciding whether to re-index.
             println!(
-                "{:>8}  {}  (deleted since the index was built)",
-                row.file_id, row.path
+                "dropped : {} of the {fetched} row(s) on this page no longer exist on disk",
+                gone.len()
+            );
+            for row in &gone {
+                println!(
+                    "{:>8}  {}  (deleted since the index was built)",
+                    row.file_id, row.path
+                );
+            }
+        }
+
+        if rows.is_empty() && gone.is_empty() {
+            println!("          (no live file carries all of these tags)");
+        }
+        if total > fetched {
+            println!(
+                "          ({} more — raise --limit/-n to see them)",
+                total - fetched
+            );
+        }
+        // The total comes from the index and was never existence-checked, so it
+        // can only ever be an upper bound. Say which number was verified and
+        // which was not, rather than letting `of {total}` read as a fact.
+        //
+        // Only under `--no-fresh` would this be a lie in the other direction:
+        // there *are* no rows that were checked against the filesystem, so
+        // claiming the listed ones were is worse than saying nothing. That
+        // mode's stderr warning already states that nothing was checked.
+        if !gone.is_empty() {
+            println!(
+                "          (the {total} total is the indexed count — an upper bound; \
+                 only the rows above were checked against the filesystem)"
             );
         }
     }
 
-    if rows.is_empty() && gone.is_empty() {
-        println!("          (no live file carries all of these tags)");
-    }
-    if total > fetched {
-        println!(
-            "          ({} more — raise --limit/-n to see them)",
-            total - fetched
-        );
-    }
-    // The total comes from the index and was never existence-checked, so it can
-    // only ever be an upper bound. Say which number was verified and which was
-    // not, rather than letting `of {total}` read as a fact.
-    //
-    // Only under `--no-fresh` would this be a lie in the other direction: there
-    // *are* no rows that were checked against the filesystem, so claiming the
-    // listed ones were is worse than saying nothing. That mode's stderr warning
-    // already states that nothing was checked.
-    if !gone.is_empty() {
-        println!(
-            "          (the {total} total is the indexed count — an upper bound; \
-             only the rows above were checked against the filesystem)"
-        );
-    }
-
     if args.no_fresh {
-        eprintln!(
-            "WARNING: --no-fresh: the listed paths were not checked against the \
+        report.warn(
+            "--no-fresh: the listed paths were not checked against the \
              filesystem, so files deleted since the index was built are listed as \
-             if they still existed."
+             if they still existed.",
         );
     } else if !gone.is_empty() {
-        eprintln!(
-            "WARNING: index is stale: {} of the files carrying these tags have been \
+        report.warn(format!(
+            "index is stale: {} of the files carrying these tags have been \
              deleted since it was built — re-run `sagasu index <root>` and \
              `sagasu tag`.",
             gone.len()
-        );
+        ));
+    }
+
+    if report.is_json() {
+        json::warnings(&report);
     }
     Ok(())
 }
 
-/// Print the namespace overview: the top level of the facet tree.
-fn list_namespaces(store: &Store, limit: usize) -> Result<()> {
+/// The namespace overview: the top level of the facet tree.
+fn list_namespaces(
+    store: &Store,
+    limit: usize,
+    db: &str,
+    freshness: &TagFreshnessReport,
+    report: &mut Report,
+) -> Result<()> {
     let namespaces = tagindex::namespace_counts(store)?;
     if namespaces.is_empty() {
-        eprintln!("WARNING: no tags in this index. Run `sagasu tag` first.");
+        report.warn("no tags in this index. Run `sagasu tag` first.");
+        if report.is_json() {
+            json::tags_counts(db, "namespaces", None, freshness, &[], &[], 0);
+            json::warnings(report);
+        }
         process::exit(1);
     }
+
+    let counts = tagindex::tag_counts(store, None, limit as i64)?;
+    let total = tagindex::tag_counts_total(store, None)?;
+
+    if report.is_json() {
+        json::tags_counts(
+            db,
+            "namespaces",
+            None,
+            freshness,
+            &namespaces,
+            &counts,
+            total,
+        );
+        json::warnings(report);
+        return Ok(());
+    }
+
     println!("namespaces:");
     for ns in &namespaces {
         println!(
@@ -401,14 +464,13 @@ fn list_namespaces(store: &Store, limit: usize) -> Result<()> {
     }
     println!();
     println!("top tags (all namespaces):");
-    print_tag_counts(store, None, limit)
+    print_tag_counts(&counts, total);
+    Ok(())
 }
 
 /// Print one facet list, saying how much of it is not on screen.
-fn print_tag_counts(store: &Store, namespace: Option<&str>, limit: usize) -> Result<()> {
-    let counts = tagindex::tag_counts(store, namespace, limit as i64)?;
-    let total = tagindex::tag_counts_total(store, namespace)?;
-    for tc in &counts {
+fn print_tag_counts(counts: &[tagindex::TagCount], total: i64) {
+    for tc in counts {
         println!("  {:>7}  {}", tc.files, tc.tag);
     }
     // A facet list cut at `--limit` with nothing said about it reads as the
@@ -421,29 +483,54 @@ fn print_tag_counts(store: &Store, namespace: Option<&str>, limit: usize) -> Res
             total
         );
     }
-    Ok(())
 }
 
-/// Print the values inside one namespace.
-fn list_tags(store: &Store, namespace: Option<&str>, limit: usize) -> Result<()> {
+/// The values inside one namespace.
+fn list_tags(
+    store: &Store,
+    namespace: Option<&str>,
+    limit: usize,
+    db: &str,
+    freshness: &TagFreshnessReport,
+    report: &mut Report,
+) -> Result<()> {
+    let total = tagindex::tag_counts_total(store, namespace)?;
+    let counts = if total == 0 {
+        Vec::new()
+    } else {
+        tagindex::tag_counts(store, namespace, limit as i64)?
+    };
+
+    if report.is_json() {
+        json::tags_counts(db, "values", namespace, freshness, &[], &counts, total);
+        json::warnings(report);
+        return Ok(());
+    }
+
     match namespace {
         Some(ns) => println!("namespace: {ns}"),
         None => println!("namespace: (all)"),
     }
-    if tagindex::tag_counts_total(store, namespace)? == 0 {
+    if total == 0 {
         println!("  (no tags — is the namespace spelled correctly? `sagasu tags` lists them)");
         return Ok(());
     }
-    print_tag_counts(store, namespace, limit)
+    print_tag_counts(&counts, total);
+    Ok(())
 }
 
 /// Explain one file: stored tags beside freshly computed ones.
-fn explain_file(store: &Store, file: &Path, rules: Option<PathBuf>) -> Result<()> {
-    let (rules_path, _) = resolve_rules(rules);
-    let rules = match &rules_path {
-        Some(p) => RuleSet::load(p)?,
-        None => RuleSet::empty(),
-    };
+fn explain_file(
+    store: &Store,
+    file: &Path,
+    explicit_config: Option<&Path>,
+    db: &str,
+    freshness: &TagFreshnessReport,
+    report: &mut Report,
+) -> Result<()> {
+    let loaded = load_config(explicit_config, &[])?;
+    let origin = loaded.origin().clone();
+    let rules = loaded.into_rules();
 
     // Canonicalize when we can: `files.path` holds canonical paths, so a
     // relative argument would otherwise never match a row.
@@ -451,16 +538,36 @@ fn explain_file(store: &Store, file: &Path, rules: Option<PathBuf>) -> Result<()
     let path_str = path.to_string_lossy().into_owned();
     let root = store.meta_get("root_path")?;
 
-    println!("file    : {path_str}");
-    println!(
-        "rules   : {}",
-        rules_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(none)".to_string())
-    );
-
     let row = tagindex::file_by_path(store, &path_str)?;
+    let stored = match &row {
+        Some(row) => tagindex::tags_of_file(store, row.file_id)?,
+        None => Vec::new(),
+    };
+
+    // Compute from the engine. The stored magic bytes are preferred; failing
+    // that the head of the file is read, so the explanation matches what a
+    // `--read-magic` build would produce rather than a weaker extension guess.
+    let computed = tagindex::explain(&path, root.as_deref(), &rules, true)?;
+
+    if report.is_json() {
+        json::tags_explain(
+            db,
+            &path_str,
+            &origin,
+            freshness,
+            row.as_ref().map(|r| r.file_id),
+            &stored,
+            &computed.tags,
+            &computed.dropped,
+            computed.capped,
+        );
+        json::warnings(report);
+        return Ok(());
+    }
+
+    println!("file    : {path_str}");
+    println!("config  : {}", origin.describe());
+
     match &row {
         Some(row) => println!("index   : file_id {} (live)", row.file_id),
         None => println!("index   : not in the metadata index"),
@@ -468,8 +575,7 @@ fn explain_file(store: &Store, file: &Path, rules: Option<PathBuf>) -> Result<()
 
     println!("stored  :");
     match &row {
-        Some(row) => {
-            let stored = tagindex::tags_of_file(store, row.file_id)?;
+        Some(_) => {
             if stored.is_empty() {
                 println!("  (none — has `sagasu tag` run since this file was indexed?)");
             }
@@ -484,10 +590,6 @@ fn explain_file(store: &Store, file: &Path, rules: Option<PathBuf>) -> Result<()
         None => println!("  (n/a)"),
     }
 
-    // Compute from the engine. The stored magic bytes are preferred; failing
-    // that the head of the file is read, so the explanation matches what a
-    // `--read-magic` build would produce rather than a weaker extension guess.
-    let computed = tagindex::explain(&path, root.as_deref(), &rules, true)?;
     println!("computed:");
     for (tag, sources) in &computed.tags {
         println!(

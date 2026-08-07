@@ -44,8 +44,11 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
+use crate::output::Output;
+
 mod browse;
 mod index;
+mod json;
 mod output;
 mod search;
 mod status;
@@ -56,6 +59,18 @@ mod tag;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Machine-readable output: JSON Lines for result streams (`search`,
+    /// `find`, `tags`, `browse`), one JSON object for summaries (`index`,
+    /// `hash`, `fulltext`, `tag`, `status`). See docs/cli.md §4.
+    ///
+    /// Warnings stay on stderr as before *and* appear in the JSON; errors are
+    /// never JSON, so decide on the exit code rather than on the stream.
+    ///
+    /// Global on purpose: one spelling for nine subcommands, and it may be
+    /// written before or after the subcommand.
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -88,16 +103,18 @@ const DEFAULT_INDEX_DIR: &str = "fulltext-index";
 fn main() {
     let cli = Cli::parse();
 
+    let mode = Output::from_flag(cli.json);
+
     let result = match cli.command {
-        Command::Index(args) => index::cmd_index(args),
-        Command::Hash(args) => index::cmd_hash(args),
-        Command::Fulltext(args) => index::cmd_fulltext(args),
-        Command::Search(args) => search::cmd_search(args),
-        Command::Find(args) => search::cmd_find(args),
-        Command::Tag(args) => tag::cmd_tag(args),
-        Command::Tags(args) => tag::cmd_tags(args),
-        Command::Browse(args) => browse::cmd_browse(args),
-        Command::Status(args) => status::cmd_status(args),
+        Command::Index(args) => index::cmd_index(args, mode),
+        Command::Hash(args) => index::cmd_hash(args, mode),
+        Command::Fulltext(args) => index::cmd_fulltext(args, mode),
+        Command::Search(args) => search::cmd_search(args, mode),
+        Command::Find(args) => search::cmd_find(args, mode),
+        Command::Tag(args) => tag::cmd_tag(args, mode),
+        Command::Tags(args) => tag::cmd_tags(args, mode),
+        Command::Browse(args) => browse::cmd_browse(args, mode),
+        Command::Status(args) => status::cmd_status(args, mode),
     };
 
     if let Err(e) = result {

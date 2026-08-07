@@ -219,14 +219,20 @@ walk して数えているからで、これは意図的に速度と引き換え
 ### 2-2. 許可リストはユーザーが広げられる
 
 コマンドラインと設定ファイルの2経路。設定ファイルの既定名は
-**`sagasu-text.toml`**(カレントディレクトリ)。`--text-config <PATH>` で明示できる。
+**`sagasu.toml`**(カレントディレクトリ)で、本文抽出の設定は `[text]` セクション。
+`--config <PATH>` で明示できる。探索順と旧ファイルの扱いは docs/cli.md §5。
 
 ```toml
-# sagasu-text.toml
+# sagasu.toml
 # 拡張子に先頭のドットは付けても付けなくてもよい。大文字小文字は無視。
+[text]
 text_ext   = ["tmpl", "hbs", "j2"]   # 許可リストに足す(拒否リストより強い)
 binary_ext = ["dat", "pak"]          # 拒否リストに足す
 ```
+
+**issue #6 で `sagasu-text.toml` と `sagasu-tags.toml` は 1 本に統合された。**
+旧ファイルは読まれないが、置かれているのを検出したらエラーで案内する
+(黙って無視すると、利用者から見えるのは「設定が効かなくなった」だけになる)。
 
 優先順位(強い順):
 
@@ -236,7 +242,7 @@ binary_ext = ["dat", "pak"]          # 拒否リストに足す
 4. 組み込みの拒否リスト
 5. どれでもなければ内容サンプリング
 
-TOML なのは `sagasu-tags.toml` と `bench/configs/*.toml` がすでに TOML だから。
+TOML なのは `bench/configs/*.toml` がすでに TOML だから(設定言語は 1 つで足りる)。
 **未知のキーはエラー** — `text_exts` と打ち間違えた設定ファイルが「読めたが
 何もしない」状態になると、利用者は sniffer を疑うことになる。
 
@@ -254,7 +260,7 @@ TOML なのは `sagasu-tags.toml` と `bench/configs/*.toml` がすでに TOML �
 
 ```
 $ sagasu search "needle" --db index.db
-text    : +text obj (sagasu-text.toml)      ← 索引から復元したもの
+text    : +text obj (sagasu.toml)          ← 索引から復元したもの
 
 $ sagasu search "needle" --db index.db --ext hbs
 WARNING: the full-text index was built with +text obj (…) but this search was
@@ -264,7 +270,7 @@ given +text hbs; the live scan used the latter, …
 ### 2-3. 除外の件数と理由、そして拡張子の内訳
 
 ```
-text config  : sagasu-text.toml
+config       : sagasu.toml (found in the working directory)
   +text      : tmpl
 candidates   : 95
 indexed      : 54

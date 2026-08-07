@@ -92,15 +92,15 @@ Shift_JIS の `.txt` が「テキストとして sniff できない」のは
 形式は TOML(`bench/configs/*.toml` と同じ。設定言語は 1 つで足りる)。
 
 ```toml
-# sagasu-tags.toml
+# sagasu.toml
 
 # --- 案件 ---------------------------------------------------------------
-[[rule]]
+[[tags.rule]]
 name = "顧客案件"                       # 任意。エラーメッセージに出る
 path = "clients/**"                     # ルート相対・'/' 区切りのパスに対する glob
 tags = ["project:client-work"]
 
-[[rule]]
+[[tags.rule]]
 name = "acme の案件"
 path = "clients/acme/**"
 tags = ["client:acme", "billing:billable"]
@@ -110,37 +110,39 @@ tags = ["client:acme", "billing:billable"]
 # PDF の /Author、EXIF の Artist からも自動で付く(`sagasu tag` の既定)。
 # ルールはその代わりではなく上乗せ: 同じ名前空間なので和集合になり、
 # メタデータを持たないファイル(テキスト・画像・古い形式)をここで拾える。
-[[rule]]
+[[tags.rule]]
 path = "**/masuda/**"
 tags = ["author:masuda"]
 
 # --- 部門 ---------------------------------------------------------------
-[[rule]]
+[[tags.rule]]
 name = "経理の Office 文書"
 path = "**/keiri/**"
 ext  = ["docx", "xlsx", "pdf"]          # 拡張子リスト(先頭のドットなし)
 tags = ["dept:accounting", "retention:7y"]
 
 # --- アプリケーション ----------------------------------------------------
-[[rule]]
+[[tags.rule]]
 file = "*.psd"                          # ファイル名だけに対する glob
 tags = ["app:photoshop"]
 
 # --- 契約書 --------------------------------------------------------------
-[[rule]]
+[[tags.rule]]
 name = "契約書"
 path = "**/契約/**"
 tags = ["doc-type:contract", "confidential:yes"]
 ```
 
-`sagasu tag --rules sagasu-tags.toml --db index.db` で適用する。
-`--rules` を省略した場合はカレントディレクトリの `sagasu-tags.toml` を探し、
+`sagasu tag --config sagasu.toml --db index.db` で適用する。
+`--config` を省略した場合はカレントディレクトリの `sagasu.toml` を探し、
 **見つかっても見つからなくても、どちらだったかを 1 行目に出す**。
 
-このファイルはタグ生成だけの設定で、本文抽出の対象判定には効かない。
-拡張子の許可リストを広げるのは**別ファイル** `sagasu-text.toml` で、
-読むのも別のコマンド (`sagasu fulltext` / `sagasu search`) — `docs/index_scope.md` §2-2。
-形式は同じ TOML で、未知のキーがエラーなのも同じ理由による。
+**タグルールと本文抽出の設定は同じファイルの別セクション**(issue #6)。
+拡張子の許可リストを広げるのは `[text]` で、読むのは別のコマンド
+(`sagasu fulltext` / `sagasu search`) — `docs/index_scope.md` §2-2。
+どちらも未知のキーがエラーなのは同じ理由による。
+旧 `sagasu-tags.toml` / `sagasu-text.toml` は読まれないが、
+置かれているのを検出したらエラーで案内する(docs/cli.md §5)。
 
 ### 2-1. マッチの規則
 

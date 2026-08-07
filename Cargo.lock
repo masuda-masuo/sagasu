@@ -2235,6 +2235,7 @@ dependencies = [
  "anyhow",
  "clap",
  "sagasu-core",
+ "serde_json",
 ]
 
 [[package]]

@@ -897,7 +897,7 @@ fn format_skips_are_broken_down_by_extension() {
 
 #[test]
 fn a_text_config_file_extends_the_allowlist() {
-    use sagasu_core::text::TextPolicy;
+    use sagasu_core::config::Config;
 
     let (data, db, index) = tmp_dirs("text_config");
     // `.obj` is denylisted and `.dat` is unknown-and-binary-looking; the config
@@ -906,15 +906,17 @@ fn a_text_config_file_extends_the_allowlist() {
     write_file(&data, "notes.dat", "タラバガニのメモ\n");
     crawl(&data, &db);
 
-    let config_path = db.join("sagasu-text.toml");
+    // One file, two sections (issue #6): the `[text]` section is what the
+    // extension lists now live in.
+    let config_path = db.join("sagasu.toml");
     fs::write(
         &config_path,
-        "text_ext   = [\"obj\"]\nbinary_ext = [\"dat\"]\n",
+        "[text]\ntext_ext   = [\"obj\"]\nbinary_ext = [\"dat\"]\n",
     )
     .unwrap();
 
     let mut config = ft_config(&db, &index);
-    config.text_policy = TextPolicy::load(&config_path).unwrap();
+    config.text_policy = Config::load(&config_path).unwrap().into_text_policy();
     let summary = fulltext::build(&config).unwrap();
 
     assert_eq!(
@@ -939,6 +941,7 @@ fn a_text_config_file_extends_the_allowlist() {
 
 #[test]
 fn the_index_records_the_extension_policy_it_was_built_with() {
+    use sagasu_core::config::Config;
     use sagasu_core::text::TextPolicy;
 
     let (data, db, index) = tmp_dirs("policy_persist");
@@ -946,15 +949,15 @@ fn the_index_records_the_extension_policy_it_was_built_with() {
     write_file(&data, "notes.dat", "メモ\n");
     crawl(&data, &db);
 
-    let config_path = db.join("sagasu-text.toml");
+    let config_path = db.join("sagasu.toml");
     fs::write(
         &config_path,
-        "text_ext   = [\"obj\"]\nbinary_ext = [\"dat\"]\n",
+        "[text]\ntext_ext   = [\"obj\"]\nbinary_ext = [\"dat\"]\n",
     )
     .unwrap();
 
     let mut config = ft_config(&db, &index);
-    config.text_policy = TextPolicy::load(&config_path).unwrap();
+    config.text_policy = Config::load(&config_path).unwrap().into_text_policy();
     let summary = fulltext::build(&config).unwrap();
     assert_eq!(summary.indexed, 1);
 

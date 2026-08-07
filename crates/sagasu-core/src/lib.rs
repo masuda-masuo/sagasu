@@ -24,12 +24,16 @@
 //! - [`tagindex`]: the stateful half of that layer — building it into SQLite,
 //!   measuring its coverage, and querying it back.
 //! - [`tagrules`]: the declarative user rule file that feeds [`tags`].
+//! - [`config`]: the one config file, `sagasu.toml` — the `[text]` section
+//!   feeding [`text`] and the `[[tags.rule]]` tables feeding [`tagrules`]
+//!   (issue #6, docs/cli.md §5).
 //! - [`browse`]: the facet drill-down over that layer — given a tag selection,
 //!   the next axes worth looking at, ranked by expected bits, with a c-TF-IDF
 //!   label for the group (design.md §6, issue #5). This is the interface the
 //!   M4 Tauri UI is meant to call directly; the CLI is a printer for it.
 
 pub mod browse;
+pub mod config;
 pub mod delta;
 pub mod docmeta;
 pub mod fresh;
@@ -44,6 +48,7 @@ pub mod usn;
 pub mod walk;
 
 pub use browse::{BrowseQuery, BrowseView, FacetAxis, FacetValue, LabelTerm, NextStep};
+pub use config::{Config, ConfigOrigin};
 pub use delta::{DeltaCache, DeltaSet, DeltaSource, DeltaStatus, ScanMarker};
 pub use docmeta::{BodyFormat, EmbeddedMeta, MetaFormat};
 pub use fresh::{FreshConfig, FreshHit, FreshOutcome};

@@ -44,7 +44,8 @@ use sagasu_core::store::Store;
 use sagasu_core::tagindex;
 use sagasu_core::tags::Tag;
 
-use crate::output::{print_tag_freshness, TagFreshness};
+use crate::json;
+use crate::output::{print_tag_freshness, tag_freshness, Output, Report, TagFreshness};
 
 /// Default database path, so the reprinted command can leave `--db` out when it
 /// would be redundant.
@@ -90,14 +91,15 @@ pub struct BrowseArgs {
 }
 
 /// Run `sagasu browse`.
-pub fn cmd_browse(args: BrowseArgs) -> Result<()> {
+pub fn cmd_browse(args: BrowseArgs, mode: Output) -> Result<()> {
+    let mut report = Report::new(mode);
     let store = Store::open(&args.db)
         .with_context(|| format!("failed to open metadata index {:?}", args.db))?;
 
     // The same block `sagasu tags` prints, from the same function: a drill-down
     // reads the same index-time snapshot and owes the same admission about it.
     let stats = store.get_stats()?;
-    print_tag_freshness(
+    let freshness = tag_freshness(
         &store,
         &stats,
         &TagFreshness {
@@ -105,7 +107,11 @@ pub fn cmd_browse(args: BrowseArgs) -> Result<()> {
             no_fresh: args.no_fresh,
             delta_limit: args.delta_limit,
         },
+        &mut report,
     );
+    if !report.is_json() {
+        print_tag_freshness(&freshness);
+    }
 
     let selected: Vec<Tag> = args
         .selection
@@ -122,20 +128,55 @@ pub fn cmd_browse(args: BrowseArgs) -> Result<()> {
     };
     let view = browse::browse(&store, &query)?;
 
-    println!();
-    print_selection(&view);
-    print_label(&view);
-    print_universal(&view);
-    print_axes(&view, &args);
-    print_preview(&view, &args);
-    println!();
-    println!("{}", next_line(&view, &args));
+    // Deletion is invisible to every delta source (design.md §5), so the
+    // previewed rows are checked one by one — the same thing `sagasu tags`
+    // does, bounded by the page rather than by the corpus. Done here rather
+    // than inside the printer so both renderings see the same partition.
+    let (rows, gone) = if args.files == 0 {
+        (Vec::new(), Vec::new())
+    } else {
+        tagindex::partition_existing(view.preview.clone())
+    };
+
+    if report.is_json() {
+        let (command, reason) = next_step(&view, &args);
+        json::browse(
+            &args.db.display().to_string(),
+            &view,
+            &freshness,
+            command.as_deref(),
+            reason.as_deref(),
+            &rows,
+            &gone,
+            args.files > 0,
+        );
+    } else {
+        print_selection(&view);
+        print_label(&view);
+        print_universal(&view);
+        print_axes(&view, &args);
+        print_preview(&view, &args, &rows, &gone);
+        println!();
+        println!("{}", next_line(&view, &args));
+    }
+
+    if !gone.is_empty() {
+        report.warn(format!(
+            "index is stale: {} of the previewed files have been deleted \
+             since it was built — re-run `sagasu index <root>` and `sagasu tag`.",
+            gone.len()
+        ));
+    }
+
+    if report.is_json() {
+        json::warnings(&report);
+    }
 
     // An index with no tag layer has no facet tree at all — the same situation
     // `sagasu tags` (with no query) exits 1 for. Exiting 0 here would let a
     // scripted `browse` treat "there is nothing to browse" as a successful
     // empty answer, which is the silent-omission failure with a warning stapled
-    // to it. The stderr warning itself already came from `print_tag_freshness`.
+    // to it. The stderr warning itself already came from `tag_freshness`.
     if !view.snapshot.built() {
         process::exit(1);
     }
@@ -247,39 +288,69 @@ pub(crate) fn share_pct(share: f64) -> String {
     }
 }
 
-/// The `next :` line, including the four different reasons there may be no step.
-fn next_line(view: &BrowseView, args: &BrowseArgs) -> String {
-    let flags = non_default_flags(args);
+/// The next step as data: the command to run next, and/or the reason there is
+/// no step to recommend.
+///
+/// Both renderings go through this. *Why* there is no next step decides what
+/// the user should do, and collapsing the four cases into one sentence was a way
+/// of telling three groups of users something untrue — a machine consumer is
+/// owed the same distinction, so the branch lives here rather than in the
+/// `println!`.
+pub(crate) fn next_step(view: &BrowseView, args: &BrowseArgs) -> (Option<String>, Option<String>) {
     if let Some(step) = &view.recommended {
-        return format!(
-            "next    : {}\n          ({:.2} bits — the step whose outcome is least \
-             predictable, leaving {} of {} file(s))",
-            next_command("browse", &flags, &view.selected, Some(&step.tag)),
-            step.bits,
-            step.files,
-            view.matched,
+        let flags = non_default_flags(args);
+        return (
+            Some(next_command(
+                "browse",
+                &flags,
+                &view.selected,
+                Some(&step.tag),
+            )),
+            None,
         );
     }
-    // No recommendation. *Why* not decides what the user should do next, and
-    // collapsing the four cases into one sentence was a way of telling three
-    // groups of users something untrue.
     if !view.snapshot.built() {
-        return "next    : (no tag layer in this index — run `sagasu tag` first)".to_string();
+        return (
+            None,
+            Some("no tag layer in this index — run `sagasu tag` first".to_string()),
+        );
     }
     if view.matched == 0 {
-        return "next    : (nothing to add — no live file carries all of these tags)".to_string();
-    }
-    if view.axes_refining == 0 {
-        return format!(
-            "next    : (nothing to add — this group is a leaf; list it with `{}`)",
-            next_command("tags", &db_flag(args), &view.selected, None),
+        return (
+            None,
+            Some("nothing to add — no live file carries all of these tags".to_string()),
         );
     }
-    format!(
-        "next    : (suppressed — {} axis/axes could narrow this group, but no value \
-         is on screen at --axes {} --values {})",
-        view.axes_refining, args.axes, args.values,
+    if view.axes_refining == 0 {
+        return (
+            Some(next_command("tags", &db_flag(args), &view.selected, None)),
+            Some("nothing to add — this group is a leaf".to_string()),
+        );
+    }
+    (
+        None,
+        Some(format!(
+            "suppressed — {} axis/axes could narrow this group, but no value \
+             is on screen at --axes {} --values {}",
+            view.axes_refining, args.axes, args.values,
+        )),
     )
+}
+
+/// The `next :` line, including the four different reasons there may be no step.
+fn next_line(view: &BrowseView, args: &BrowseArgs) -> String {
+    match (next_step(view, args), &view.recommended) {
+        ((Some(command), _), Some(step)) => format!(
+            "next    : {command}\n          ({:.2} bits — the step whose outcome is least \
+             predictable, leaving {} of {} file(s))",
+            step.bits, step.files, view.matched,
+        ),
+        ((Some(command), Some(reason)), None) => {
+            format!("next    : ({reason}; list it with `{command}`)")
+        }
+        ((_, Some(reason)), None) => format!("next    : ({reason})"),
+        _ => "next    : (nothing to add)".to_string(),
+    }
 }
 
 /// Just `--db`, for hints at commands that do not take the browse flags.
@@ -461,25 +532,26 @@ fn print_axis(axis: &FacetAxis) {
 
 /// Whether an axis assigns more tags than it covers files — i.e. some file in
 /// the group carries two or more values of this namespace.
-fn is_multi_valued(axis: &FacetAxis) -> bool {
+pub(crate) fn is_multi_valued(axis: &FacetAxis) -> bool {
     let shown: i64 = axis.values.iter().map(|v| v.files).sum();
     shown + axis.tail_assignments > axis.files
 }
 
 /// A few files of the group, existence-checked.
-fn print_preview(view: &BrowseView, args: &BrowseArgs) {
+fn print_preview(
+    view: &BrowseView,
+    args: &BrowseArgs,
+    rows: &[sagasu_core::store::FileRow],
+    gone: &[sagasu_core::store::FileRow],
+) {
     println!();
     if args.files == 0 {
         println!("files   : (not listed — pass -n/--files N)");
         return;
     }
     let fetched = view.preview.len();
-    // Deletion is invisible to every delta source (design.md §5), so the rows
-    // about to be printed are checked one by one — the same thing `sagasu tags`
-    // does, bounded by the page rather than by the corpus.
-    let (rows, gone) = tagindex::partition_existing(view.preview.clone());
     println!("files   : {} of {} shown", rows.len(), view.matched);
-    for row in &rows {
+    for row in rows {
         println!("{:>8}  {}", row.file_id, row.path);
     }
     if !gone.is_empty() {
@@ -487,17 +559,12 @@ fn print_preview(view: &BrowseView, args: &BrowseArgs) {
             "dropped : {} of the {fetched} previewed row(s) no longer exist on disk",
             gone.len()
         );
-        for row in &gone {
+        for row in gone {
             println!(
                 "{:>8}  {}  (deleted since the index was built)",
                 row.file_id, row.path
             );
         }
-        eprintln!(
-            "WARNING: index is stale: {} of the previewed files have been deleted \
-             since it was built — re-run `sagasu index <root>` and `sagasu tag`.",
-            gone.len()
-        );
     }
     if view.matched > fetched as i64 {
         println!(

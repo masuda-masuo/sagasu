@@ -15,6 +15,12 @@ globset = "0.4"
 # already uses, so the project has one config language rather than two.
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+# The machine-readable CLI rendering (`--json`, issue #6, docs/cli.md §4).
+# Hand-rolling the encoder would mean hand-rolling the escaping, and the one
+# place a search tool must not corrupt its output is a path with a quote in it.
+# CLI-only: `sagasu-core` does not depend on it, because the JSON is a rendering
+# of the CLI's output and not a second contract on the core types.
+serde_json = "1"
 # ── Embedded document formats (issue #40) ────────────────────────────────────
 # OOXML (docx/xlsx/pptx) is a ZIP of XML parts, so the container and the parser
 # are two small crates rather than one library per format.
