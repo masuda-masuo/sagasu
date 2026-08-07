@@ -780,7 +780,13 @@ pub fn search(config: &SearchConfig) -> Result<SearchOutcome> {
         .with_context(|| format!("could not parse query {:?}", config.query))?;
 
     let t0 = Instant::now();
-    let top = searcher.search(&query, &TopDocs::with_limit(config.limit.max(1)))?;
+    // tantivy 0.26: `TopDocs` is a builder and no longer implements `Collector`
+    // itself; the ordering has to be named.  `order_by_score()` is the 0.25
+    // behaviour.
+    let top = searcher.search(
+        &query,
+        &TopDocs::with_limit(config.limit.max(1)).order_by_score(),
+    )?;
     let match_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let live_terms = split_query_terms(&*query, fields.body);

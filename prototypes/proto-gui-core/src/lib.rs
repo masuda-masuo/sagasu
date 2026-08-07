@@ -325,7 +325,12 @@ impl Engine {
         let searcher = reader.searcher();
         let query_parsed = QueryParser::for_index(&self.index, vec![body_f]).parse_query(query)?;
         let (top, index_match_count) =
-            searcher.search(&query_parsed, &(TopDocs::with_limit(limit), Count))?;
+            // tantivy 0.26: `TopDocs` is a builder; the ordering has to be
+            // named.  `order_by_score()` is the 0.25 behaviour.
+            searcher.search(
+                &query_parsed,
+                &(TopDocs::with_limit(limit).order_by_score(), Count),
+            )?;
         let search_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         // --- 2. Delta walk + live-grep ---

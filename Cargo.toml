@@ -43,9 +43,9 @@ lopdf = { version = "0.44", default-features = false }
 kamadak-exif = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
-tantivy = "0.25"
-lindera = "4"
-lindera-tantivy = { version = "4.0", features = ["embed-ipadic"] }
+tantivy = "0.26"
+lindera = "5"
+lindera-tantivy = { version = "5.0", features = ["embed-ipadic"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
