@@ -682,13 +682,17 @@ fn a_tag_query_does_not_return_files_that_were_deleted_after_the_crawl() {
 #[test]
 fn facet_counts_do_not_include_tombstones() {
     let (d, db) = tmp_dirs("tombstone_counts");
-    for i in 0..3 {
-        write(&d, &format!("notes/n{i}.txt"), "body");
-    }
+    // One of the doomed files sits in its own directory, so `path:archive` is a
+    // tag whose *only* holder becomes a tombstone. Without that the corpus
+    // cannot tell a live-only count from a raw one: three files with identical
+    // tags leave the distinct count at 3 either way.
+    write(&d, "archive/n0.txt", "body");
+    write(&d, "notes/n1.txt", "body");
+    write(&d, "notes/n2.txt", "body");
     crawl(&d, &db);
     tag(&db, true);
 
-    fs::remove_file(d.join("notes/n0.txt")).unwrap();
+    fs::remove_file(d.join("archive/n0.txt")).unwrap();
     fs::remove_file(d.join("notes/n1.txt")).unwrap();
     // Re-crawl only: the two files become tombstones, but `file_tags` still
     // carries their rows because only `sagasu tag` rebuilds that table.
@@ -716,17 +720,38 @@ fn facet_counts_do_not_include_tombstones() {
         .expect("the kind namespace should still be listed");
     assert_eq!(ns.files, 1, "namespace counts must exclude tombstones");
 
-    // A tag whose only holders are tombstones must leave the facet list, not
+    // A tag whose only holder is now a tombstone must leave the facet list, not
     // sit there as a bucket that holds nothing.
-    let n0 = sagasu_core::Tag::parse("path:notes").unwrap();
+    let archive = sagasu_core::Tag::parse("path:archive").unwrap();
     assert_eq!(
-        tagindex::count_files_with_tags(&store, std::slice::from_ref(&n0)).unwrap(),
+        tagindex::count_files_with_tags(&store, std::slice::from_ref(&archive)).unwrap(),
+        0
+    );
+    assert!(
+        !tagindex::tag_counts(&store, Some("path"), 100)
+            .unwrap()
+            .iter()
+            .any(|c| c.tag == archive),
+        "a bucket whose only file is a tombstone must not be offered"
+    );
+    let notes = sagasu_core::Tag::parse("path:notes").unwrap();
+    assert_eq!(
+        tagindex::count_files_with_tags(&store, std::slice::from_ref(&notes)).unwrap(),
         1
     );
     assert_eq!(
         tagindex::tag_counts_total(&store, None).unwrap(),
         tagindex::tag_counts(&store, None, 10_000).unwrap().len() as i64,
         "the total and the list must still agree once tombstones are excluded"
+    );
+
+    // `sagasu status` and `sagasu tags` both print this as "distinct", and its
+    // doc comment says "referenced by a live file" — so it has to be counted
+    // the same way the facet list is.
+    assert_eq!(
+        store.get_stats().unwrap().distinct_tags,
+        tagindex::tag_counts_total(&store, None).unwrap(),
+        "the reported distinct-tag count must exclude tombstones too"
     );
 }
 

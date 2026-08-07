@@ -301,7 +301,12 @@ pub fn cmd_tags(args: TagsArgs) -> Result<()> {
     // The total comes from the index and was never existence-checked, so it can
     // only ever be an upper bound. Say which number was verified and which was
     // not, rather than letting `of {total}` read as a fact.
-    if !gone.is_empty() || (args.no_fresh && total > 0) {
+    //
+    // Only under `--no-fresh` would this be a lie in the other direction: there
+    // *are* no rows that were checked against the filesystem, so claiming the
+    // listed ones were is worse than saying nothing. That mode's stderr warning
+    // already states that nothing was checked.
+    if !gone.is_empty() {
         println!(
             "          (the {total} total is the indexed count — an upper bound; \
              only the rows above were checked against the filesystem)"

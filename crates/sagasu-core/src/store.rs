@@ -667,11 +667,17 @@ impl Store {
         let tag_rows: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM file_tags", [], |row| row.get(0))?;
-        let distinct_tags: i64 =
-            self.conn
-                .query_row("SELECT COUNT(DISTINCT tag_id) FROM file_tags", [], |row| {
-                    row.get(0)
-                })?;
+        // Restricted to live files, matching the doc comment on the field and
+        // the same condition `tagindex::LIVE_FILES_JOIN` applies to every facet
+        // count. `tag_rows` above deliberately stays a raw row count: it is
+        // framed as "rows written by the build at generation N", which is what
+        // its doc comment says and what makes it comparable to `tag_files`.
+        let distinct_tags: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT ft.tag_id) FROM file_tags ft
+             JOIN files f ON f.file_id = ft.file_id AND f.deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
 
         Ok(IndexStats {
             root_path,
