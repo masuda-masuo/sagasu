@@ -76,6 +76,7 @@ const FULLTEXT_META_KEYS: &[&str] = &[
     "fulltext_marker",
     "fulltext_docs",
     "fulltext_scan_generation",
+    text::TEXT_POLICY_KEY,
 ];
 
 // ── Skip reasons ────────────────────────────────────────────────────────────
@@ -440,6 +441,11 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
         "fulltext_scan_generation",
         &store.scan_generation().to_string(),
     )?;
+    // The rule this index was built under, so a later search judges a changed
+    // file the same way (issue #15). Without it the live grep falls back to the
+    // built-in lists whenever it is run from a directory with no config file in
+    // it, and an edit to a `.tmpl` deletes that file from the answer.
+    store.meta_set(text::TEXT_POLICY_KEY, &config.text_policy.encode())?;
     store.wal_checkpoint()?;
 
     let mut skipped = BTreeMap::new();

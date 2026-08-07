@@ -73,24 +73,47 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
     // The exclusion policy the crawl ran under, replayed from what it stored.
     // Every query replays this too (design.md §5-1), so a surprising file count
     // is explainable from this report alone rather than from shell history.
-    let root = PathBuf::from(stats.root_path.clone().unwrap_or_default());
+    let mut policy_missing = false;
     match store.meta_get(walk::EXCLUDE_POLICY_KEY)? {
-        Some(encoded) => match ExcludeSet::decode(&encoded, &root) {
+        Some(encoded) => match ExcludeSet::decode(&encoded) {
             Ok(excludes) => {
                 println!("exclusion      : {} dir name(s)", excludes.names().len());
                 println!("  hidden       : {}", excludes.hidden_policy().as_str());
                 println!(
                     "  gitignore    : {}",
                     if excludes.uses_gitignore() {
-                        format!("{} rule(s), directories only", excludes.gitignore_rules())
+                        format!(
+                            "{} rule(s) baked in, directories only{}",
+                            excludes.gitignore_rules(),
+                            match excludes.gitignore_digest() {
+                                Some(d) => format!(" (digest {})", &d[..d.len().min(12)]),
+                                None => String::new(),
+                            }
+                        )
                     } else {
                         "not applied".to_string()
                     }
                 );
             }
-            Err(e) => println!("exclusion      : (unreadable policy: {e:#})"),
+            Err(e) => {
+                policy_missing = true;
+                println!("exclusion      : (unreadable policy: {e:#})");
+            }
         },
-        None => println!("exclusion      : (not recorded — crawled before policies were stored)"),
+        None => {
+            policy_missing = true;
+            println!("exclusion      : (not recorded — crawled by an older sagasu)");
+        }
+    }
+
+    // Entries the last crawl could not read. Persisted because the crawl's own
+    // warning scrolls away and this is the report someone comes back to.
+    match store
+        .meta_get(walk::SCAN_ERRORS_KEY)?
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(n) if n > 0 => println!("unreadable     : {n} (as of the last crawl)"),
+        _ => {}
     }
 
     println!("scan generation: {}", stats.scan_generation);
@@ -150,6 +173,20 @@ pub fn cmd_status(args: StatusArgs) -> Result<()> {
     // indistinguishable. `index` and `fulltext` warn at build time, but the
     // build scrolls away and this report is what someone comes back to
     // (issue #15). Warnings go to stderr so the report itself stays parseable.
+    if policy_missing && stats.root_path.is_some() {
+        // The delta path falls back to the *default* set when no policy is
+        // recorded, which is only right for an index that was crawled with the
+        // defaults. An index built with `--exclude`, `--skip-hidden` or
+        // `--use-gitignore` by an older build disagrees with every query it
+        // now answers, and nothing else in this report would say so.
+        eprintln!(
+            "WARNING: this index does not carry a readable exclusion policy, so searches \
+             filter their live scan with the built-in defaults. If it was crawled with \
+             --exclude / --skip-hidden / --use-gitignore, those files can come back as \
+             live hits with no index row behind them — re-run `sagasu index <root>`."
+        );
+    }
+
     if stats.root_path.is_none() {
         eprintln!("WARNING: this database holds no crawl — run `sagasu index <root>` first.");
     } else if stats.live_count == 0 {

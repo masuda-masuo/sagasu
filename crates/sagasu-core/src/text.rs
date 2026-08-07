@@ -258,6 +258,126 @@ fn normalize_ext(raw: &str) -> String {
     raw.trim().trim_start_matches('.').to_lowercase()
 }
 
+/// Name of the `meta` row a [`TextPolicy`] is persisted under.
+pub const TEXT_POLICY_KEY: &str = "text_policy";
+
+impl TextPolicy {
+    /// Serialize for the `meta` table.
+    ///
+    /// The full-text index has to carry the rule it was built under, for the
+    /// same reason the crawl carries its exclusion policy: a live grep that
+    /// judges a changed file differently makes that file **disappear** from the
+    /// answer the moment it is edited — the index hit is dropped as changed and
+    /// no live hit replaces it. Auto-discovering `./sagasu-text.toml` at query
+    /// time cannot do that job, because a search run from another directory
+    /// finds no file and silently reverts to the built-in lists.
+    ///
+    /// Extensions are normalized to `[a-z0-9…]` with no whitespace, so the
+    /// line format needs no escaping.
+    pub fn encode(&self) -> String {
+        let mut out = String::from("v1\n");
+        if let Some(digest) = &self.digest {
+            out.push_str(&format!("digest={digest}\n"));
+        }
+        if let Some(source) = &self.source {
+            // Informational only — never re-read. It answers "which file was
+            // this?" in a report, not "what are the rules?".
+            out.push_str(&format!("source={}\n", source.display()));
+        }
+        for e in &self.text_ext {
+            out.push_str(&format!("text={e}\n"));
+        }
+        for e in &self.binary_ext {
+            out.push_str(&format!("binary={e}\n"));
+        }
+        out
+    }
+
+    /// Rebuild a policy written by [`TextPolicy::encode`]. Reads no files.
+    ///
+    /// Unknown keys and versions are errors, for the reasons spelled out on
+    /// [`crate::walk::ExcludeSet::decode`]; the caller degrades rather than
+    /// failing the query.
+    pub fn decode(text: &str) -> anyhow::Result<Self> {
+        use anyhow::bail;
+        let mut lines = text.lines();
+        match lines.next() {
+            Some("v1") => {}
+            other => bail!(
+                "unsupported text policy format {other:?} — this index was written by a \
+                 newer sagasu. Re-run `sagasu fulltext` with this build, or upgrade."
+            ),
+        }
+        let mut policy = Self::empty();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                bail!("malformed text policy line: {line:?}");
+            };
+            match key {
+                "digest" => policy.digest = Some(value.to_string()),
+                "source" => policy.source = Some(std::path::PathBuf::from(value)),
+                "text" => policy.text_ext.push(value.to_string()),
+                "binary" => policy.binary_ext.push(value.to_string()),
+                other => bail!(
+                    "unknown text policy key {other:?} — this index was written by a \
+                     newer sagasu. Re-run `sagasu fulltext` with this build, or upgrade."
+                ),
+            }
+        }
+        Ok(policy)
+    }
+
+    /// The policy the full-text index at `store` was built with, if it recorded
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row exists but cannot be parsed.
+    pub fn from_index(store: &crate::Store) -> anyhow::Result<Option<Self>> {
+        match store.meta_get(TEXT_POLICY_KEY)? {
+            Some(encoded) => Ok(Some(Self::decode(&encoded)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether two policies would classify every extension the same way.
+    ///
+    /// Compared by effect, not by provenance: two config files with different
+    /// names and the same lists agree, and that is the only thing a warning
+    /// about disagreement should care about.
+    pub fn agrees_with(&self, other: &Self) -> bool {
+        let norm = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v.dedup();
+            v
+        };
+        norm(&self.text_ext) == norm(&other.text_ext)
+            && norm(&self.binary_ext) == norm(&other.binary_ext)
+    }
+
+    /// One-line description for a report.
+    pub fn describe(&self) -> String {
+        if self.is_empty() {
+            return "built-in lists only".to_string();
+        }
+        let mut parts = Vec::new();
+        if !self.text_ext.is_empty() {
+            parts.push(format!("+text {}", self.text_ext.join(",")));
+        }
+        if !self.binary_ext.is_empty() {
+            parts.push(format!("+binary {}", self.binary_ext.join(",")));
+        }
+        match &self.source {
+            Some(p) => format!("{} ({})", parts.join(", "), p.display()),
+            None => parts.join(", "),
+        }
+    }
+}
+
 /// Classify a file by extension alone under the built-in lists only.
 ///
 /// The shorthand for callers with no user policy to apply; everything that has
@@ -290,12 +410,28 @@ pub fn sniff_is_text(sample: &[u8]) -> bool {
         return false;
     }
 
-    // Control characters other than tab/LF/CR/FF/ESC should be rare in text.
+    // Control characters other than tab / LF / VT / FF / CR / ESC should be
+    // rare in text.
+    //
+    // ESC (0x1B) is deliberately *not* counted. An ANSI-coloured log or a
+    // terminal capture is full of it and is exactly the kind of file someone
+    // greps their own disk for; the earlier version counted it, which
+    // contradicted this comment and pushed the judgement in the direction of
+    // dropping text — the failure this project treats as the worst one.
+    //
+    // The denominator has a floor of [`SNIFF_LEN`]. Without it the ratio is
+    // brutal on short files: a 40-byte file with one stray control byte would
+    // be called binary, because one is more than 1% of forty. Reading it as
+    // "at most one control character per 512 bytes examined" keeps the same
+    // rule for a full sample and stops a tiny file from being judged on one
+    // byte.
     let control = sample
         .iter()
-        .filter(|&&b| (b < 0x09) || (0x0E..0x20).contains(&b) || b == 0x7F)
+        .filter(|&&b| {
+            (b < 0x09) || (0x0E..0x1B).contains(&b) || (0x1C..0x20).contains(&b) || b == 0x7F
+        })
         .count();
-    if control * 100 > sample.len() {
+    if control * 100 > sample.len().max(SNIFF_LEN) {
         return false;
     }
 
@@ -419,5 +555,49 @@ mod tests {
         let mut bytes = BOM_UTF8.to_vec();
         bytes.extend_from_slice("見出し".as_bytes());
         assert_eq!(decode(&bytes), "見出し");
+    }
+}
+
+#[cfg(test)]
+mod sniff_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn escape_sequences_do_not_make_a_coloured_log_binary() {
+        // An ANSI-coloured log is text someone greps their own disk for. The
+        // comment above `sniff_is_text` always said ESC was allowed; the code
+        // counted it, and the disagreement pushed the judgement toward dropping
+        // text — the failure this project treats as the worst one.
+        let mut log = Vec::new();
+        for i in 0..40 {
+            log.extend_from_slice(format!("\x1b[32mINFO\x1b[0m line {i}\n").as_bytes());
+        }
+        assert!(sniff_is_text(&log));
+    }
+
+    #[test]
+    fn a_short_file_is_not_condemned_by_a_single_control_byte() {
+        // `control * 100 > len` on a 40-byte file means one control character
+        // is more than 1% and the file is called binary. The floor of SNIFF_LEN
+        // reads the rule as "at most one per 512 bytes examined" instead.
+        let short = b"short text\x01 with one stray byte\n";
+        assert!(short.len() < SNIFF_LEN);
+        assert!(sniff_is_text(short));
+    }
+
+    #[test]
+    fn a_control_dense_sample_is_still_rejected() {
+        // The floor must not turn the check off: a small blob that is mostly
+        // control bytes is still binary.
+        let dense: Vec<u8> = (0..64)
+            .map(|i| if i % 2 == 0 { 0x01 } else { b'a' })
+            .collect();
+        assert!(!sniff_is_text(&dense));
+        // …and so is a full-length sample over the ratio.
+        let mut long = vec![b'a'; SNIFF_LEN];
+        for slot in long.iter_mut().take(8) {
+            *slot = 0x02;
+        }
+        assert!(!sniff_is_text(&long));
     }
 }

@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Instant, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{WalkBuilder, WalkState};
 
@@ -75,6 +75,12 @@ pub const EXCLUDE_POLICY_KEY: &str = "exclude_policy";
 
 /// Filename read from the crawl root when [`ExcludeSet::with_gitignore`] is on.
 pub const GITIGNORE_FILE: &str = ".gitignore";
+
+/// `meta` row holding how many entries the last crawl could not read.
+///
+/// Persisted because the crawl's own warning scrolls away, and an index that is
+/// missing a subtree looks exactly like one that is not.
+pub const SCAN_ERRORS_KEY: &str = "scan_errors";
 
 // ── Hidden attribute ────────────────────────────────────────────────────────
 
@@ -179,7 +185,28 @@ pub struct ExcludeSet {
     hidden: HiddenPolicy,
     /// Compiled root `.gitignore`, when the crawl opted into reading one.
     /// `Arc` because [`ExcludeSet`] is cloned once per walker thread.
+    ///
+    /// Compiled against an **empty** base path: matching is done on a path we
+    /// make relative to the crawl root ourselves ([`relative_slash_path`]),
+    /// never on an absolute one. That keeps anchored rules (`/dist`) working
+    /// when the root the caller holds is spelled differently from the one the
+    /// rules were compiled with — on Windows the crawl canonicalizes to
+    /// `\\?\C:\…` while a USN record resolves to `C:\…`, and a `Gitignore` that
+    /// cannot strip its own root silently stops matching anything with a slash
+    /// in it while basename rules keep working.
     gitignore: Option<Arc<Gitignore>>,
+    /// The `.gitignore` lines the crawl read, verbatim and in file order.
+    ///
+    /// These are what [`ExcludeSet::encode`] persists. The alternative —
+    /// recording that a `.gitignore` was used and re-reading it at query time —
+    /// makes every query depend on a file the index does not own: editing it to
+    /// something unparsable killed every query, and deleting it silently
+    /// widened the delta set until directories the crawl had pruned came back
+    /// as live hits for files with no index row behind them.
+    gitignore_lines: Vec<String>,
+    /// BLAKE3 (hex) of the `.gitignore` bytes at crawl time, when there was a
+    /// file. Recorded so a report can say *which* rules produced the index.
+    gitignore_digest: Option<String>,
 }
 
 impl ExcludeSet {
@@ -202,6 +229,8 @@ impl ExcludeSet {
             no_default,
             hidden: HiddenPolicy::default(),
             gitignore: None,
+            gitignore_lines: Vec::new(),
+            gitignore_digest: None,
         }
     }
 
@@ -209,6 +238,34 @@ impl ExcludeSet {
     pub fn with_hidden(mut self, hidden: HiddenPolicy) -> Self {
         self.hidden = hidden;
         self
+    }
+
+    /// Reject anything that cannot survive [`ExcludeSet::encode`].
+    ///
+    /// A directory basename containing a newline or a carriage return would end
+    /// the line the policy is written on, and the two failures that produces are
+    /// both worse than refusing: a `\n` makes every later query fail to parse
+    /// the policy (the crawl having reported success), and a trailing `\r` is
+    /// parsed back as a *different* name, so the crawl and the delta scan
+    /// quietly exclude different sets.
+    ///
+    /// # Errors
+    ///
+    /// Names the offending value and what is wrong with it.
+    pub fn validate(&self) -> Result<()> {
+        for name in &self.extra {
+            if name.contains('\n') || name.contains('\r') {
+                bail!(
+                    "exclude name {name:?} contains a line break. Directory names \
+                     are recorded one per line in the index's exclusion policy, so \
+                     a name that spans lines cannot be replayed by a later search."
+                );
+            }
+            if name.is_empty() {
+                bail!("exclude name is empty — it would match nothing and hide the mistake");
+            }
+        }
+        Ok(())
     }
 
     /// Read `root/.gitignore` and apply it — **to directories only**.
@@ -226,28 +283,81 @@ impl ExcludeSet {
     /// Only the root file is read; nested `.gitignore`s in subprojects are not.
     /// A missing file is not an error — it means "no rules".
     ///
+    /// The rules are read **once, here**, and then travel with the policy
+    /// (see [`ExcludeSet::gitignore_lines`]). Nothing re-reads the file later.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file exists but cannot be read or compiled. It
     /// is not swallowed: a user who asked for gitignore support and silently
     /// did not get it would be counting a different corpus than they think.
-    pub fn with_gitignore(mut self, root: &Path, enabled: bool) -> Result<Self> {
+    pub fn with_gitignore(self, root: &Path, enabled: bool) -> Result<Self> {
         if !enabled {
-            self.gitignore = None;
-            return Ok(self);
+            return Ok(self.without_gitignore());
         }
         let file = root.join(GITIGNORE_FILE);
-        let mut builder = GitignoreBuilder::new(root);
-        if file.exists() {
-            if let Some(err) = builder.add(&file) {
-                bail!("failed to read {}: {err}", file.display());
+        let (text, digest) = match std::fs::read(&file) {
+            Ok(bytes) => {
+                let digest = blake3::hash(&bytes).to_hex().to_string();
+                (String::from_utf8_lossy(&bytes).into_owned(), Some(digest))
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), None),
+            Err(e) => bail!("failed to read {}: {e}", file.display()),
+        };
+        let lines: Vec<String> = text
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect();
+        self.with_gitignore_lines(&lines, digest)
+            .with_context(|| format!("invalid rule in {}", file.display()))
+    }
+
+    /// Drop the gitignore filter.
+    pub fn without_gitignore(mut self) -> Self {
+        self.gitignore = None;
+        self.gitignore_lines = Vec::new();
+        self.gitignore_digest = None;
+        self
+    }
+
+    /// Compile a gitignore filter from rule *lines* rather than from a file.
+    ///
+    /// This is the form the policy round-trips through, and the only form the
+    /// query side ever uses — it touches no filesystem, so the rules a search
+    /// applies are exactly the rules the crawl applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the offending line if a rule does not compile.
+    pub fn with_gitignore_lines(
+        mut self,
+        lines: &[String],
+        digest: Option<String>,
+    ) -> Result<Self> {
+        // Base path deliberately empty — see the field comment on `gitignore`.
+        let mut builder = GitignoreBuilder::new("");
+        for line in lines {
+            builder
+                .add_line(None, line)
+                .map_err(|e| anyhow!("bad gitignore rule {line:?}: {e}"))?;
         }
         let compiled = builder
             .build()
-            .with_context(|| format!("failed to compile {}", file.display()))?;
+            .context("failed to compile gitignore rules")?;
         self.gitignore = Some(Arc::new(compiled));
+        self.gitignore_lines = lines.to_vec();
+        self.gitignore_digest = digest;
         Ok(self)
+    }
+
+    /// The `.gitignore` lines baked into this policy.
+    pub fn gitignore_lines(&self) -> &[String] {
+        &self.gitignore_lines
+    }
+
+    /// BLAKE3 (hex) of the `.gitignore` the rules were read from, if any.
+    pub fn gitignore_digest(&self) -> Option<&str> {
+        self.gitignore_digest.as_deref()
     }
 
     /// The excluded directory basenames, in effective order.
@@ -322,10 +432,16 @@ impl ExcludeSet {
         }
         if let Some(gi) = &self.gitignore {
             for ancestor in path.ancestors().skip(1) {
-                if ancestor == root {
+                // Stops at the root, and also stops if `path` turns out not to
+                // be under it at all — which is the only honest answer when the
+                // two are spelled differently enough that we cannot relate them.
+                let Some(rel) = relative_slash_path(root, ancestor) else {
+                    break;
+                };
+                if rel.is_empty() {
                     break;
                 }
-                if gi.matched(ancestor, true).is_ignore() {
+                if gi.matched(Path::new(&rel), true).is_ignore() {
                     return Some(ExcludeReason::Gitignore);
                 }
             }
@@ -356,16 +472,26 @@ impl ExcludeSet {
     /// Serialize the policy for the `meta` table.
     ///
     /// Line-oriented rather than delimiter-packed because a directory basename
-    /// may contain almost any byte; a newline is the one thing that is illegal
-    /// in a path component on Windows and vanishingly rare on Unix. The root
-    /// `.gitignore` is referenced, not copied — [`ExcludeSet::decode`] re-reads
-    /// it, so an edited file takes effect at the next query rather than being
-    /// frozen at crawl time.
+    /// may contain almost any byte. A name that *does* contain a line break is
+    /// refused at crawl time ([`ExcludeSet::validate`]) rather than escaped,
+    /// because the failure it produces is invisible until the next query.
+    ///
+    /// The `.gitignore` rules are **copied in, not referenced**. The index owns
+    /// the rules it was built with; a search must not depend on a file that may
+    /// have been edited, deleted or broken since.
     pub fn encode(&self) -> String {
         let mut out = String::from("v1\n");
         out.push_str(&format!("defaults={}\n", u8::from(!self.no_default)));
         out.push_str(&format!("hidden={}\n", self.hidden.as_str()));
         out.push_str(&format!("gitignore={}\n", u8::from(self.uses_gitignore())));
+        if let Some(digest) = &self.gitignore_digest {
+            out.push_str(&format!("gitignore-digest={digest}\n"));
+        }
+        for line in &self.gitignore_lines {
+            out.push_str("gitignore-rule=");
+            out.push_str(line);
+            out.push('\n');
+        }
         for name in &self.extra {
             out.push_str("extra=");
             out.push_str(name);
@@ -374,22 +500,36 @@ impl ExcludeSet {
         out
     }
 
-    /// Rebuild a policy written by [`ExcludeSet::encode`].
+    /// Rebuild a policy written by [`ExcludeSet::encode`]. Reads no files.
     ///
-    /// An unknown version or a malformed line is an error rather than a
-    /// best-effort parse: falling back to the defaults would quietly give the
-    /// delta path a *different* exclusion set than the crawl used, which is the
-    /// exact inconsistency the encoding exists to remove.
-    pub fn decode(text: &str, root: &Path) -> Result<Self> {
+    /// An unknown version, an unknown key or a malformed line is an **error**,
+    /// not a best-effort parse. Falling back to the defaults would quietly give
+    /// the query side a different exclusion set than the crawl used, which is
+    /// the exact inconsistency the encoding exists to remove — and the caller
+    /// cannot tell an approximation from the real thing.
+    ///
+    /// Forward compatibility is the version number's job, not this parser's: a
+    /// future release that adds a rule to the policy bumps `v1`, and an older
+    /// binary meeting `v2` fails here **on purpose**, because it cannot
+    /// reproduce a set it does not understand. What keeps that from being a
+    /// trap is on the other side: a query that cannot read the policy degrades
+    /// to an index-only answer with a stale notice ([`crate::fresh`]) instead
+    /// of exiting non-zero.
+    pub fn decode(text: &str) -> Result<Self> {
         let mut lines = text.lines();
         match lines.next() {
             Some("v1") => {}
-            other => bail!("unknown exclusion policy format: {other:?}"),
+            other => bail!(
+                "unsupported exclusion policy format {other:?} — this index was written by a \
+                 newer sagasu. Re-run `sagasu index <root>` with this build, or upgrade."
+            ),
         }
 
         let mut no_default = false;
         let mut hidden = HiddenPolicy::Include;
         let mut gitignore = false;
+        let mut gitignore_digest: Option<String> = None;
+        let mut gitignore_lines: Vec<String> = Vec::new();
         let mut extra: Vec<String> = Vec::new();
 
         for line in lines {
@@ -402,6 +542,8 @@ impl ExcludeSet {
             match key {
                 "defaults" => no_default = value == "0",
                 "gitignore" => gitignore = value == "1",
+                "gitignore-digest" => gitignore_digest = Some(value.to_string()),
+                "gitignore-rule" => gitignore_lines.push(value.to_string()),
                 "hidden" => {
                     hidden = match value {
                         "include" => HiddenPolicy::Include,
@@ -410,14 +552,69 @@ impl ExcludeSet {
                     }
                 }
                 "extra" => extra.push(value.to_string()),
-                other => bail!("unknown exclusion policy key: {other:?}"),
+                other => bail!(
+                    "unknown exclusion policy key {other:?} — this index was written by a \
+                     newer sagasu. Re-run `sagasu index <root>` with this build, or upgrade."
+                ),
             }
         }
 
-        Self::new(&extra, no_default)
-            .with_hidden(hidden)
-            .with_gitignore(root, gitignore)
+        let set = Self::new(&extra, no_default).with_hidden(hidden);
+        if gitignore {
+            set.with_gitignore_lines(&gitignore_lines, gitignore_digest)
+        } else {
+            Ok(set)
+        }
     }
+}
+
+// ── Path relation ───────────────────────────────────────────────────────────
+
+/// Drop the Windows extended-length prefix (`\\?\`, `\\?\UNC\`).
+///
+/// `std::fs::canonicalize` returns that form on Windows while a path resolved
+/// through Win32 (a USN record run back through `GetFinalPathNameByHandleW`)
+/// does not, and the two must still be recognisable as the same place.
+fn strip_verbatim(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// `path` expressed relative to `root` with `/` separators, or `None` when it
+/// is not under `root` at all. `Some("")` means "is the root".
+///
+/// This is what gitignore rules are matched against, and it is a pure string
+/// function on purpose: the anchoring of a rule like `/dist` depends entirely
+/// on getting this relation right, and the platform where it is easiest to get
+/// wrong (Windows, where the two spellings of a root differ by a prefix and by
+/// case) is the one that cannot be exercised here.
+pub(crate) fn relative_slash_path(root: &Path, path: &Path) -> Option<String> {
+    let root_s = strip_verbatim(&root.to_string_lossy());
+    let path_s = strip_verbatim(&path.to_string_lossy());
+    let root_t = root_s.trim_end_matches(['/', '\\']);
+
+    let head = path_s.get(..root_t.len())?;
+    let same = if cfg!(windows) {
+        head.eq_ignore_ascii_case(root_t)
+    } else {
+        head == root_t
+    };
+    if !same {
+        return None;
+    }
+    let rest = path_s.get(root_t.len()..)?;
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    if !rest.starts_with('/') && !rest.starts_with('\\') {
+        return None;
+    }
+    Some(rest.trim_start_matches(['/', '\\']).replace('\\', "/"))
 }
 
 /// Resolve a database path to its canonical (absolute) form, tolerating a file
@@ -504,7 +701,8 @@ impl CrawlConfig {
 /// Summary of a crawl operation.
 #[derive(Debug, Clone, Default)]
 pub struct CrawlSummary {
-    /// Total files examined by the walker (before filtering).
+    /// Everything the walker was handed (before filtering), including entries
+    /// it could not read. `scanned = indexed + skipped_total() + errors`.
     pub scanned: u64,
     /// Files that were successfully indexed (new + unchanged + changed + renamed).
     pub indexed: u64,
@@ -519,6 +717,17 @@ pub struct CrawlSummary {
     /// Files skipped because a directory above them matched the root
     /// `.gitignore`. Always 0 unless the crawl opted into reading one.
     pub skipped_gitignore: u64,
+    /// Entries the walker could not read: a directory it could not open, or a
+    /// file whose metadata it could not stat.
+    ///
+    /// These are *not* exclusions — nobody asked for them to be dropped — and
+    /// counting them apart is what makes `scanned = indexed + skipped + errors`
+    /// true. Without this counter an unreadable subtree vanishes from the index
+    /// while the summary still adds up and the exit code stays 0.
+    pub errors: u64,
+    /// The first few paths behind [`CrawlSummary::errors`], for the report. A
+    /// number alone does not tell anyone where to look.
+    pub error_samples: Vec<String>,
     /// Files newly inserted.
     pub added: u64,
     /// Files whose metadata changed in place.
@@ -532,10 +741,67 @@ pub struct CrawlSummary {
 }
 
 impl CrawlSummary {
-    /// Every file the walker saw and then dropped, across all three reasons.
-    /// `scanned - skipped_total()` is what reached the store.
+    /// Every file the walker saw and then dropped *by a rule*, across all three
+    /// reasons. Read failures are [`CrawlSummary::errors`], not this.
     pub fn skipped_total(&self) -> u64 {
         self.skipped.values().sum::<u64>() + self.skipped_hidden + self.skipped_gitignore
+    }
+}
+
+/// How many unreadable-entry paths a summary keeps as examples.
+pub const ERROR_SAMPLE_LIMIT: usize = 3;
+
+/// Shared collector for entries the walker could not read.
+#[derive(Debug, Default)]
+pub(crate) struct ErrorLog {
+    count: AtomicU64,
+    samples: Mutex<Vec<String>>,
+}
+
+impl ErrorLog {
+    /// Record one unreadable entry, keeping the first few descriptions.
+    ///
+    /// The description is built lazily: on a tree where a whole mount is
+    /// unreadable this runs once per entry, and only the first few are kept.
+    pub(crate) fn record(&self, detail: impl FnOnce() -> String) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let mut samples = self.samples.lock().unwrap();
+        if samples.len() < ERROR_SAMPLE_LIMIT {
+            samples.push(detail());
+        }
+    }
+
+    /// Record an `ignore` walk error, naming the path when it carries one.
+    pub(crate) fn record_walk_error(&self, err: &ignore::Error) {
+        self.record(|| match error_path(err) {
+            Some(path) => format!("{}: {err}", path.display()),
+            None => err.to_string(),
+        });
+    }
+
+    /// `(count, samples)`, samples sorted so the report is deterministic even
+    /// though the walker threads race to fill them.
+    pub(crate) fn drain(&self) -> (u64, Vec<String>) {
+        let mut samples = self.samples.lock().unwrap().clone();
+        samples.sort();
+        (self.count.load(Ordering::Relaxed), samples)
+    }
+}
+
+/// The path an `ignore::Error` is about, when it names one.
+///
+/// `ignore` wraps errors in `WithPath` / `WithDepth` / `Partial` layers, so the
+/// path is not always at the top. Without it an unreadable subtree is reported
+/// as a bare "permission denied" with no hint of where.
+fn error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            error_path(err)
+        }
+        ignore::Error::Loop { child, .. } => Some(child),
+        ignore::Error::Partial(errs) => errs.iter().find_map(error_path),
+        _ => None,
     }
 }
 
@@ -588,6 +854,9 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
     let excludes = ExcludeSet::new(&config.exclude, config.no_default_excludes)
         .with_hidden(config.hidden)
         .with_gitignore(&root, config.use_gitignore)?;
+    // Before anything is written: a policy that cannot be replayed would make
+    // this crawl report success and every later query fail.
+    excludes.validate()?;
 
     // The database file (and its WAL/SHM siblings) must never be indexed. If the
     // user pointed `--db` inside the crawl root, skip those paths explicitly.
@@ -615,6 +884,7 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
     let skip_map = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
     let skipped_hidden = Arc::new(AtomicU64::new(0));
     let skipped_gitignore = Arc::new(AtomicU64::new(0));
+    let errors = Arc::new(ErrorLog::default());
     let scanned = Arc::new(AtomicU64::new(0));
 
     let threads = if config.threads == 0 {
@@ -629,6 +899,7 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
     let skip_map_ref = skip_map.clone();
     let hidden_ref = skipped_hidden.clone();
     let gitignore_ref = skipped_gitignore.clone();
+    let errors_ref = errors.clone();
     let scanned_ref = scanned.clone();
     let root_ref = root.clone();
     let db_skip_ref = db_skip.clone();
@@ -678,6 +949,7 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                 let skip_map = skip_map_ref.clone();
                 let hidden_count = hidden_ref.clone();
                 let gitignore_count = gitignore_ref.clone();
+                let errors = errors_ref.clone();
                 let scanned = scanned_ref.clone();
                 let root = root_ref.clone();
                 let db_skip = db_skip_ref.clone();
@@ -688,8 +960,20 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                 let mut hidden_memo: HashMap<PathBuf, bool> = HashMap::new();
 
                 Box::new(move |entry| {
-                    let Ok(entry) = entry else {
-                        return WalkState::Continue;
+                    // A directory we cannot open takes its whole subtree with
+                    // it. Counting the failure is the only thing standing
+                    // between that and a summary that adds up while files are
+                    // missing.
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(e) => {
+                            // Counted as scanned as well, so that
+                            // `scanned = indexed + skipped + errors` stays an
+                            // identity rather than an approximation.
+                            scanned.fetch_add(1, Ordering::Relaxed);
+                            errors.record_walk_error(&e);
+                            return WalkState::Continue;
+                        }
                     };
 
                     if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -731,8 +1015,12 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                         None => {}
                     }
 
-                    let Ok(meta) = entry.metadata() else {
-                        return WalkState::Continue;
+                    let meta = match entry.metadata() {
+                        Ok(meta) => meta,
+                        Err(e) => {
+                            errors.record_walk_error(&e);
+                            return WalkState::Continue;
+                        }
                     };
 
                     let size = meta.len() as i64;
@@ -864,6 +1152,11 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
 
             let deleted = store.tombstone_unseen(&tx_db, scan_gen)?;
 
+            // Recorded inside the crawl's transaction, so the count always
+            // describes the scan the rest of this database came from.
+            let (error_count, error_samples) = errors.drain();
+            Store::meta_set_tx(&tx_db, SCAN_ERRORS_KEY, &error_count.to_string())?;
+
             tx_db.commit()?;
 
             let elapsed_secs = t0.elapsed().as_secs_f64();
@@ -878,6 +1171,8 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                 skipped,
                 skipped_hidden: skipped_hidden.load(Ordering::Relaxed),
                 skipped_gitignore: skipped_gitignore.load(Ordering::Relaxed),
+                errors: error_count,
+                error_samples,
                 added,
                 changed,
                 renamed,
@@ -1022,7 +1317,7 @@ mod tests {
             .with_hidden(HiddenPolicy::SkipOsHidden)
             .with_gitignore(&dir, true)
             .unwrap();
-        let decoded = ExcludeSet::decode(&original.encode(), &dir).unwrap();
+        let decoded = ExcludeSet::decode(&original.encode()).unwrap();
 
         assert_eq!(decoded.names(), original.names());
         assert_eq!(decoded.hidden_policy(), HiddenPolicy::SkipOsHidden);
@@ -1037,11 +1332,10 @@ mod tests {
     fn a_policy_we_cannot_read_is_an_error_not_a_shrug() {
         // Falling back to the defaults would give the delta path a different
         // exclusion set than the crawl used, without saying so.
-        let root = Path::new("/root");
-        assert!(ExcludeSet::decode("v2\n", root).is_err());
-        assert!(ExcludeSet::decode("v1\nhidden=maybe\n", root).is_err());
-        assert!(ExcludeSet::decode("v1\nnonsense\n", root).is_err());
-        assert!(ExcludeSet::decode("v1\nfuture_key=1\n", root).is_err());
+        assert!(ExcludeSet::decode("v2\n").is_err());
+        assert!(ExcludeSet::decode("v1\nhidden=maybe\n").is_err());
+        assert!(ExcludeSet::decode("v1\nnonsense\n").is_err());
+        assert!(ExcludeSet::decode("v1\nfuture_key=1\n").is_err());
     }
 
     #[test]
@@ -1082,5 +1376,233 @@ mod tests {
         assert_eq!(set.reason_for_path(&dir.join("a.txt"), &dir), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    // ── F1: the rules travel with the index ─────────────────────────────────
+
+    #[test]
+    fn gitignore_rules_are_baked_into_the_policy_not_referenced() {
+        let dir = std::env::temp_dir().join(format!("sagasu_bake_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(GITIGNORE_FILE), "dist/\n*.log\n").unwrap();
+
+        let at_crawl = ExcludeSet::new(&[], false)
+            .with_gitignore(&dir, true)
+            .unwrap();
+        let encoded = at_crawl.encode();
+        assert!(encoded.contains("gitignore-rule=dist/"), "{encoded}");
+
+        // Now do the two things that used to break every query on this index:
+        // replace the file with something that does not compile, then delete it.
+        std::fs::write(dir.join(GITIGNORE_FILE), "build/{tmp\n").unwrap();
+        let after_break = ExcludeSet::decode(&encoded).expect("policy still readable");
+        assert_eq!(
+            after_break.reason_for_path(&dir.join("dist").join("a.js"), &dir),
+            Some(ExcludeReason::Gitignore),
+            "a broken .gitignore must not change what the index already decided"
+        );
+
+        std::fs::remove_file(dir.join(GITIGNORE_FILE)).unwrap();
+        let after_delete = ExcludeSet::decode(&encoded).expect("policy still readable");
+        assert_eq!(
+            after_delete.gitignore_rules(),
+            at_crawl.gitignore_rules(),
+            "deleting the file must not silently widen the set"
+        );
+        assert_eq!(
+            after_delete.reason_for_path(&dir.join("dist").join("a.js"), &dir),
+            Some(ExcludeReason::Gitignore)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_broken_gitignore_names_the_rule_that_broke() {
+        let dir = std::env::temp_dir().join(format!("sagasu_badgi_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(GITIGNORE_FILE), "ok/\nbuild/{tmp\n").unwrap();
+
+        let err = ExcludeSet::new(&[], false)
+            .with_gitignore(&dir, true)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("build/{tmp"), "must name the rule: {msg}");
+        assert!(
+            !msg.contains("failed to read"),
+            "a rule that does not compile is not a read failure: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── F3: names that cannot survive the encoding ──────────────────────────
+
+    #[test]
+    fn an_exclude_name_with_a_line_break_is_refused() {
+        // A `\n` would make the crawl succeed and every later query fail to
+        // parse the policy; a trailing `\r` would parse back as a different
+        // name, so the crawl and the delta scan would exclude different sets.
+        for bad in ["foo\nbar", "foo\r", "\n"] {
+            let err = ExcludeSet::new(&[bad.to_string()], false)
+                .validate()
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("line break"),
+                "{bad:?}: unexpected error"
+            );
+        }
+        assert!(ExcludeSet::new(&["".to_string()], false)
+            .validate()
+            .is_err());
+        assert!(ExcludeSet::new(&["build".to_string()], false)
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn a_carriage_return_does_not_survive_a_round_trip_so_it_is_rejected() {
+        // The proof that rejecting is not overcautious: this is what would
+        // happen if it were allowed through.
+        let set = ExcludeSet::new(&["scratch\r".to_string()], false);
+        let decoded = ExcludeSet::decode(&set.encode()).unwrap();
+        assert!(set.contains("scratch\r"));
+        assert!(
+            !decoded.contains("scratch\r"),
+            "the name comes back different — which is why validate() refuses it"
+        );
+    }
+
+    // ── F7: relating two spellings of the same root ─────────────────────────
+
+    #[test]
+    fn a_path_is_related_to_its_root_by_components_not_by_string_prefix() {
+        let rel = |root: &str, path: &str| relative_slash_path(Path::new(root), Path::new(path));
+
+        assert_eq!(rel("/a/b", "/a/b/c/d.txt").as_deref(), Some("c/d.txt"));
+        assert_eq!(rel("/a/b/", "/a/b/c").as_deref(), Some("c"));
+        assert_eq!(rel("/a/b", "/a/b").as_deref(), Some(""));
+        // A sibling that merely shares a string prefix is not under the root.
+        assert_eq!(rel("/a/b", "/a/bc/d.txt"), None);
+        assert_eq!(rel("/a/b", "/x/y"), None);
+    }
+
+    #[test]
+    fn the_windows_extended_length_prefix_does_not_break_the_relation() {
+        // `sagasu index` canonicalizes the root to `\\?\C:\…` while a USN record
+        // resolves to `C:\…`. If these do not relate, gitignore rules with a
+        // slash in them silently stop matching while basename rules keep
+        // working — the least noticeable possible failure (issue #14, F7).
+        let rel = |root: &str, path: &str| relative_slash_path(Path::new(root), Path::new(path));
+
+        assert_eq!(
+            rel(r"\\?\C:\proj", r"C:\proj\dist\a.js").as_deref(),
+            Some("dist/a.js")
+        );
+        assert_eq!(
+            rel(r"C:\proj", r"\\?\C:\proj\dist\a.js").as_deref(),
+            Some("dist/a.js")
+        );
+        assert_eq!(
+            rel(r"\\?\UNC\srv\share", r"\\srv\share\dist").as_deref(),
+            Some("dist")
+        );
+    }
+
+    #[test]
+    fn an_anchored_gitignore_rule_matches_against_the_root_it_is_given() {
+        // Compiled once, matched against two spellings of the same root.
+        let lines = vec!["/dist".to_string(), "cache/".to_string()];
+        let set = ExcludeSet::new(&[], false)
+            .with_gitignore_lines(&lines, None)
+            .unwrap();
+
+        for root in ["/proj", "/other/proj"] {
+            let root = Path::new(root);
+            assert_eq!(
+                set.reason_for_path(&root.join("dist").join("a.js"), root),
+                Some(ExcludeReason::Gitignore),
+                "anchored rule under {root:?}"
+            );
+            // `/dist` is anchored: a nested `dist` must NOT match.
+            assert_eq!(
+                set.reason_for_path(&root.join("sub").join("dist").join("a.js"), root),
+                None,
+                "anchored rule must not match a nested directory under {root:?}"
+            );
+            // An unanchored rule matches at any depth.
+            assert_eq!(
+                set.reason_for_path(&root.join("sub").join("cache").join("a.js"), root),
+                Some(ExcludeReason::Gitignore)
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_outside_the_root_is_not_judged_by_gitignore_rules() {
+        let set = ExcludeSet::new(&[], false)
+            .with_gitignore_lines(&["dist/".to_string()], None)
+            .unwrap();
+        assert_eq!(
+            set.reason_for_path(Path::new("/elsewhere/dist/a.js"), Path::new("/proj")),
+            None
+        );
+    }
+
+    // ── F2: the error log ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_walk_error_is_reported_with_the_path_it_is_about() {
+        // `ignore` wraps errors in layers, so the path is not always at the top.
+        // Without digging it out, an unreadable subtree is reported as a bare
+        // "permission denied" with no hint of where to look.
+        let inner = ignore::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+        let wrapped = ignore::Error::WithDepth {
+            depth: 2,
+            err: Box::new(ignore::Error::WithPath {
+                path: PathBuf::from("/root/locked"),
+                err: Box::new(inner),
+            }),
+        };
+        assert_eq!(error_path(&wrapped), Some(Path::new("/root/locked")));
+
+        let log = ErrorLog::default();
+        log.record_walk_error(&wrapped);
+        let (count, samples) = log.drain();
+        assert_eq!(count, 1);
+        assert!(samples[0].contains("/root/locked"), "{samples:?}");
+        assert!(samples[0].contains("permission denied"), "{samples:?}");
+
+        // An error that names no path still counts; it just cannot say where.
+        let anonymous = ignore::Error::InvalidDefinition;
+        assert_eq!(error_path(&anonymous), None);
+        let log = ErrorLog::default();
+        log.record_walk_error(&anonymous);
+        assert_eq!(log.drain().0, 1);
+    }
+
+    #[test]
+    fn the_error_log_keeps_a_bounded_sample_and_a_full_count() {
+        let log = ErrorLog::default();
+        for i in 0..10 {
+            log.record(|| format!("/x/{i:02}"));
+        }
+        let (count, samples) = log.drain();
+        assert_eq!(count, 10);
+        assert_eq!(samples.len(), ERROR_SAMPLE_LIMIT);
+        // Sorted, so a parallel walk still produces a deterministic report.
+        let mut sorted = samples.clone();
+        sorted.sort();
+        assert_eq!(samples, sorted);
     }
 }

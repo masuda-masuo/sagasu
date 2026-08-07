@@ -43,6 +43,15 @@ pub(crate) fn print_fresh(outcome: &FreshOutcome) {
         if let DeltaStatus::RescanRequired(reason) = d.status {
             println!("          rescan required: {}", reason.as_str());
         }
+        // Unreadable entries are not exclusions: a directory the live scan
+        // could not open may hold changes this answer does not know about.
+        if d.errors > 0 {
+            println!(
+                "          note: {} entr(ies) were unreadable during the live scan, so \
+                 changes below them are not in this answer",
+                d.errors
+            );
+        }
         // A source that cannot see renames makes a renamed file vanish from the
         // answer instead of moving in it. Saying so once beats letting the gap
         // read as "no such file".

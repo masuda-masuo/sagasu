@@ -378,6 +378,10 @@ impl UsnDeltaSource {
             detects_renames: true,
             scanned,
             excluded,
+            // The journal read either succeeds or fails as a whole; there is no
+            // per-entry read to fail the way a directory walk has.
+            errors: 0,
+            error_samples: Vec::new(),
             elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
             marker: marker.clone(),
         })
@@ -395,6 +399,8 @@ fn failed(marker: &ScanMarker, reason: RescanReason, t0: Instant) -> DeltaSet {
         detects_renames: false,
         scanned: 0,
         excluded: 0,
+        errors: 0,
+        error_samples: Vec::new(),
         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
         marker: marker.clone(),
     }

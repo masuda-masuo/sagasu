@@ -105,7 +105,15 @@ pub fn cmd_search(args: SearchArgs) -> Result<()> {
         outcome.live_hits,
         outcome.hits.len() - outcome.live_hits,
     );
+    // Which extension rule the live half of this answer was judged by. It
+    // decides whether an edited file comes back refreshed or disappears, so it
+    // belongs next to the answer rather than in the build log.
+    println!("text    : {}", outcome.text_policy.describe());
     print_fresh(&outcome);
+
+    if let Some(notice) = &outcome.text_policy_notice {
+        eprintln!("WARNING: {notice}");
+    }
 
     if outcome.total_docs == 0 {
         eprintln!(

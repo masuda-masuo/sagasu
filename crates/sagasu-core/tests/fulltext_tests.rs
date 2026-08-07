@@ -896,3 +896,84 @@ fn a_text_config_file_extends_the_allowlist() {
         "the file is digested"
     );
 }
+
+// ── 30. The extension rule travels with the index (#15) ───────────────────
+
+#[test]
+fn the_index_records_the_extension_policy_it_was_built_with() {
+    use sagasu_core::text::TextPolicy;
+
+    let (data, db, index) = tmp_dirs("policy_persist");
+    write_bytes(&data, "model.obj", "v 0.0\n# タラバガニ\n".as_bytes());
+    write_file(&data, "notes.dat", "メモ\n");
+    crawl(&data, &db);
+
+    let config_path = db.join("sagasu-text.toml");
+    fs::write(
+        &config_path,
+        "text_ext   = [\"obj\"]\nbinary_ext = [\"dat\"]\n",
+    )
+    .unwrap();
+
+    let mut config = ft_config(&db, &index);
+    config.text_policy = TextPolicy::load(&config_path).unwrap();
+    let summary = fulltext::build(&config).unwrap();
+    assert_eq!(summary.indexed, 1);
+
+    // The rule the build used is now the index's, and reading it back needs no
+    // config file and no particular working directory. Before this, `sagasu
+    // fulltext` picked up ./sagasu-text.toml automatically and a `sagasu
+    // search` run from anywhere else did not — so the live grep judged an
+    // edited `.obj` as binary and the file vanished from the answer.
+    let store = Store::open(db_path(&db)).unwrap();
+    let restored = TextPolicy::from_index(&store)
+        .unwrap()
+        .expect("the build recorded its policy");
+
+    assert_eq!(restored.text_exts(), ["obj"]);
+    assert_eq!(restored.binary_exts(), ["dat"]);
+    assert!(restored.agrees_with(&config.text_policy));
+    assert_eq!(
+        restored.digest(),
+        config.text_policy.digest(),
+        "the digest identifies which config file produced the index"
+    );
+
+    // Round-trips by effect, not just by bytes.
+    let round_tripped = TextPolicy::decode(&restored.encode()).unwrap();
+    assert!(round_tripped.agrees_with(&restored));
+    assert_eq!(
+        round_tripped.classify_ext(Some("obj")),
+        sagasu_core::text::ExtVerdict::Text
+    );
+    assert_eq!(
+        round_tripped.classify_ext(Some("dat")),
+        sagasu_core::text::ExtVerdict::Binary
+    );
+}
+
+// ── 31. A rebuild without the config does not leave the old rule behind ───
+
+#[test]
+fn rebuilding_without_a_config_clears_the_recorded_policy() {
+    use sagasu_core::text::TextPolicy;
+
+    let (data, db, index) = tmp_dirs("policy_clear");
+    write_bytes(&data, "model.obj", "v 0.0\n".as_bytes());
+    write_file(&data, "a.md", "本文\n");
+    crawl(&data, &db);
+
+    let mut config = ft_config(&db, &index);
+    config.text_policy.add_text_exts(&["obj".to_string()]);
+    assert_eq!(fulltext::build(&config).unwrap().indexed, 2);
+
+    // Rebuild with the built-in lists only. A stale `text_policy` row would
+    // make later searches treat `.obj` as text while the index no longer holds
+    // it — the disagreement pointed the other way.
+    let plain = ft_config(&db, &index);
+    assert_eq!(fulltext::build(&plain).unwrap().indexed, 1);
+
+    let store = Store::open(db_path(&db)).unwrap();
+    let restored = TextPolicy::from_index(&store).unwrap().unwrap();
+    assert!(restored.is_empty(), "{:?}", restored.text_exts());
+}

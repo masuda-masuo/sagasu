@@ -276,6 +276,10 @@ pub enum RescanReason {
     /// The marker was taken by a different delta source (or on another volume),
     /// so its position means nothing to this one.
     MarkerKindMismatch,
+    /// The crawl's exclusion policy could not be read back, so the delta set
+    /// cannot be filtered the way the crawl was. Answering anyway would mix a
+    /// differently-scoped live scan into the index result.
+    PolicyUnreadable,
 }
 
 impl RescanReason {
@@ -289,6 +293,7 @@ impl RescanReason {
             }
             RescanReason::JournalUnavailable => "USN journal unavailable",
             RescanReason::MarkerMissing => "no usable index marker",
+            RescanReason::PolicyUnreadable => "the index's exclusion policy could not be read back",
             RescanReason::MarkerKindMismatch => {
                 "index marker was taken by a different delta source"
             }
@@ -339,6 +344,13 @@ pub struct DeltaSet {
     /// Candidates dropped by the exclusion set. `excluded / (excluded +
     /// entries)` is the noise ratio issue #16 measured at 94%.
     pub excluded: u64,
+    /// Entries the scan could not read (an unopenable directory, a file it
+    /// could not stat). Not exclusions — nobody asked for these to be dropped
+    /// — so they are counted apart, and a delta set with errors in it is
+    /// reported as possibly incomplete rather than as complete.
+    pub errors: u64,
+    /// The first few descriptions behind [`DeltaSet::errors`].
+    pub error_samples: Vec<String>,
     /// Wall-clock cost of the query in milliseconds — the number the freshness
     /// claim lives or dies by.
     pub elapsed_ms: f64,
@@ -359,6 +371,8 @@ impl DeltaSet {
             detects_renames: false,
             scanned: 0,
             excluded: 0,
+            errors: 0,
+            error_samples: Vec::new(),
             elapsed_ms: ms,
             marker: marker.clone(),
         }
@@ -430,9 +444,15 @@ impl DeltaConfig {
     /// index. Reconstructing "the defaults" instead is what let `sagasu index
     /// --exclude` disagree with every later query (design.md §5-2): the crawl
     /// never saw those files, the delta scan did, and a live hit appeared for a
-    /// path with no index row behind it. An index written before the policy was
-    /// persisted has no row, and falls back to the defaults — which is what it
-    /// was crawled with.
+    /// path with no index row behind it.
+    ///
+    /// An index written before the policy was persisted has no row and falls
+    /// back to the built-in defaults. That is **not** a guarantee that it is
+    /// what the index was crawled with — an older build accepted `--exclude`
+    /// and recorded nothing, so such an index really does disagree with the
+    /// answers it now gives, in exactly the way described above. The fallback
+    /// exists so an old database still answers at all; `sagasu status` warns
+    /// that it is a guess and says to re-crawl.
     ///
     /// # Errors
     ///
@@ -444,7 +464,7 @@ impl DeltaConfig {
         };
         let root = PathBuf::from(root);
         let excludes = match store.meta_get(walk::EXCLUDE_POLICY_KEY)? {
-            Some(encoded) => ExcludeSet::decode(&encoded, &root)?,
+            Some(encoded) => ExcludeSet::decode(&encoded)?,
             None => ExcludeSet::new(&[], false),
         };
         Ok(Some(Self {
@@ -641,6 +661,7 @@ impl DeltaSource for MtimeDeltaSource {
         let entries: Mutex<Vec<DeltaEntry>> = Mutex::new(Vec::new());
         let scanned = AtomicU64::new(0);
         let excluded = AtomicU64::new(0);
+        let errors = walk::ErrorLog::default();
         let found = AtomicU64::new(0);
         let truncated = AtomicBool::new(false);
 
@@ -663,12 +684,17 @@ impl DeltaSource for MtimeDeltaSource {
             .follow_links(false);
 
         builder.build_parallel().run(|| {
-            let (config, entries) = (&self.config, &entries);
+            let (config, entries, errors) = (&self.config, &entries, &errors);
             let (scanned, excluded, found, truncated) = (&scanned, &excluded, &found, &truncated);
 
             Box::new(move |entry| {
-                let Ok(entry) = entry else {
-                    return WalkState::Continue;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        scanned.fetch_add(1, Ordering::Relaxed);
+                        errors.record_walk_error(&e);
+                        return WalkState::Continue;
+                    }
                 };
                 if !entry.file_type().is_some_and(|t| t.is_file()) {
                     return WalkState::Continue;
@@ -690,8 +716,12 @@ impl DeltaSource for MtimeDeltaSource {
                     };
                 }
 
-                let Ok(meta) = entry.metadata() else {
-                    return WalkState::Continue;
+                let meta = match entry.metadata() {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        errors.record_walk_error(&e);
+                        return WalkState::Continue;
+                    }
                 };
                 if !changed_since(&meta, since_ns) {
                     return WalkState::Continue;
@@ -725,6 +755,8 @@ impl DeltaSource for MtimeDeltaSource {
             DeltaStatus::Complete
         };
 
+        let (error_count, error_samples) = errors.drain();
+
         Ok(DeltaSet {
             entries,
             status,
@@ -732,6 +764,8 @@ impl DeltaSource for MtimeDeltaSource {
             detects_renames: self.detects_renames(),
             scanned: scanned.load(Ordering::Relaxed),
             excluded: excluded.load(Ordering::Relaxed),
+            errors: error_count,
+            error_samples,
             elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
             marker: marker.clone(),
         })

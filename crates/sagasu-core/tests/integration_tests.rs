@@ -1195,3 +1195,152 @@ fn an_index_without_a_recorded_policy_falls_back_to_the_defaults() {
     assert_eq!(config.excludes.hidden_policy(), walk::HiddenPolicy::Include);
     assert!(!config.excludes.uses_gitignore());
 }
+
+// ── 35. A query outlives an edited .gitignore (#14) ────────────────────────
+
+#[test]
+fn queries_keep_working_when_the_gitignore_changes_after_the_crawl() {
+    use sagasu_core::delta::DeltaConfig;
+
+    let (d, db) = tmp_dir("gitignore_edit");
+    write_file(&d, ".gitignore", "dist/\n");
+    write_file(&d, "dist/bundle.js", "generated");
+    write_file(&d, "README.md", "# hi\n");
+
+    let summary = crawl_scoped(&d, &db, walk::HiddenPolicy::Include, true);
+    assert_eq!(summary.indexed, 2);
+    assert_eq!(summary.skipped_gitignore, 1);
+
+    let root = open_store(&db)
+        .meta_get("root_path")
+        .unwrap()
+        .map(PathBuf::from)
+        .unwrap();
+
+    // Break it. The rules are the index's, not the file's, so nothing moves.
+    write_file(&d, ".gitignore", "build/{tmp\n");
+    let store = open_store(&db);
+    let config = DeltaConfig::from_index(&store, &db_path(&db))
+        .expect("an unparsable file on disk must not fail the query")
+        .unwrap();
+    assert_eq!(
+        config
+            .excludes
+            .reason_for_path(&root.join("dist").join("bundle.js"), &root),
+        Some(walk::ExcludeReason::Gitignore),
+    );
+
+    // Delete it. The delta scan must not suddenly widen to include the
+    // directory the crawl pruned — that would put a live hit on the screen for
+    // a file with no index row behind it.
+    fs::remove_file(d.join(".gitignore")).unwrap();
+    let config = DeltaConfig::from_index(&store, &db_path(&db))
+        .expect("a missing file must not fail the query")
+        .unwrap();
+    assert_eq!(config.excludes.gitignore_rules(), 1);
+    assert_eq!(
+        config
+            .excludes
+            .reason_for_path(&root.join("dist").join("bundle.js"), &root),
+        Some(walk::ExcludeReason::Gitignore),
+    );
+}
+
+// ── 36. An unreplayable exclusion policy is refused at crawl time (#14) ────
+
+#[test]
+fn an_exclude_name_that_cannot_be_replayed_fails_the_crawl_before_it_writes() {
+    let (d, db) = tmp_dir("bad_exclude");
+    write_file(&d, "a.txt", "hi");
+
+    let err = walk::crawl(CrawlConfig {
+        root: d.clone(),
+        db_path: db_path(&db),
+        exclude: vec!["foo\nbar".to_string()],
+        no_default_excludes: false,
+        hidden: Default::default(),
+        use_gitignore: false,
+        threads: 1,
+    })
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("line break"),
+        "unexpected error: {err:#}"
+    );
+
+    // And nothing was written: a crawl that reported success while making every
+    // later query fail is the failure this check exists to prevent.
+    let store = open_store(&db);
+    assert!(store.meta_get("root_path").unwrap().is_none());
+    assert!(store.meta_get(walk::EXCLUDE_POLICY_KEY).unwrap().is_none());
+}
+
+// ── 37. Unreadable entries are counted, not silently dropped (#14) ────────
+
+#[test]
+fn a_walk_error_is_counted_and_kept_out_of_the_skip_totals() {
+    let (d, db) = tmp_dir("walk_errors");
+    write_file(&d, "visible.txt", "hi");
+    write_file(&d, "locked/secret.txt", "hi");
+
+    // Only meaningful without the privilege that overrides file permissions;
+    // as root (and on Windows) a mode-000 directory is still readable, so the
+    // precondition is checked rather than assumed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = d.join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = fs::read_dir(&locked).is_err();
+
+        let summary = crawl(&d, &db);
+        // Restore before asserting so a failure does not leave an undeletable
+        // directory behind.
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+        if unreadable {
+            assert_eq!(summary.indexed, 1, "only visible.txt is reachable");
+            assert_eq!(summary.errors, 1, "the unopenable directory is counted");
+            assert_eq!(
+                summary.skipped_total(),
+                0,
+                "an unreadable entry is not an exclusion — nobody asked for it"
+            );
+            assert!(
+                summary.error_samples.iter().any(|s| s.contains("locked")),
+                "the sample must name the path: {:?}",
+                summary.error_samples
+            );
+            assert_eq!(
+                summary.scanned,
+                summary.indexed + summary.skipped_total() + summary.errors,
+                "scanned = indexed + skipped + errors"
+            );
+            // And it survives into the report someone reads later.
+            let store = open_store(&db);
+            assert_eq!(
+                store.meta_get(walk::SCAN_ERRORS_KEY).unwrap().as_deref(),
+                Some("1")
+            );
+        } else {
+            // Running with a privilege that ignores the mode: the walk sees
+            // everything, which is itself the identity we care about.
+            assert_eq!(summary.indexed, 2);
+            assert_eq!(summary.errors, 0);
+            assert_eq!(
+                summary.scanned,
+                summary.indexed + summary.skipped_total() + summary.errors
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let summary = crawl(&d, &db);
+        assert_eq!(
+            summary.scanned,
+            summary.indexed + summary.skipped_total() + summary.errors,
+            "scanned = indexed + skipped + errors"
+        );
+    }
+}

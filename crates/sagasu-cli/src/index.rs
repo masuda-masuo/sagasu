@@ -128,7 +128,33 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
         }
     }
 
+    // Not an exclusion: nobody asked for these to be dropped. An unreadable
+    // directory takes its whole subtree with it, and without this line the
+    // summary still adds up and the exit code is still 0.
+    if summary.errors > 0 {
+        println!("unreadable   : {}", summary.errors);
+        for sample in &summary.error_samples {
+            println!("  {sample}");
+        }
+        if summary.errors as usize > summary.error_samples.len() {
+            println!(
+                "  ({} more)",
+                summary.errors as usize - summary.error_samples.len()
+            );
+        }
+    }
+
     println!("elapsed      : {:.3}s", summary.elapsed_secs);
+
+    if summary.errors > 0 {
+        eprintln!(
+            "WARNING: {} entr(ies) could not be read and are missing from the index \
+             along with anything below them. They are not excluded — they were \
+             unreachable — so re-running after fixing permissions will change the \
+             file count.",
+            summary.errors
+        );
+    }
 
     // Zero files indexed = warning + non-zero exit.
     if summary.indexed == 0 {
@@ -152,6 +178,7 @@ fn print_scope(config: &CrawlConfig, root: &Path) -> Result<()> {
     let excludes = ExcludeSet::new(&config.exclude, config.no_default_excludes)
         .with_hidden(config.hidden)
         .with_gitignore(root, config.use_gitignore)?;
+    excludes.validate()?;
 
     println!("root         : {}", root.display());
     if excludes.names().is_empty() {
@@ -162,16 +189,31 @@ fn print_scope(config: &CrawlConfig, root: &Path) -> Result<()> {
     println!(
         "hidden       : {}",
         match excludes.hidden_policy() {
-            HiddenPolicy::Include => "indexed (dot-directories are content)",
-            HiddenPolicy::SkipOsHidden => "skipped when the OS marks them hidden",
+            HiddenPolicy::Include => "indexed (dot-directories are content)".to_string(),
+            // Saying "skipped" on a platform with no hidden attribute would be a
+            // claim about a filter that cannot fire.
+            HiddenPolicy::SkipOsHidden if cfg!(windows) =>
+                "skipped when the OS marks them hidden".to_string(),
+            HiddenPolicy::SkipOsHidden => format!(
+                "--skip-hidden has no effect on {}: only Windows has a hidden attribute \
+                 (a leading dot is not one)",
+                std::env::consts::OS
+            ),
         }
     );
     println!(
         "gitignore    : {}",
         if excludes.uses_gitignore() {
             format!(
-                "{} rule(s) from the root .gitignore, directories only",
-                excludes.gitignore_rules()
+                "{} rule(s) from the root .gitignore, directories only{}",
+                excludes.gitignore_rules(),
+                match excludes.gitignore_digest() {
+                    // The rules are copied into the index, so the file may
+                    // change afterwards without changing the answer. The digest
+                    // is what lets someone check which version was baked in.
+                    Some(d) => format!(" (digest {})", &d[..d.len().min(12)]),
+                    None => " (no .gitignore at the root)".to_string(),
+                }
             )
         } else {
             "not applied".to_string()
