@@ -113,6 +113,26 @@
 //! already the deterministic, cased-folded, capped vocabulary this project
 //! defends, so a label cannot say something the facet counts would deny.
 //!
+//! ## Which single value to take next
+//!
+//! The axis ranking says *which question to read*. It does not say which answer
+//! to pick, and the two are not the same: values are listed count-descending, so
+//! the first row of the best axis is the **largest** bucket — the one that
+//! narrows least. Measured on `/usr`, following it blindly gives
+//! 63,901 → 21,006 → 21,002 → 21,000: a `path:` value carried by 99.98% of the
+//! group is not universal, so it survives the exclusion and keeps being offered.
+//!
+//! So [`BrowseView::recommended`] is computed separately, in the same
+//! information-theoretic frame as the axis score: the step worth taking is the
+//! one whose *outcome* is least predictable, i.e. the value maximising the
+//! binary entropy `H(p, 1−p)` of "is my file in this bucket?" — the share
+//! closest to one half. It is chosen only from values that are actually on
+//! screen ([`FacetAxis::values`]); recommending something the caller was never
+//! shown would be a worse trap than recommending a bad step.
+//!
+//! Ties (`p` and `1−p` have the same entropy) go to the smaller bucket, then to
+//! tag order — see [`pick_next`].
+//!
 //! ## Determinism
 //!
 //! design.md §6 asks for a hierarchy that does not reshuffle under re-indexing,
@@ -122,8 +142,15 @@
 //! - every ordering here is a **total** order. Scores are floats, so they are
 //!   compared through [`rank_key`], which rounds to a fixed 1e-6 grid; ties then
 //!   fall through to integer counts and finally to the tag or namespace name,
-//!   which cannot tie. Rounding first also means a one-ulp difference in `log2`
-//!   or `ln` between two platforms' libm cannot reorder an axis list.
+//!   which cannot tie.
+//!
+//! The rounding is a **bound on the exposure, not a proof of identity**. If two
+//! true scores straddle a grid boundary, a one-ulp difference in `log2` or `ln`
+//! between two platforms' libm can still round them apart and swap them. What it
+//! buys is that such a wobble only matters when the scores sit within 1e-6 of a
+//! boundary, instead of mattering whenever they sit within an ulp of each other.
+//! Determinism on *one* machine against *one* database — which is what the CLI
+//! and the tests assert — is exact.
 //!
 //! ## What the counts are, and are not
 //!
@@ -241,6 +268,26 @@ pub struct FacetAxis {
     pub tail_assignments: i64,
 }
 
+/// The one value worth taking next, out of everything on screen.
+///
+/// Separate from the axis ranking because the two answer different questions:
+/// the axis score says which question to read, this says which answer to pick.
+/// See the module docs — reading the first row of the best axis instead is a
+/// step that measurably fails to advance.
+#[derive(Debug, Clone)]
+pub struct NextStep {
+    /// The namespace it came from.
+    pub namespace: String,
+    /// The tag to add to the selection.
+    pub tag: Tag,
+    /// Live files that would remain.
+    pub files: i64,
+    /// `files` as a share of the current selection.
+    pub share: f64,
+    /// Bits this single step resolves: `H(share, 1 − share)`.
+    pub bits: f64,
+}
+
 /// One term of a generated group label.
 #[derive(Debug, Clone)]
 pub struct LabelTerm {
@@ -319,8 +366,20 @@ pub struct BrowseView {
     /// axes that exist here but are dead ends, and it is reported rather than
     /// quietly absent from the list.
     pub axes_refining: usize,
+    /// The single value worth adding next, chosen from the values on screen by
+    /// [`pick_next`]. `None` when nothing is on screen to take.
+    ///
+    /// In the core rather than in the CLI so that the terminal and the M4 UI
+    /// recommend the same step. A UI that ordered its own buttons and offered
+    /// the first one would reproduce, silently, the "advances by four files per
+    /// click" behaviour this exists to avoid.
+    pub recommended: Option<NextStep>,
     /// First files of the selection, `file_id` order. Not existence-checked —
     /// that is the caller's job, exactly as in `sagasu tags`.
+    ///
+    /// `file_id` is assigned by the parallel crawl, so this order is stable for
+    /// a given database but **not** across two independent indexings of the same
+    /// tree. It is a page, not a ranking.
     pub preview: Vec<FileRow>,
     /// Freshness of the layer all of the above was read from.
     pub snapshot: TagLayerSnapshot,
@@ -363,6 +422,61 @@ pub fn axis_bits(counts: &[i64], matched: i64, shown: usize) -> f64 {
         bits -= p * p.log2();
     }
     bits
+}
+
+/// Bits a single yes/no step resolves: `H(share, 1 − share)`.
+///
+/// Maximal (1 bit) at a half, zero at either end. This is what makes a step that
+/// keeps 99.98% of the group score ~0.002 and lose to anything else on screen.
+pub fn step_bits(share: f64) -> f64 {
+    if !(share > 0.0 && share < 1.0) {
+        return 0.0;
+    }
+    -share * share.log2() - (1.0 - share) * (1.0 - share).log2()
+}
+
+/// The value worth taking next, out of everything the caller can see.
+///
+/// Searches only [`FacetAxis::values`] — the rows that are on screen — and picks
+/// the maximum [`step_bits`]. Ties (a share of `p` and one of `1 − p` carry the
+/// same entropy) go to the **smaller** bucket, because between two equally
+/// informative steps the one that leaves less to read is the better step; then
+/// to namespace and tag order, which cannot tie.
+pub fn pick_next(axes: &[FacetAxis], matched: i64) -> Option<NextStep> {
+    if matched <= 0 {
+        return None;
+    }
+    let mut best: Option<NextStep> = None;
+    for axis in axes {
+        for value in &axis.values {
+            let candidate = NextStep {
+                namespace: axis.namespace.clone(),
+                tag: value.tag.clone(),
+                files: value.files,
+                share: value.share,
+                bits: step_bits(value.share),
+            };
+            let better = match &best {
+                None => true,
+                Some(b) => {
+                    (
+                        rank_key(candidate.bits),
+                        -candidate.files,
+                        // Reversed so that `>` below means "sorts earlier".
+                        std::cmp::Reverse((&candidate.namespace, &candidate.tag)),
+                    ) > (
+                        rank_key(b.bits),
+                        -b.files,
+                        std::cmp::Reverse((&b.namespace, &b.tag)),
+                    )
+                }
+            };
+            if better {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
 }
 
 /// c-TF-IDF weight of one term. See the module docs for the definition.
@@ -437,6 +551,11 @@ pub fn browse(store: &Store, query: &BrowseQuery) -> Result<BrowseView> {
         tagindex::files_in_selection(store, &selected, query.preview as i64)?
     };
 
+    // Only over the axes that survive `max_axes`: the recommendation has to be
+    // something the caller was shown.
+    let axes: Vec<FacetAxis> = axes.into_iter().take(query.max_axes).collect();
+    let recommended = pick_next(&axes, matched);
+
     Ok(BrowseView {
         selected,
         matched,
@@ -444,9 +563,10 @@ pub fn browse(store: &Store, query: &BrowseQuery) -> Result<BrowseView> {
         label,
         label_vocabulary,
         universal,
-        axes: axes.into_iter().take(query.max_axes).collect(),
+        axes,
         axes_total,
         axes_refining,
+        recommended,
         preview,
         snapshot,
     })
@@ -752,6 +872,87 @@ mod tests {
         // One value on every file: caller excludes it, but the maths must not
         // produce a NaN if it does not.
         assert!(axis_bits(&[10], 10, 8).is_finite());
+    }
+
+    fn axis(namespace: &str, values: &[(&str, i64)], matched: i64) -> FacetAxis {
+        FacetAxis {
+            namespace: namespace.to_string(),
+            score: 0.0,
+            coverage: 1.0,
+            files: matched,
+            distinct: values.len() as i64,
+            values: values
+                .iter()
+                .map(|(v, n)| FacetValue {
+                    tag: Tag::new(namespace, v).unwrap(),
+                    files: *n,
+                    share: *n as f64 / matched as f64,
+                })
+                .collect(),
+            tail_assignments: 0,
+        }
+    }
+
+    #[test]
+    fn a_step_that_keeps_almost_everything_resolves_almost_nothing() {
+        assert!((step_bits(0.5) - 1.0).abs() < 1e-12);
+        assert!(step_bits(0.9998) < 0.005, "{}", step_bits(0.9998));
+        assert!(step_bits(0.0002) < 0.005);
+        // Degenerate shares are zero rather than NaN.
+        assert_eq!(step_bits(0.0), 0.0);
+        assert_eq!(step_bits(1.0), 0.0);
+        assert_eq!(step_bits(-1.0), 0.0);
+    }
+
+    #[test]
+    fn the_recommendation_is_not_the_biggest_bucket() {
+        // The shape measured on /usr: the top-ranked axis leads with a value
+        // carried by all but four files of the group. Taking it is a step that
+        // does not move.
+        let axes = vec![
+            axis(
+                "path",
+                &[("go1", 21002), ("local", 21002), ("src", 12000)],
+                21006,
+            ),
+            axis("ext", &[("go", 10500), ("md", 300)], 21006),
+        ];
+        let next = pick_next(&axes, 21006).expect("something is on screen");
+        assert_eq!(next.tag.to_string(), "ext:go", "picked {}", next.tag);
+        assert!(next.bits > 0.99, "{}", next.bits);
+        // …and the first row of the first axis, which the CLI used to take, is
+        // the worst step available.
+        assert!(step_bits(21002.0 / 21006.0) < 0.01);
+    }
+
+    #[test]
+    fn between_two_equally_informative_steps_the_smaller_group_wins() {
+        // 30% and 70% carry identical binary entropy. The one that leaves less
+        // to read is the better step.
+        let axes = vec![axis("ext", &[("big", 70), ("small", 30)], 100)];
+        let next = pick_next(&axes, 100).unwrap();
+        assert_eq!(next.tag.to_string(), "ext:small");
+
+        // Exact tie in both bits and size: namespace then tag order decides, and
+        // it decides the same way every time.
+        let tied = vec![
+            axis("zzz", &[("a", 50)], 100),
+            axis("aaa", &[("b", 50)], 100),
+        ];
+        let first = pick_next(&tied, 100).unwrap();
+        assert_eq!(first.tag.to_string(), "aaa:b");
+        assert_eq!(
+            pick_next(&tied, 100).unwrap().tag.to_string(),
+            first.tag.to_string()
+        );
+    }
+
+    #[test]
+    fn nothing_on_screen_means_no_recommendation() {
+        assert!(pick_next(&[], 100).is_none());
+        // An axis whose values were all cut by the display budget.
+        assert!(pick_next(&[axis("ext", &[], 100)], 100).is_none());
+        assert!(pick_next(&[axis("ext", &[("a", 5)], 100)], 0).is_none());
     }
 
     #[test]

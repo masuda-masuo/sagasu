@@ -39,7 +39,7 @@ pub mod text;
 pub mod usn;
 pub mod walk;
 
-pub use browse::{BrowseQuery, BrowseView, FacetAxis, FacetValue, LabelTerm};
+pub use browse::{BrowseQuery, BrowseView, FacetAxis, FacetValue, LabelTerm, NextStep};
 pub use delta::{DeltaCache, DeltaSet, DeltaSource, DeltaStatus, ScanMarker};
 pub use fresh::{FreshConfig, FreshHit, FreshOutcome};
 pub use fulltext::{FulltextConfig, FulltextSummary, SearchConfig, SearchHit, SearchOutcome};
