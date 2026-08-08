@@ -17,6 +17,7 @@ use sagasu_core::Store;
 
 use crate::json;
 use crate::output::{mib, Output, Report};
+use crate::Outcome;
 
 #[derive(Parser)]
 pub struct StatusArgs {
@@ -51,7 +52,7 @@ impl PolicyState {
     }
 }
 
-pub fn cmd_status(args: StatusArgs, mode: Output) -> Result<()> {
+pub fn cmd_status(args: StatusArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
     let store = Store::open(&args.db)?;
     let stats = store.get_stats()?;
@@ -102,7 +103,9 @@ pub fn cmd_status(args: StatusArgs, mode: Output) -> Result<()> {
         );
     }
 
-    Ok(())
+    // `status` is a report: it always has an answer (the report itself), so
+    // only 0 and 2 (errors) exist for it.
+    Ok(Outcome::Success)
 }
 
 /// The human rendering of the index report.

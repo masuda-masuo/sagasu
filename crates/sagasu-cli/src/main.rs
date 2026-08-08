@@ -98,6 +98,26 @@ enum Command {
 /// Default location of the tantivy index, used by both `fulltext` and `search`.
 const DEFAULT_INDEX_DIR: &str = "fulltext-index";
 
+/// What a subcommand did, decoupled from the process exit code so the 0/1/2
+/// contract (docs/cli.md §6) is owned in exactly one place.
+///
+/// A subcommand never calls `process::exit` itself: it returns one of these,
+/// or an `Err`, and [`run`] is the only function that turns that into a code.
+/// The scattered exits that produced the old 2-value contract were exactly
+/// this enum's reason to exist.
+pub(crate) enum Outcome {
+    /// The command ran correctly and the answer is non-empty — exit 0.
+    Success,
+    /// Read command: ran correctly, but the answer is empty — exit 1.
+    Empty,
+    /// The setup was unusable or no work was done; the command already warned
+    /// about it on stderr — exit 2. Kept apart from `Err` because its message
+    /// is a `WARNING:`, not an `error:` line, and apart from `Empty` because
+    /// "nothing was indexed" / "the index is empty" is a broken setup, not a
+    /// legitimate "no match".
+    Unusable,
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -105,7 +125,18 @@ fn main() {
 
     let mode = Output::from_flag(cli.json);
 
-    let result = match cli.command {
+    process::exit(run(cli.command, mode));
+}
+
+/// Run one subcommand and map its outcome to the process exit code.
+///
+/// 0 = ran fine with an answer; 1 = read command whose answer is empty; 2 =
+/// everything that used to mean "problem" — `anyhow` errors (`error:` on
+/// stderr) and the unusable-setup / no-work-done cases the subcommands already
+/// reported as warnings. clap usage errors exit 2 on their own, which is the
+/// same code by design (docs/cli.md §6).
+fn run(command: Command, mode: Output) -> i32 {
+    let result = match command {
         Command::Index(args) => index::cmd_index(args, mode),
         Command::Hash(args) => index::cmd_hash(args, mode),
         Command::Fulltext(args) => index::cmd_fulltext(args, mode),
@@ -117,8 +148,13 @@ fn main() {
         Command::Status(args) => status::cmd_status(args, mode),
     };
 
-    if let Err(e) = result {
-        eprintln!("error: {e:#}");
-        process::exit(1);
+    match result {
+        Ok(Outcome::Success) => 0,
+        Ok(Outcome::Empty) => 1,
+        Ok(Outcome::Unusable) => 2,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            2
+        }
     }
 }

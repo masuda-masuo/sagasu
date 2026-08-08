@@ -10,7 +10,6 @@
 //! gets to define for itself.
 
 use std::path::PathBuf;
-use std::process;
 
 use anyhow::Result;
 use clap::Parser;
@@ -21,7 +20,7 @@ use sagasu_core::fulltext::{self, SearchConfig};
 
 use crate::json;
 use crate::output::{print_fresh, warn_fresh, Output, Report};
-use crate::DEFAULT_INDEX_DIR;
+use crate::{Outcome, DEFAULT_INDEX_DIR};
 
 // ── search ──────────────────────────────────────────────────────────────────
 
@@ -76,7 +75,7 @@ pub struct SearchArgs {
     text_config: Option<PathBuf>,
 }
 
-pub fn cmd_search(args: SearchArgs, mode: Output) -> Result<()> {
+pub fn cmd_search(args: SearchArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
     crate::index::reject_removed_config_flag("--text-config", args.text_config.as_deref())?;
 
@@ -148,15 +147,21 @@ pub fn cmd_search(args: SearchArgs, mode: Output) -> Result<()> {
         json::warnings(&report);
     }
 
+    // An empty full-text index is an unusable setup, not a legitimate "no
+    // match" — the old 2-value contract could not tell "indexed, found
+    // nothing" from "nothing is indexed". It exits 2, the same as any error;
+    // only the zero-hit case below is the empty answer (1).
     if outcome.total_docs == 0 {
-        process::exit(1);
+        return Ok(Outcome::Unusable);
     }
-
-    Ok(())
+    if outcome.hits.is_empty() {
+        return Ok(Outcome::Empty);
+    }
+    Ok(Outcome::Success)
 }
 
 /// Search a bare tantivy directory with no metadata index behind it.
-fn search_index_only(args: &SearchArgs, report: &mut Report) -> Result<()> {
+fn search_index_only(args: &SearchArgs, report: &mut Report) -> Result<Outcome> {
     let config = SearchConfig {
         index_dir: args.index_dir.clone(),
         db_path: None,
@@ -213,11 +218,15 @@ fn search_index_only(args: &SearchArgs, report: &mut Report) -> Result<()> {
         json::warnings(report);
     }
 
+    // Same contract as the merged search above: an empty index is an unusable
+    // setup (2), a usable index with zero hits is the empty answer (1).
     if outcome.total_docs == 0 {
-        process::exit(1);
+        return Ok(Outcome::Unusable);
     }
-
-    Ok(())
+    if outcome.hits.is_empty() {
+        return Ok(Outcome::Empty);
+    }
+    Ok(Outcome::Success)
 }
 
 // ── find ────────────────────────────────────────────────────────────────────
@@ -245,7 +254,7 @@ pub struct FindArgs {
     delta_limit: usize,
 }
 
-pub fn cmd_find(args: FindArgs, mode: Output) -> Result<()> {
+pub fn cmd_find(args: FindArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
     let db = args.db.display().to_string();
     let config = FreshConfig {
@@ -297,5 +306,15 @@ pub fn cmd_find(args: FindArgs, mode: Output) -> Result<()> {
         json::warnings(&report);
     }
 
-    Ok(())
+    // An empty metadata index answers every query empty for a reason that has
+    // nothing to do with the query — the §7 #3 case. It is an unusable setup,
+    // not the legitimate empty answer, so it exits 2 like any error; the
+    // zero-hit case below is the empty answer (1).
+    if live_files == 0 {
+        return Ok(Outcome::Unusable);
+    }
+    if outcome.hits.is_empty() {
+        return Ok(Outcome::Empty);
+    }
+    Ok(Outcome::Success)
 }

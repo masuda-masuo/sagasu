@@ -300,8 +300,8 @@ skipped      : 41
 
 ### 2-5. 対象0件は正常終了ではない
 
-- `sagasu index` が 0 件 → stderr に警告、**終了コード 1**
-- `sagasu fulltext` が 0 件 → stderr に警告、**終了コード 1**
+- `sagasu index` が 0 件 → stderr に警告、**終了コード 2**(issue #49 で 1→2。正本は docs/cli.md §6)
+- `sagasu fulltext` が 0 件 → stderr に警告、**終了コード 2**(同上)
 - `sagasu status` は後からでもそれが見える:
   - クロールが無い / live 0件 / 全文索引はあるのに 0 文書 のそれぞれに警告
 

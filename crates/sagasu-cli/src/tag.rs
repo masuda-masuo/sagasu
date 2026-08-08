@@ -9,7 +9,6 @@
 //! the others.
 
 use std::path::{Path, PathBuf};
-use std::process;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -25,6 +24,7 @@ use crate::json;
 use crate::output::{
     print_tag_freshness, tag_freshness, Output, Report, TagFreshness, TagFreshnessReport,
 };
+use crate::Outcome;
 
 // ── sagasu tag ──────────────────────────────────────────────────────────────
 
@@ -80,7 +80,7 @@ pub struct TagArgs {
 }
 
 /// Run `sagasu tag`.
-pub fn cmd_tag(args: TagArgs, mode: Output) -> Result<()> {
+pub fn cmd_tag(args: TagArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
     reject_removed_config_flag("--rules", args.rules.as_deref())?;
 
@@ -128,11 +128,15 @@ pub fn cmd_tag(args: TagArgs, mode: Output) -> Result<()> {
         );
     }
 
+    // No live files, or no file tagged, was exit 1 under the old 2-value
+    // contract; it is a failure (the tag layer is unusable), not an empty
+    // answer, so it moves to 2 with the rest. The warning above already said
+    // why.
     if summary.files == 0 || summary.tagged == 0 {
-        process::exit(1);
+        Ok(Outcome::Unusable)
+    } else {
+        Ok(Outcome::Success)
     }
-
-    Ok(())
 }
 
 /// The human rendering of a tag build.
@@ -275,7 +279,7 @@ pub struct TagsArgs {
 }
 
 /// Run `sagasu tags`.
-pub fn cmd_tags(args: TagsArgs, mode: Output) -> Result<()> {
+pub fn cmd_tags(args: TagsArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
     reject_removed_config_flag("--rules", args.rules.as_deref())?;
 
@@ -417,7 +421,18 @@ pub fn cmd_tags(args: TagsArgs, mode: Output) -> Result<()> {
     if report.is_json() {
         json::warnings(&report);
     }
-    Ok(())
+
+    // Two different "nothing" answers, with two different codes: no tag layer
+    // at all is an unusable setup (2, same as the namespace overview below);
+    // a built layer that simply has no file carrying these tags is the
+    // legitimate empty answer (1).
+    if rows.is_empty() {
+        if tagindex::namespace_counts(&store)?.is_empty() {
+            return Ok(Outcome::Unusable);
+        }
+        return Ok(Outcome::Empty);
+    }
+    Ok(Outcome::Success)
 }
 
 /// The namespace overview: the top level of the facet tree.
@@ -427,7 +442,7 @@ fn list_namespaces(
     db: &str,
     freshness: &TagFreshnessReport,
     report: &mut Report,
-) -> Result<()> {
+) -> Result<Outcome> {
     let namespaces = tagindex::namespace_counts(store)?;
     if namespaces.is_empty() {
         report.warn("no tags in this index. Run `sagasu tag` first.");
@@ -435,7 +450,9 @@ fn list_namespaces(
             json::tags_counts(db, "namespaces", None, freshness, &[], &[], 0);
             json::warnings(report);
         }
-        process::exit(1);
+        // No tag layer means there is no tree to browse: an unusable setup
+        // (2), not the legitimate empty answer.
+        return Ok(Outcome::Unusable);
     }
 
     let counts = tagindex::tag_counts(store, None, limit as i64)?;
@@ -452,7 +469,7 @@ fn list_namespaces(
             total,
         );
         json::warnings(report);
-        return Ok(());
+        return Ok(Outcome::Success);
     }
 
     println!("namespaces:");
@@ -465,7 +482,7 @@ fn list_namespaces(
     println!();
     println!("top tags (all namespaces):");
     print_tag_counts(&counts, total);
-    Ok(())
+    Ok(Outcome::Success)
 }
 
 /// Print one facet list, saying how much of it is not on screen.
@@ -493,7 +510,7 @@ fn list_tags(
     db: &str,
     freshness: &TagFreshnessReport,
     report: &mut Report,
-) -> Result<()> {
+) -> Result<Outcome> {
     let total = tagindex::tag_counts_total(store, namespace)?;
     let counts = if total == 0 {
         Vec::new()
@@ -504,7 +521,13 @@ fn list_tags(
     if report.is_json() {
         json::tags_counts(db, "values", namespace, freshness, &[], &counts, total);
         json::warnings(report);
-        return Ok(());
+        // The layer is built (the namespace overview would have exited 2
+        // otherwise); a namespace with no values is the empty answer.
+        return Ok(if total == 0 {
+            Outcome::Empty
+        } else {
+            Outcome::Success
+        });
     }
 
     match namespace {
@@ -513,10 +536,11 @@ fn list_tags(
     }
     if total == 0 {
         println!("  (no tags — is the namespace spelled correctly? `sagasu tags` lists them)");
-        return Ok(());
+        // Same as the JSON branch: the query yielded nothing.
+        return Ok(Outcome::Empty);
     }
     print_tag_counts(&counts, total);
-    Ok(())
+    Ok(Outcome::Success)
 }
 
 /// Explain one file: stored tags beside freshly computed ones.
@@ -527,7 +551,7 @@ fn explain_file(
     db: &str,
     freshness: &TagFreshnessReport,
     report: &mut Report,
-) -> Result<()> {
+) -> Result<Outcome> {
     let loaded = load_config(explicit_config, &[])?;
     let origin = loaded.origin().clone();
     let rules = loaded.into_rules();
@@ -549,6 +573,18 @@ fn explain_file(
     // `--read-magic` build would produce rather than a weaker extension guess.
     let computed = tagindex::explain(&path, root.as_deref(), &rules, true)?;
 
+    // The empty-answer question is asked before rendering so both renderings
+    // answer it identically: a file whose stored tags are empty is "the query
+    // yielded nothing" (1) — unless the tag layer was never built at all, in
+    // which case the setup is unusable (2, same as the namespace overview).
+    let outcome = if tagindex::namespace_counts(store)?.is_empty() {
+        Outcome::Unusable
+    } else if stored.is_empty() {
+        Outcome::Empty
+    } else {
+        Outcome::Success
+    };
+
     if report.is_json() {
         json::tags_explain(
             db,
@@ -562,7 +598,7 @@ fn explain_file(
             computed.capped,
         );
         json::warnings(report);
-        return Ok(());
+        return Ok(outcome);
     }
 
     println!("file    : {path_str}");
@@ -617,5 +653,5 @@ fn explain_file(
             );
         }
     }
-    Ok(())
+    Ok(outcome)
 }
