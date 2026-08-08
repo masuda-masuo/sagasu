@@ -11,6 +11,20 @@
 //!
 //! Temporary directories live under `std::env::temp_dir()` and are keyed by test
 //! name so the tests can run in parallel.
+//!
+//! ## Timestamp discipline
+//!
+//! The delta walk decides "changed since the marker" by comparing kernel
+//! timestamps against the marker the crawl recorded, and kernel-assigned
+//! timestamps come from a coarse clock that can lag the marker's precise
+//! `SystemTime::now()` — so no test here *assumes* a freshly written file lands
+//! after the marker. Every file whose presence in the delta set is asserted is
+//! stamped explicitly past the recorded marker (`stamp_after_marker`); renames
+//! ride on `st_ctime`, which no API can set, so their precondition is *verified*
+//! with a bounded retry (`ensure_ctime_after_marker`). Files whose *absence*
+//! from the delta set is asserted are never metadata-touched after the crawl —
+//! any utimensat/chmod bumps ctime, and the unix source treats `ctime > marker`
+//! as changed (the "ctime trap").
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,16 +87,96 @@ fn build_ft(db_dir: &Path, index_dir: &Path) {
     fulltext::build(&config).unwrap();
 }
 
-/// Give the filesystem clock a moment to move past the crawl marker.
+/// Margin past the recorded marker at which changed files are stamped.
 ///
-/// Sized for Windows, where this is not cosmetic: `SystemTime::now()` (the
-/// marker) comes from `GetSystemTimePreciseAsFileTime`, while a file's
-/// LastWriteTime comes from the interrupt-driven system clock at roughly 15.6 ms
-/// granularity. A file written a few milliseconds after the marker can therefore
-/// carry a timestamp *older* than it. 30 ms clears that window with room to
-/// spare; on the nanosecond-resolution filesystems elsewhere it is free.
-fn tick() {
-    std::thread::sleep(std::time::Duration::from_millis(30));
+/// An explicitly-set mtime is stored as given, so ten seconds is effectively
+/// infinite margin: the coarse-clock lag that made the old 30 ms sleep flaky
+/// only affects *kernel-assigned* timestamps, never a value written by
+/// `utimensat`.
+const TIMESTAMP_MARGIN_NS: i64 = 10 * 1_000_000_000;
+
+/// The wall-clock marker (unix ns) the last crawl recorded.
+fn recorded_marker_ns(db_dir: &Path) -> i64 {
+    Store::open(db_path(db_dir))
+        .unwrap()
+        .delta_marker()
+        .unwrap()
+        .expect("a crawl must record a delta marker")
+        .wall_clock_ns()
+}
+
+/// Set `path`'s mtime to exactly `ns` (unix ns), leaving atime alone.
+fn set_mtime_ns(path: &Path, ns: i64) {
+    filetime::set_file_mtime(
+        path,
+        filetime::FileTime::from_unix_time(
+            ns.div_euclid(1_000_000_000),
+            ns.rem_euclid(1_000_000_000) as u32,
+        ),
+    )
+    .unwrap();
+}
+
+/// Make a file that must appear in the delta set compare as changed since the
+/// recorded marker — as an explicit fact, not a race.
+///
+/// Write the file, then stamp its mtime to `marker_ns + TIMESTAMP_MARGIN_NS`.
+/// This replaces the old `tick()` ("sleep 30 ms and hope the kernel clock moved
+/// past the marker") with a value that is guaranteed newer. It also bumps
+/// ctime, which is consistent: the file is supposed to look touched. It is only
+/// ever called on files whose *presence* in the delta set the test asserts;
+/// files whose absence is asserted are never metadata-touched after the crawl
+/// (the ctime trap — see the module docs).
+fn stamp_after_marker(path: &Path, marker_ns: i64) {
+    set_mtime_ns(path, marker_ns + TIMESTAMP_MARGIN_NS);
+}
+
+/// Make a rename's detectability a *verified* precondition instead of an
+/// assumed one.
+///
+/// On unix the mtime source sees a rename through `st_ctime`, which no API can
+/// set explicitly. The rename itself bumps ctime, but the kernel assigns it
+/// from the coarse clock, which can lag the marker — so after the rename,
+/// verify ctime is past the marker; if not, bump it again with a metadata no-op
+/// (re-applying the same mode is a `chmod`, which updates ctime and never
+/// touches mtime — keeping the "renamed, not modified" shape the source keys
+/// on) and re-check, bounded.
+///
+/// A same-mode `chmod` only advances ctime when it lands in a *new* coarse
+/// clock tick: issued back-to-back with the rename it can be a no-op, which is
+/// why each retry sleeps 5 ms before re-checking — every attempt lands in a
+/// fresh tick and is therefore effective. The 100-attempt bound (~0.5 s of
+/// ticks) covers any realistic lag; exhaustion panics loudly rather than
+/// answering with an unverifiable delta set.
+///
+/// Unix-only: Windows exposes no ctime through `std::fs`, and the rename tests
+/// take the `detects_renames == false` branch there (or the USN source, which
+/// reports renames without ctime).
+#[cfg(unix)]
+fn ensure_ctime_after_marker(path: &Path, marker_ns: i64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut attempts: u32 = 0;
+    loop {
+        let meta = fs::metadata(path).unwrap();
+        let ctime_ns = meta
+            .ctime()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(meta.ctime_nsec());
+        if ctime_ns > marker_ns {
+            return;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "rename at {} never moved ctime past the crawl marker \
+             (ctime={ctime_ns}, marker={marker_ns})",
+            path.display()
+        );
+        let mode = meta.permissions();
+        fs::set_permissions(path, mode).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// Whether the delta source that answered this query can observe a rename.
@@ -155,15 +249,21 @@ fn metadata_search_sees_a_file_added_after_indexing() {
     let (d, db, _) = tmp_dirs("meta_add");
     write_file(&d, "old_report.md", "before");
     crawl(&d, &db);
-    tick();
+    let marker_ns = recorded_marker_ns(&db);
 
-    write_file(&d, "new_report.md", "after");
+    let new = write_file(&d, "new_report.md", "after");
+    // The new file must land on the live side: stamp its mtime past the marker
+    // explicitly instead of sleeping and hoping the kernel clock moved.
+    stamp_after_marker(&new, marker_ns);
 
     let outcome = fresh::find(&find_config(&db, "report"), None).unwrap();
     let n = names(&outcome);
     assert!(n.contains(&"new_report.md".to_string()), "{n:?}");
     assert!(n.contains(&"old_report.md".to_string()), "{n:?}");
     assert_eq!(origin_of(&outcome, "new_report.md"), Some(HitOrigin::Live));
+    // old_report.md must stay on the index side, and it will: it was written
+    // before the crawl and is never metadata-touched afterwards (ctime trap),
+    // so it cannot enter the delta set.
     assert_eq!(origin_of(&outcome, "old_report.md"), Some(HitOrigin::Index));
     assert!(outcome.stale.is_none(), "{:?}", outcome.stale);
 }
@@ -174,8 +274,12 @@ fn metadata_search_drops_a_file_deleted_after_indexing() {
     write_file(&d, "keep_report.md", "a");
     let gone = write_file(&d, "gone_report.md", "b");
     crawl(&d, &db);
-    tick();
 
+    // keep_report.md was written before the crawl and is never metadata-touched
+    // afterwards (ctime trap: any utimensat/chmod bumps ctime, and the unix
+    // source reads `ctime > marker` as changed). Its pre-crawl timestamps are
+    // already safely below the marker — the marker is recorded after those
+    // writes complete — so `delta.entries == 0` below stays strict.
     fs::remove_file(&gone).unwrap();
 
     let outcome = fresh::find(&find_config(&db, "report"), None).unwrap();
@@ -191,9 +295,12 @@ fn metadata_search_returns_fresh_size_for_a_file_changed_after_indexing() {
     let (d, db, _) = tmp_dirs("meta_change");
     write_file(&d, "notes_report.md", "short");
     crawl(&d, &db);
-    tick();
+    let marker_ns = recorded_marker_ns(&db);
 
-    write_file(&d, "notes_report.md", &"x".repeat(4096));
+    let p = write_file(&d, "notes_report.md", &"x".repeat(4096));
+    // The file must look *changed* since the marker: overwriting alone leaves
+    // its timestamp to the kernel's coarse clock, so stamp it explicitly.
+    stamp_after_marker(&p, marker_ns);
 
     let outcome = fresh::find(&find_config(&db, "report"), None).unwrap();
     assert_eq!(outcome.hits.len(), 1);
@@ -211,9 +318,18 @@ fn metadata_search_follows_a_rename_made_after_indexing() {
     let (d, db, _) = tmp_dirs("meta_rename");
     write_file(&d, "draft_report.md", "content");
     crawl(&d, &db);
-    tick();
+    // Rename detection on unix rides on st_ctime, which no API can set
+    // explicitly, so make the precondition *verified* instead of assumed:
+    // after the rename, ensure the observed ctime is past the marker (bounded
+    // retry — see `ensure_ctime_after_marker`). On Windows the `stat` source
+    // cannot see the rename at all (the `detects_renames` branch below), so
+    // there is nothing to verify there.
+    #[cfg(unix)]
+    let marker_ns = recorded_marker_ns(&db);
 
     fs::rename(d.join("draft_report.md"), d.join("final_report.md")).unwrap();
+    #[cfg(unix)]
+    ensure_ctime_after_marker(&d.join("final_report.md"), marker_ns);
 
     let outcome = fresh::find(&find_config(&db, "report"), None).unwrap();
     let n = names(&outcome);
@@ -253,8 +369,9 @@ fn a_rename_a_source_cannot_see_drops_the_old_path_rather_than_returning_it() {
     let (d, db, _) = tmp_dirs("blind_rename");
     write_file(&d, "draft_report.md", "content");
     crawl(&d, &db);
-    tick();
-
+    // With the merge disabled below, no delta walk runs at all, so the rename's
+    // timestamps never enter the picture — the dropped old path is the merge's
+    // existence check, not a timestamp comparison.
     fs::rename(d.join("draft_report.md"), d.join("final_report.md")).unwrap();
 
     let mut config = find_config(&db, "report");
@@ -276,9 +393,10 @@ fn fulltext_search_sees_a_file_added_after_indexing() {
     write_file(&d, "a.md", "既存の文書には索引という語が入っている。\n");
     crawl(&d, &db);
     build_ft(&db, &ft);
-    tick();
+    let marker_ns = recorded_marker_ns(&db);
 
-    write_file(&d, "b.md", "新しい文書にも索引という語を書いた。\n");
+    let b = write_file(&d, "b.md", "新しい文書にも索引という語を書いた。\n");
+    stamp_after_marker(&b, marker_ns);
 
     let outcome = fresh::search(&search_config(&db, &ft, "索引"), None).unwrap();
     let n = names(&outcome);
@@ -296,14 +414,19 @@ fn fulltext_search_reflects_an_edit_made_after_indexing() {
     write_file(&d, "other.md", "こちらの文書にも索引がある。\n");
     crawl(&d, &db);
     build_ft(&db, &ft);
-    tick();
+    let marker_ns = recorded_marker_ns(&db);
 
     // The term the index knows about is removed; a new one takes its place.
-    write_file(
+    let doc = write_file(
         &d,
         "doc.md",
         "この文書は書き換えられ、鮮度という語になった。\n",
     );
+    // doc.md must enter the delta set as *changed*; other.md must not (its
+    // absence is what makes `dropped_changed == 1` below), so other.md is never
+    // metadata-touched after the crawl (ctime trap) and doc.md is stamped
+    // explicitly.
+    stamp_after_marker(&doc, marker_ns);
 
     // The removed term must no longer match the edited file.
     let stale_term = fresh::search(&search_config(&db, &ft, "索引"), None).unwrap();
@@ -330,8 +453,10 @@ fn fulltext_search_drops_a_file_deleted_after_indexing() {
     write_file(&d, "gone.md", "索引の話その二。\n");
     crawl(&d, &db);
     build_ft(&db, &ft);
-    tick();
 
+    // keep.md stays untouched after the crawl (ctime trap — see the metadata
+    // delete test); the deletion is caught by the merge's existence check, and
+    // the delta walk cannot see a file that no longer exists.
     fs::remove_file(d.join("gone.md")).unwrap();
 
     let outcome = fresh::search(&search_config(&db, &ft, "索引"), None).unwrap();
@@ -345,9 +470,15 @@ fn fulltext_search_follows_a_rename_made_after_indexing() {
     write_file(&d, "before.md", "移動しても索引から辿れるべき本文。\n");
     crawl(&d, &db);
     build_ft(&db, &ft);
-    tick();
+    // Same verified precondition as the metadata rename test: on unix the new
+    // path must be seen via ctime, which is verified (bounded retry) rather
+    // than assumed; on Windows the `detects_renames` branch below decides.
+    #[cfg(unix)]
+    let marker_ns = recorded_marker_ns(&db);
 
     fs::rename(d.join("before.md"), d.join("after.md")).unwrap();
+    #[cfg(unix)]
+    ensure_ctime_after_marker(&d.join("after.md"), marker_ns);
 
     let outcome = fresh::search(&search_config(&db, &ft, "索引"), None).unwrap();
     let n = names(&outcome);
@@ -379,10 +510,15 @@ fn fulltext_live_side_honours_query_negation() {
     write_file(&d, "seed.md", "索引の説明。\n");
     crawl(&d, &db);
     build_ft(&db, &ft);
-    tick();
+    let marker_ns = recorded_marker_ns(&db);
 
-    write_file(&d, "wanted.md", "索引についての新しいメモ。\n");
-    write_file(&d, "unwanted.md", "索引と鮮度の両方に触れたメモ。\n");
+    let wanted = write_file(&d, "wanted.md", "索引についての新しいメモ。\n");
+    let unwanted = write_file(&d, "unwanted.md", "索引と鮮度の両方に触れたメモ。\n");
+    // Both new files must reach the live side: wanted.md to be returned, and
+    // unwanted.md to be *excluded by the negation* — a file that never made it
+    // into the delta set would pass the `!contains` assertion vacuously.
+    stamp_after_marker(&wanted, marker_ns);
+    stamp_after_marker(&unwanted, marker_ns);
 
     // Both new files contain 索引; only one also contains 鮮度.
     let outcome = fresh::search(&search_config(&db, &ft, "索引 -鮮度"), None).unwrap();
@@ -401,12 +537,14 @@ fn live_hits_lead_the_page_without_taking_all_of_it() {
         write_file(&d, &format!("indexed_{i}_report.md"), "x");
     }
     crawl(&d, &db);
-    tick();
+    let marker_ns = recorded_marker_ns(&db);
 
     // More changed files than the whole page: without a reservation the ranked
-    // index result would vanish behind them.
+    // index result would vanish behind them. All six must be in the delta set
+    // for the live half of the page to fill, so each is stamped explicitly.
     for i in 0..6 {
-        write_file(&d, &format!("changed_{i}_report.md"), "y");
+        let p = write_file(&d, &format!("changed_{i}_report.md"), "y");
+        stamp_after_marker(&p, marker_ns);
     }
 
     let mut config = find_config(&db, "report");
@@ -429,10 +567,11 @@ fn live_hits_take_the_free_slots_when_the_index_has_none() {
     let (d, db, _) = tmp_dirs("live_share_free");
     write_file(&d, "seed.txt", "x");
     crawl(&d, &db);
-    tick();
+    let marker_ns = recorded_marker_ns(&db);
 
     for i in 0..4 {
-        write_file(&d, &format!("changed_{i}_report.md"), "y");
+        let p = write_file(&d, &format!("changed_{i}_report.md"), "y");
+        stamp_after_marker(&p, marker_ns);
     }
 
     let mut config = find_config(&db, "report");
@@ -456,9 +595,10 @@ fn the_live_grep_uses_the_same_extension_policy_as_the_index_build() {
     build.threads = 2;
     build.text_policy.add_text_exts(&["obj".to_string()]);
     fulltext::build(&build).unwrap();
-    tick();
+    let marker_ns = recorded_marker_ns(&db);
 
-    write_file(&d, "custom.obj", "書き換えたが索引という語は残す。\n");
+    let custom = write_file(&d, "custom.obj", "書き換えたが索引という語は残す。\n");
+    stamp_after_marker(&custom, marker_ns);
 
     // A search told nothing inherits it, and the live side refreshes the file.
     //
@@ -520,10 +660,13 @@ fn a_delta_set_over_the_cap_is_truncated_and_reported_stale() {
     let (d, db, _) = tmp_dirs("truncate");
     write_file(&d, "seed_report.md", "seed");
     crawl(&d, &db);
-    tick();
+    let marker_ns = recorded_marker_ns(&db);
 
+    // Truncation needs at least `delta_limit + 1` files past the marker, so
+    // every changed file is stamped explicitly.
     for i in 0..5 {
-        write_file(&d, &format!("changed_{i}_report.md"), "new");
+        let p = write_file(&d, &format!("changed_{i}_report.md"), "new");
+        stamp_after_marker(&p, marker_ns);
     }
 
     let mut config = find_config(&db, "report");
@@ -578,8 +721,10 @@ fn disabling_the_merge_still_says_the_answer_is_unmerged() {
     let (d, db, _) = tmp_dirs("no_delta");
     write_file(&d, "a_report.md", "x");
     crawl(&d, &db);
-    tick();
     write_file(&d, "b_report.md", "y");
+    // The merge is switched off below, so no delta walk runs and b_report.md's
+    // timestamp never enters the picture — there is no marker relation to
+    // establish or verify here.
 
     let mut config = find_config(&db, "report");
     config.no_delta = true;
@@ -613,17 +758,23 @@ fn the_delta_set_applies_the_crawls_exclusion_set() {
     let (d, db, _) = tmp_dirs("delta_excludes");
     write_file(&d, "src/main.rs", "fn main() {}");
     crawl(&d, &db);
-    tick();
-
-    write_file(&d, "src/lib.rs", "pub fn a() {}");
-    write_file(&d, "node_modules/pkg/index.js", "module.exports = 1;");
-    write_file(&d, "target/debug/build.log", "noise");
-
     let marker = Store::open(db_path(&db))
         .unwrap()
         .delta_marker()
         .unwrap()
         .unwrap();
+    let marker_ns = marker.wall_clock_ns();
+
+    let lib = write_file(&d, "src/lib.rs", "pub fn a() {}");
+    write_file(&d, "node_modules/pkg/index.js", "module.exports = 1;");
+    write_file(&d, "target/debug/build.log", "noise");
+    // Only lib.rs must enter the delta set, so its mtime is stamped past the
+    // marker. The two noise files are dropped by the exclusion rules *before*
+    // any timestamp comparison, and the `excluded >= 2` counter asserts those
+    // rules fired — their mtimes never matter. src/main.rs is pre-crawl and
+    // never touched (ctime trap).
+    stamp_after_marker(&lib, marker_ns);
+
     let set = source_for_root(&d, &db)
         .changes_since(&marker, delta::DEFAULT_DELTA_LIMIT)
         .unwrap();
@@ -662,7 +813,10 @@ fn the_delta_set_never_contains_our_own_database() {
         threads: 1,
     })
     .unwrap();
-    tick();
+    // The database is rejected by `skip_paths` *before* any timestamp
+    // comparison, so touching it afterwards (exactly what any query would do,
+    // and what the lines below do) cannot put it in the delta set — there is no
+    // marker relation to establish or verify here.
 
     // Touch the database the way any later query would.
     let store = Store::open(&inner_db).unwrap();
@@ -692,9 +846,13 @@ fn the_mtime_source_accepts_a_usn_marker_by_falling_back_to_its_timestamp() {
     let (d, db, _) = tmp_dirs("marker_degrade");
     write_file(&d, "a.txt", "x");
     crawl(&d, &db);
-    tick();
     write_file(&d, "b.txt", "y");
 
+    // The marker below is a USN marker whose fallback timestamp is constructed
+    // a full minute in the past: both files compare newer than it by
+    // construction, a margin that dwarfs any coarse-clock lag, so neither
+    // stamping nor a sleep is needed here.
+    //
     // A Windows index opened where the journal is unavailable: the USN marker is
     // all we have, and its wall clock still makes the fallback usable.
     let recorded_ns = std::time::SystemTime::now()
@@ -731,8 +889,12 @@ fn the_cache_serves_a_second_query_without_re_walking() {
     let (d, db, _) = tmp_dirs("cache_hit");
     write_file(&d, "a_report.md", "x");
     crawl(&d, &db);
-    tick();
-    write_file(&d, "b_report.md", "y");
+    let marker_ns = recorded_marker_ns(&db);
+
+    let b = write_file(&d, "b_report.md", "y");
+    // Both queries must see the new file, so it must be in the delta set for
+    // the shared marker: stamp it explicitly.
+    stamp_after_marker(&b, marker_ns);
 
     let cache = DeltaCache::new();
     let first = fresh::find(&find_config(&db, "report"), Some(&cache)).unwrap();
@@ -752,8 +914,12 @@ fn the_cache_is_invalidated_by_a_re_crawl_and_by_hand() {
     let (d, db, _) = tmp_dirs("cache_invalidate");
     write_file(&d, "a_report.md", "x");
     crawl(&d, &db);
-    tick();
-    write_file(&d, "b_report.md", "y");
+    let marker_ns = recorded_marker_ns(&db);
+
+    let b = write_file(&d, "b_report.md", "y");
+    // For the pre-recrawl queries the file must be in the delta set (changed
+    // since marker1), so its mtime is stamped explicitly.
+    stamp_after_marker(&b, marker_ns);
 
     let cache = DeltaCache::new();
     fresh::find(&find_config(&db, "report"), Some(&cache)).unwrap();
@@ -765,9 +931,58 @@ fn the_cache_is_invalidated_by_a_re_crawl_and_by_hand() {
     assert!(!after_invalidate.delta.as_ref().unwrap().cached);
     assert_eq!(cache.stats().misses, 2);
 
-    // A re-crawl moves the marker, which makes every cached entry meaningless
-    // even inside the TTL.
-    crawl(&d, &db);
+    // The re-crawl records a fresh marker; the post-recrawl query must see an
+    // *empty* delta set, so b_report.md has to compare older than that new
+    // marker on every axis the source checks (mtime, and ctime on unix). Its
+    // stamped mtime (marker1 + 10 s) is ahead of any marker recorded a moment
+    // later, so first re-stamp it just below the current wall clock. This
+    // metadata touch happens *before* the re-crawl, which is exactly what the
+    // ctime trap allows. Then make the precondition *verified* instead of
+    // assumed, with the same bounded-retry discipline as the rename tests:
+    // re-crawl until the recorded marker is past b_report.md's mtime and (on
+    // unix) its ctime is not past it. Each iteration is a real crawl over the
+    // same two files; the cache was populated before the crawls, so
+    // marker_invalidations stays 1 however many land.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let b_mtime_ns = now_ns - 1_000_000_000;
+    set_mtime_ns(&b, b_mtime_ns);
+
+    let mut marker2_ns = None;
+    for _ in 0..100 {
+        crawl(&d, &db);
+        let m2 = recorded_marker_ns(&db);
+        // mtime must not be past the marker (b_mtime_ns < m2, i.e. mtime ≤
+        // marker2 — the source's `>` comparison then says "unchanged").
+        let mtime_ok = m2 > b_mtime_ns;
+        // ctime (unix) is kernel-assigned at the re-stamp and must not be past
+        // the marker either; each retry records a later marker, so a lagging
+        // coarse clock clears on the next iteration. Windows exposes no ctime
+        // through `std::fs` and the stat source never consults it.
+        #[cfg(unix)]
+        let ctime_ok = {
+            use std::os::unix::fs::MetadataExt;
+            let meta = fs::metadata(&b).unwrap();
+            let ctime_ns = meta
+                .ctime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(meta.ctime_nsec());
+            ctime_ns <= m2
+        };
+        #[cfg(not(unix))]
+        let ctime_ok = true;
+        if mtime_ok && ctime_ok {
+            marker2_ns = Some(m2);
+            break;
+        }
+    }
+    marker2_ns.expect(
+        "100 re-crawls never recorded a marker after b_report.md's re-stamped \
+         mtime/ctime; the post-recrawl empty-delta precondition cannot be established",
+    );
+
     let after_recrawl = fresh::find(&find_config(&db, "report"), Some(&cache)).unwrap();
     assert!(!after_recrawl.delta.as_ref().unwrap().cached);
     assert_eq!(cache.stats().marker_invalidations, 1);
@@ -804,11 +1019,22 @@ fn a_crawl_records_a_delta_marker_and_bumps_it_on_re_crawl() {
     assert_eq!(store.get_stats().unwrap().delta_marker, Some(first.clone()));
     drop(store);
 
-    tick();
-    crawl(&d, &db);
-
-    let store = Store::open(db_path(&db)).unwrap();
-    let second = store.delta_marker().unwrap().unwrap();
+    // This is a marker-vs-marker relation: no file timestamp is involved, so
+    // nothing needs stamping — but the wall clock can step, so "the re-crawl
+    // records a strictly later marker" is *verified* rather than assumed.
+    // Re-crawl until the recorded marker is past the first (bounded); each
+    // iteration is a real crawl over the same single file.
+    let mut second = None;
+    for _ in 0..50 {
+        crawl(&d, &db);
+        let store = Store::open(db_path(&db)).unwrap();
+        let m = store.delta_marker().unwrap().unwrap();
+        if m.wall_clock_ns() > first.wall_clock_ns() {
+            second = Some(m);
+            break;
+        }
+    }
+    let second = second.expect("50 re-crawls never moved the delta marker past the first");
     assert_ne!(first, second, "a re-crawl must move the marker forward");
     assert!(second.wall_clock_ns() > first.wall_clock_ns());
 }
