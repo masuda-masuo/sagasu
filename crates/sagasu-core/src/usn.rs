@@ -150,16 +150,17 @@ impl UsnDeltaSource {
         // while journal paths are prefix-stripped long forms. Normalizing here
         // puts both in the same shape so the case-insensitive `same_path` in
         // `accepts` matches; otherwise the database and its WAL/SHM siblings
-        // leak into every delta set. A skip path that no longer resolves (the
-        // database was moved, say) keeps its raw value rather than vanishing
-        // from the check.
+        // leak into every delta set. The prefix strip is textual and applies
+        // even when canonicalize fails: the WAL/SHM siblings routinely do not
+        // exist yet (SQLite removes them on a clean close, and re-creates them
+        // during the very query this source is answering), and their raw
+        // values still carry the parent's `\\?\` prefix.
         let skip_paths = config
             .skip_paths
             .iter()
             .map(|p| {
-                p.canonicalize()
-                    .map(|c| strip_extended_prefix(&c.to_string_lossy()))
-                    .unwrap_or_else(|_| p.clone())
+                let resolved = p.canonicalize().unwrap_or_else(|_| p.clone());
+                strip_extended_prefix(&resolved.to_string_lossy())
             })
             .collect();
         let source = Self {
