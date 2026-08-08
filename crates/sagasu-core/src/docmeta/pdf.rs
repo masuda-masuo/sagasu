@@ -51,10 +51,79 @@ pub(super) fn body(path: &Path, max_bytes: u64) -> Result<String> {
     let text = doc
         .extract_text_with_limit(&pages, limit)
         .map_err(|e| anyhow!("failed to extract PDF text: {e}"))?;
+    let text = remove_kerning_spaces(&text);
 
     let mut sink = Sink::new(max_bytes);
     sink.push(&text);
     Ok(sink.finish())
+}
+
+/// Whether `c` is a CJK character in the exact set this rule applies to.
+///
+/// The six ranges are the CJK script blocks a Japanese document actually
+/// mixes: Hiragana, Katakana, CJK Symbols and Punctuation, the two CJK
+/// Unified Ideograph blocks, and Halfwidth/Fullwidth Forms. Deliberately
+/// nothing wider — the CJK Compatibility blocks are excluded, because widening
+/// the set widens the chance of eating a genuine boundary.
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3000}'..='\u{303F}'   // CJK Symbols and Punctuation
+        | '\u{3040}'..='\u{309F}' // Hiragana
+        | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{3400}'..='\u{4DBF}' // CJK Unified Ideographs Extension A
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{FF00}'..='\u{FFEF}' // Halfwidth and Fullwidth Forms
+    )
+}
+
+/// Whether the space between `left` and `right` is a kerning artifact.
+///
+/// `lopdf` emits an ASCII space for a `TJ` kerning adjustment past its
+/// threshold, assuming a large glyph gap means a word boundary. That holds for
+/// Latin but not for Japanese, which is kerned between individual characters —
+/// so the space lands *inside* a word, and the word becomes unreachable (a
+/// split word is found by neither half, which is silence rather than a worse
+/// ranking). Both neighbours must be CJK: next to Latin, digits or punctuation
+/// the space may well be genuine.
+///
+/// Joining is the safe direction, and that is the justification for a
+/// heuristic that is knowingly not always right. If we wrongly join two
+/// genuinely separate Japanese words (`設定 変更` → `設定変更`), Lindera still
+/// segments the compound and both halves remain searchable. If we leave a
+/// wrongly split word, neither half of it retrieves the document.
+fn is_kerning_artifact_space(left: char, right: char) -> bool {
+    is_cjk(left) && is_cjk(right)
+}
+
+/// Drop ASCII spaces (`U+0020`) whose neighbours on both sides are CJK, in the
+/// PDF extraction path only.
+///
+/// Only `U+0020` is touched, and a run of them collapses away entirely.
+/// Newlines and tabs are structure and stay untouched — page and line
+/// boundaries are real. A space adjacent to Latin, digits or punctuation is
+/// left alone, because there it may well be genuine.
+fn remove_kerning_spaces(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ' ' {
+            let mut end = i;
+            while end < chars.len() && chars[end] == ' ' {
+                end += 1;
+            }
+            let left = i.checked_sub(1).map(|p| chars[p]).unwrap_or('\0');
+            let right = chars.get(end).copied().unwrap_or('\0');
+            if !is_kerning_artifact_space(left, right) {
+                out.extend(std::iter::repeat_n(' ', end - i));
+            }
+            i = end;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// The trailer's info dictionary: `/Author`, `/Title`, `/CreationDate`.
@@ -136,5 +205,53 @@ mod tests {
         // A byte that is not valid UTF-8 falls back rather than returning None.
         let obj = Object::String(vec![0xC9, 0x74, 0xE9], lopdf::StringFormat::Literal);
         assert_eq!(decode_string(&obj).as_deref(), Some("Été"));
+    }
+
+    #[test]
+    fn a_space_between_cjk_characters_is_a_kerning_artifact() {
+        assert!(is_kerning_artifact_space('ッ', 'プ')); // Katakana
+        assert!(is_kerning_artifact_space('設', '定')); // CJK ideographs
+        assert!(is_kerning_artifact_space('の', '設')); // Hiragana + ideograph
+        assert!(is_kerning_artifact_space('。', '設')); // CJK punctuation
+    }
+
+    #[test]
+    fn a_space_next_to_latin_or_a_digit_is_genuine() {
+        assert!(!is_kerning_artifact_space('l', 'w')); // Latin both sides
+        assert!(!is_kerning_artifact_space('設', 'A'));
+        assert!(!is_kerning_artifact_space('A', '設'));
+        assert!(!is_kerning_artifact_space('1', '設'));
+        assert!(!is_kerning_artifact_space('設', '2'));
+        assert!(!is_kerning_artifact_space('2', '0'));
+    }
+
+    #[test]
+    fn remove_kerning_spaces_joins_cjk_and_keeps_real_spaces() {
+        // The issue-#66 shape: a kerned `TJ` array split the word here.
+        assert_eq!(remove_kerning_spaces("バックアッ プの設定"), "バックアップの設定");
+        // Two genuinely separate words join, and stay searchable via Lindera's
+        // compound segmentation — the asymmetry that makes joining the safe
+        // direction.
+        assert_eq!(remove_kerning_spaces("設定 変更"), "設定変更");
+        assert_eq!(remove_kerning_spaces("hello world"), "hello world");
+        assert_eq!(remove_kerning_spaces("設定 A"), "設定 A");
+        assert_eq!(remove_kerning_spaces("A 設定"), "A 設定");
+        assert_eq!(remove_kerning_spaces("2024 設定"), "2024 設定");
+        assert_eq!(remove_kerning_spaces("設定 2"), "設定 2");
+        assert_eq!(remove_kerning_spaces("a 設定 変更 b"), "a 設定変更 b");
+    }
+
+    #[test]
+    fn a_run_of_spaces_between_cjk_collapses_entirely() {
+        assert_eq!(remove_kerning_spaces("バックアッ  プ"), "バックアップ");
+        assert_eq!(remove_kerning_spaces("バックアッ   プ"), "バックアップ");
+        // A run next to Latin is not an artifact: nothing is dropped.
+        assert_eq!(remove_kerning_spaces("a   b"), "a   b");
+    }
+
+    #[test]
+    fn a_newline_between_cjk_is_structure_not_kerning() {
+        assert_eq!(remove_kerning_spaces("設定\n変更"), "設定\n変更");
+        assert_eq!(remove_kerning_spaces("設定\t変更"), "設定\t変更");
     }
 }
