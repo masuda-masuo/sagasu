@@ -200,7 +200,8 @@ walk して数えているからで、これは意図的に速度と引き換え
 | 段 | 入力 | 結果 |
 |---|---|---|
 | 1. 許可リスト | 拡張子 | text — 1バイトも読まずに索引 |
-| 2. 拒否リスト | 拡張子 | binary — 開かずに落とす(PDF/Office/画像/実行形式) |
+| 1.5. 抽出器の照会 | 拡張子 | PDF / docx / xlsx / pptx は専用パーサで本文を取り出す(issue #40) |
+| 2. 拒否リスト | 拡張子 | binary — 開かずに落とす(画像/実行形式/古い Office 形式) |
 | 3. 内容サンプリング | 先頭512バイト | どちらのリストにも無いものはここで決める |
 
 3段目があるので、`Makefile` `LICENSE` `.tmpl` `.vim` のように**誰も拡張子リストに
@@ -213,8 +214,16 @@ walk して数えているからで、これは意図的に速度と引き換え
 
 **既知の制限**: Shift_JIS / EUC-JP / UTF-16 は「デコードできない」ので binary 扱い。
 文字コード判定は未実装。**黙って落とすのではなく、`binary or undecodable content`
-として数えて出す。** PDF / Office の本文抽出はスコープ外(別 issue)で、
-これも `unsupported format` として数える。
+として数えて出す。**
+
+**PDF / Office は抽出する**(issue #40)。`.pdf` / `.docx` / `.xlsx` / `.pptx` は
+1.5 段目の抽出器に回り、本文と埋め込みメタデータ(作成者・タイトル・撮影機種)が取れる。
+壊れたファイルは `unsupported format (media/binary/legacy documents)` ではなく
+**`document extraction failed`** に別計上し、
+先頭数件はパスと理由をそのまま出す(「この形式は読まない」と「読める形式だがこの
+ファイルが壊れている」は利用者の取るべき行動が違う)。`.doc` / `.xls` / `.ppt` /
+OpenDocument / `.rtf` は拒否リストのまま。抽出 feature を落としてビルドした場合は
+抽出器が何も返さず、拒否リストに落ちて `unsupported format` に戻る(#40 以前の挙動)。
 
 ### 2-2. 許可リストはユーザーが広げられる
 
@@ -273,19 +282,23 @@ given +text hbs; the live scan used the latter, …
 config       : sagasu.toml (found in the working directory)
   +text      : tmpl
 candidates   : 95
-indexed      : 54
+indexed      : 84
   by ext     : 48
   by sniff   : 6        ← 大きいとリストに足す価値のある形式がある合図
-skipped      : 41
-  unsupported format (PDF/Office/media/binary): 38
+  by extract : 30       ← PDF / docx / xlsx / pptx(issue #40)
+skipped      : 11
+  unsupported format (media/binary/legacy documents): 8
   binary or undecodable content: 3
   by extension:
-    .pdf: 30
     .png: 8
     (no extension): 3
 ```
 
-`by extension` は「41件落ちた」を**次の一手**に変える行。`.mjs: 41` と出れば
+抽出に失敗したファイルがあれば `document extraction failed` の行と、
+その下に**パスと理由**が先頭数件だけ並ぶ(`(… and N more)` 付き)。
+索引前に格子を分割した文書があれば `long lines :` の行が出る(design.md §4-2-2)。
+
+`by extension` は「11件落ちた」を**次の一手**に変える行。`.mjs: 41` と出れば
 足すべき引数がそのまま読める。
 
 ### 2-4. sniff の既知の性質
