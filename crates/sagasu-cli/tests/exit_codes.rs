@@ -49,6 +49,25 @@ fn run_with_env(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
     )
 }
 
+/// The spelling `sagasu` will print and store for a path it canonicalizes.
+///
+/// Mirrors `walk::canonical_prefix`: resolve, then drop the Windows verbatim
+/// prefix (`std::fs::canonicalize` returns `\\?\C:\…` there and the tool's
+/// output does not carry it). Tests must compare against this rather than
+/// against whatever they typed — on the Windows CI runner `temp_dir()` is an
+/// 8.3 short path and the two differ.
+fn canonical_display(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = resolved.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s
+    }
+}
+
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// A unique temporary directory, removed on drop.
@@ -275,6 +294,13 @@ fn exclude_prefix_prunes_and_status_reports_the_rule() {
     std::fs::write(fx.root.join("proc/cmdline"), "init").unwrap();
     std::fs::write(fx.root.join("b.txt"), "world\n").unwrap();
     let prefix = fx.root.join("proc");
+    // What the tool will *display* and store is the canonical spelling, not
+    // the one typed here — prefixes are canonicalized so a symlinked or
+    // short-name spelling still prunes (issue #43). This is not hypothetical
+    // on Windows: the CI runner's `temp_dir()` is an 8.3 short path
+    // (`C:\Users\RUNNER~1\…`) that canonicalizes to the long form, which is
+    // exactly how this assertion first caught the difference.
+    let shown = canonical_display(&prefix);
 
     // The flag is a sibling of --exclude, clearly named so the two cannot be
     // confused: names are filtered per file, prefixes prune the walk.
@@ -292,9 +318,9 @@ fn exclude_prefix_prunes_and_status_reports_the_rule() {
         "the prune must be attributed to the prefix rule: {stdout}"
     );
     assert!(
-        stdout.contains(&format!("pruned paths : {}", prefix.display()))
-            || stdout.contains(&format!(", {}", prefix.display())),
-        "the scope must list the pruned prefix: {stdout}"
+        stdout.contains(&format!("pruned paths : {shown}"))
+            || stdout.contains(&format!(", {shown}")),
+        "the scope must list the pruned prefix as {shown}: {stdout}"
     );
 
     // The rule survives into the index and `status` reports it, replayed from
@@ -302,8 +328,8 @@ fn exclude_prefix_prunes_and_status_reports_the_rule() {
     let (code, stdout, _) = run(&["status", "--db", fx.db.to_str().unwrap()]);
     assert_eq!(code, 0, "a report is always an answer");
     assert!(
-        stdout.contains(prefix.to_str().unwrap()),
-        "status must replay the pruned prefix from the policy: {stdout}"
+        stdout.contains(&shown),
+        "status must replay the pruned prefix from the policy as {shown}: {stdout}"
     );
 
     // A relative prefix is refused at crawl time rather than silently
