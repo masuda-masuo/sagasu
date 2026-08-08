@@ -266,6 +266,64 @@ fn search_on_empty_fulltext_index_exits_2() {
 // ── index / hash / fulltext / tag / status (write and report side) ──────────
 
 #[test]
+fn exclude_prefix_prunes_and_status_reports_the_rule() {
+    let fx = Fixture::new("exclude-prefix", "a.txt", "hello\n");
+    // A fixture pseudo-filesystem: the walker must not descend into it, the
+    // same way it must not descend into the real /proc on Linux (issue #43).
+    std::fs::create_dir_all(fx.root.join("proc/self")).unwrap();
+    std::fs::write(fx.root.join("proc/self/status"), "cpu").unwrap();
+    std::fs::write(fx.root.join("proc/cmdline"), "init").unwrap();
+    std::fs::write(fx.root.join("b.txt"), "world\n").unwrap();
+    let prefix = fx.root.join("proc");
+
+    // The flag is a sibling of --exclude, clearly named so the two cannot be
+    // confused: names are filtered per file, prefixes prune the walk.
+    let (code, stdout, _) = run(&[
+        "index",
+        fx.root.to_str().unwrap(),
+        "--db",
+        fx.db.to_str().unwrap(),
+        "--exclude-prefix",
+        prefix.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "indexing with the prefix pruned must exit 0");
+    assert!(
+        stdout.contains("(excluded prefix): 1"),
+        "the prune must be attributed to the prefix rule: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("pruned paths : {}", prefix.display()))
+            || stdout.contains(&format!(", {}", prefix.display())),
+        "the scope must list the pruned prefix: {stdout}"
+    );
+
+    // The rule survives into the index and `status` reports it, replayed from
+    // what the crawl wrote — not from the command line.
+    let (code, stdout, _) = run(&["status", "--db", fx.db.to_str().unwrap()]);
+    assert_eq!(code, 0, "a report is always an answer");
+    assert!(
+        stdout.contains(prefix.to_str().unwrap()),
+        "status must replay the pruned prefix from the policy: {stdout}"
+    );
+
+    // A relative prefix is refused at crawl time rather than silently
+    // matching nothing.
+    let (code, _, stderr) = run(&[
+        "index",
+        fx.root.to_str().unwrap(),
+        "--db",
+        fx.db.to_str().unwrap(),
+        "--exclude-prefix",
+        "proc",
+    ]);
+    assert_eq!(code, 2, "a relative prefix must be refused: {stderr}");
+    assert!(
+        stderr.contains("not an absolute path"),
+        "the refusal must name the problem: {stderr}"
+    );
+}
+
+#[test]
 fn index_with_files_exits_0_and_empty_dir_exits_2() {
     let fx = Fixture::new("index-files", "a.txt", "needle\n");
     assert_eq!(fx.index(), 0, "indexing a directory with files must exit 0");

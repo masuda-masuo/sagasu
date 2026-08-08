@@ -250,6 +250,14 @@ fn print_status(
     match (policy_state, excludes) {
         (PolicyState::Present, Some(excludes)) => {
             println!("exclusion      : {} dir name(s)", excludes.names().len());
+            if excludes.prefixes().is_empty() {
+                println!("  prefixes    : (none)");
+            } else {
+                // The pruned path prefixes, exactly as the crawl wrote them
+                // into the policy (issue #43): pseudo-filesystems by default,
+                // plus whatever `--exclude-prefix` added.
+                println!("  prefixes    : {}", excludes.prefixes().join(", "));
+            }
             println!("  hidden       : {}", excludes.hidden_policy().as_str());
             println!(
                 "  gitignore    : {}",

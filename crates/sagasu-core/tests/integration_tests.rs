@@ -1344,3 +1344,211 @@ fn a_walk_error_is_counted_and_kept_out_of_the_skip_totals() {
         );
     }
 }
+
+// ── 43. Prefix prunes are real prunes, replayed by the delta side (#43) ─────
+
+#[test]
+fn a_prefix_exclusion_prunes_and_is_replayed_by_the_delta_side() {
+    use sagasu_core::delta::{source_for, DeltaConfig};
+
+    let (d, db) = tmp_dir("prefix_prune");
+    write_file(&d, "a.txt", "keep me");
+    write_file(&d, "proc/self/status", "cpu");
+    write_file(&d, "proc/cmdline", "init");
+    // A directory that merely *shares the name* is not under the prefix.
+    write_file(&d, "deep/proc/status", "nested");
+    write_file(&d, "sys/kernel/osrelease", "6.1");
+
+    let root = d.canonicalize().unwrap();
+    let proc_prefix = root.join("proc").to_string_lossy().into_owned();
+    let excludes =
+        walk::ExcludeSet::new(&[], false).with_prefixes(std::slice::from_ref(&proc_prefix));
+
+    let summary = walk::crawl_with_excludes(
+        CrawlConfig {
+            root: root.clone(),
+            db_path: db_path(&db),
+            exclude: vec![],
+            no_default_excludes: false,
+            hidden: Default::default(),
+            use_gitignore: false,
+            threads: 1,
+        },
+        root.clone(),
+        excludes,
+    )
+    .unwrap();
+
+    // The walker did not descend: the whole subtree is one skip, attributed to
+    // the prefix rule and to no other counter.
+    assert_eq!(summary.skipped_prefix, 1);
+    assert!(summary.skipped.is_empty(), "no name rule fired: {:?}", summary.skipped);
+    assert_eq!(summary.indexed, 3); // a.txt, deep/proc/status, sys/kernel/osrelease
+    // The pruned directory itself is the fourth scanned entry — the walker was
+    // handed it, and counting it is what keeps the identity below true.
+    assert_eq!(summary.scanned, 4);
+    assert_eq!(summary.errors, 0);
+    assert_eq!(
+        summary.scanned,
+        summary.indexed + summary.skipped_total() + summary.errors,
+        "scanned = indexed + skipped + errors"
+    );
+
+    // Nothing under the pruned prefix landed in the index.
+    let store = open_store(&db);
+    let under_prefix: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE path >= ? AND path < ?",
+            [
+                format!("{}/", root.join("proc").display()),
+                format!("{}/0", root.join("proc").display()),
+            ],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(under_prefix, 0);
+
+    // The policy the crawl persisted lists the prefix explicitly...
+    let encoded = store
+        .meta_get(walk::EXCLUDE_POLICY_KEY)
+        .unwrap()
+        .expect("the crawl records its policy");
+    assert!(
+        encoded.contains(&format!("prefix={proc_prefix}\n")),
+        "{encoded}"
+    );
+
+    // ...and a search-time delta query replays it: the config rebuilt from the
+    // index prunes the same subtree.
+    let config = DeltaConfig::from_index(&store, &db_path(&db))
+        .unwrap()
+        .expect("the crawl recorded a root");
+    // The whole effective list is replayed: the platform defaults plus the
+    // user's prefix, exactly as the crawl wrote them.
+    assert!(config.excludes.prefixes().contains(&proc_prefix.clone()));
+    for default in walk::DEFAULT_PREFIX_EXCLUDES {
+        assert!(
+            config.excludes.prefixes().iter().any(|p| p == default),
+            "default prefix {default} must be replayed"
+        );
+    }
+    assert_eq!(
+        config
+            .excludes
+            .reason_for_path(&root.join("proc/self/status"), &root),
+        Some(walk::ExcludeReason::Prefix)
+    );
+    // A file that only shares a directory name is not excluded by the prefix.
+    assert_eq!(
+        config
+            .excludes
+            .reason_for_path(&root.join("deep/proc/status"), &root),
+        None
+    );
+
+    // And in an actual delta walk: a file created under the pruned prefix
+    // after the crawl must not appear in the delta set, while a sibling
+    // outside it does. The marker is taken *before* the writes, and the
+    // written files are stamped with an explicit future mtime — the same
+    // margin the freshness tests use, so a coarse kernel clock can never
+    // make a post-marker file look pre-marker.
+    let source = source_for(&config);
+    let marker = source.current_marker().unwrap();
+    let stamp = marker.wall_clock_ns() + 10 * 1_000_000_000;
+    for rel in ["proc/self/after.txt", "b.txt"] {
+        let p = write_file(&d, rel, "created after the crawl");
+        filetime::set_file_mtime(
+            &p,
+            filetime::FileTime::from_unix_time(stamp.div_euclid(1_000_000_000), stamp.rem_euclid(1_000_000_000) as u32),
+        )
+        .unwrap();
+    }
+    let delta = source.changes_since(&marker, 1000).unwrap();
+    let paths: Vec<&str> = delta.entries.iter().map(|e| e.path.as_str()).collect();
+    assert!(
+        paths.iter().any(|p| p.ends_with("/b.txt")),
+        "the sibling change must be seen: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("/proc/")),
+        "the pruned subtree must stay out of the delta set: {paths:?}"
+    );
+}
+
+/// A prune spelled through a symlink must still prune (issue #43).
+///
+/// The walker's paths descend from a canonicalized root, so a prefix compared
+/// verbatim matches nothing whenever the user typed a symlinked spelling — and
+/// the crawl prints the rule as in force while indexing the subtree anyway.
+/// That is not a corner case on the platforms `--exclude-prefix` exists for:
+/// macOS resolves `/tmp` to `/private/tmp`, and Windows junctions
+/// (`C:\Users\All Users` → `C:\ProgramData`) differ the same way. Measured on
+/// the real binary before the fix: `indexed=2` with the rule displayed.
+#[cfg(unix)]
+#[test]
+fn a_prefix_spelled_through_a_symlink_still_prunes() {
+    let (d, db) = tmp_dir("prefix_symlink");
+    write_file(&d, "real/a.txt", "keep me");
+    write_file(&d, "real/proc/status", "cpu");
+
+    let real = d.join("real").canonicalize().unwrap();
+    let link = d.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    // The prefix is spelled through the symlink; the crawl root is the real
+    // path, which is what the walker will produce paths from.
+    let linked_prefix = link.join("proc").to_string_lossy().into_owned();
+    let excludes =
+        walk::ExcludeSet::new(&[], false).with_prefixes(std::slice::from_ref(&linked_prefix));
+
+    let summary = walk::crawl_with_excludes(
+        CrawlConfig {
+            root: real.clone(),
+            db_path: db_path(&db),
+            exclude: vec![],
+            no_default_excludes: false,
+            hidden: Default::default(),
+            use_gitignore: false,
+            threads: 1,
+        },
+        real.clone(),
+        excludes,
+    )
+    .unwrap();
+
+    assert_eq!(
+        summary.skipped_prefix, 1,
+        "the symlinked spelling must resolve to the same place the walker walks"
+    );
+    assert_eq!(summary.indexed, 1, "only real/a.txt survives");
+    assert_eq!(
+        summary.scanned,
+        summary.indexed + summary.skipped_total() + summary.errors,
+        "scanned = indexed + skipped + errors"
+    );
+}
+
+/// A prefix naming somewhere that does not exist is reported, not silently
+/// dropped (issue #43).
+#[test]
+fn a_prefix_that_cannot_resolve_is_reported() {
+    let missing = if cfg!(windows) {
+        r"C:\definitely\not\here\sagasu-43"
+    } else {
+        "/definitely/not/here/sagasu-43"
+    }
+    .to_string();
+
+    let flagged = walk::ExcludeSet::unresolvable_prefixes(std::slice::from_ref(&missing));
+    assert_eq!(flagged, vec![missing.clone()]);
+
+    // …and it is kept as typed rather than dropped, so the policy still
+    // records what the user asked for.
+    let set = walk::ExcludeSet::new(&[], true).with_prefixes(std::slice::from_ref(&missing));
+    assert!(
+        set.prefixes().contains(&missing),
+        "prefixes: {:?}",
+        set.prefixes()
+    );
+}

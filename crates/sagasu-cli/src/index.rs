@@ -41,7 +41,18 @@ pub struct IndexArgs {
     #[arg(long = "exclude")]
     exclude: Vec<String>,
 
-    /// Drop the built-in exclusion list (node_modules, target, .git, ...).
+    /// Absolute path prefix to prune from the crawl (repeatable). The walker
+    /// does not descend into any path at or below the prefix — unlike
+    /// `--exclude` (a directory *name*, filtered per file) this is a prune.
+    /// The pseudo-filesystems (/proc, /sys, /dev, /run on Linux) are pruned by
+    /// default; `--no-default-excludes` drops them too. Windows and macOS OS
+    /// directories (C:\Windows, Library/Caches, ...) are not pruned by default
+    /// — this flag is the mechanism for those.
+    #[arg(long = "exclude-prefix")]
+    exclude_prefix: Vec<String>,
+
+    /// Drop the built-in exclusion list (node_modules, target, .git, ...)
+    /// and the default prefixes (/proc, /sys, ...).
     #[arg(long)]
     no_default_excludes: bool,
 
@@ -104,12 +115,16 @@ pub fn cmd_index(args: IndexArgs, mode: Output) -> Result<Outcome> {
     // Built once and used by both renderings. The human one prints it *before*
     // the walk so a wrong root can be interrupted; the machine one carries it
     // in the single object at the end, where the ordering buys nothing.
-    let excludes = scope(&config, &root)?;
+    let excludes = scope(&config, &root, &args.exclude_prefix)?;
     if !report.is_json() {
         print_scope(&root, &excludes);
     }
 
-    let summary = sagasu_core::walk::crawl(config)?;
+    // `crawl_with_excludes`: the policy built here — including the
+    // `--exclude-prefix` additions, which `CrawlConfig` deliberately does not
+    // carry — is exactly what the walk applies and what lands in
+    // `meta.exclude_policy` for every later query to replay.
+    let summary = sagasu_core::walk::crawl_with_excludes(config, root.clone(), excludes.clone())?;
 
     if !report.is_json() {
         print_crawl_summary(&summary);
@@ -171,6 +186,11 @@ fn print_crawl_summary(summary: &sagasu_core::CrawlSummary) {
         if summary.skipped_gitignore > 0 {
             println!("  (gitignore): {}", summary.skipped_gitignore);
         }
+        if summary.skipped_prefix > 0 {
+            // Counted per pruned directory, not per file inside it: the
+            // walker never descends, which is the whole point of the rule.
+            println!("  (excluded prefix): {}", summary.skipped_prefix);
+        }
     }
 
     // Not an exclusion: nobody asked for these to be dropped. An unreadable
@@ -198,11 +218,23 @@ fn print_crawl_summary(summary: &sagasu_core::CrawlSummary) {
 /// costs a `.gitignore` read; the alternative is reporting the *arguments* and
 /// hoping they describe the same thing the core assembled. It also surfaces a
 /// broken `.gitignore` before the walk instead of after it.
-fn scope(config: &CrawlConfig, root: &Path) -> Result<ExcludeSet> {
+fn scope(config: &CrawlConfig, root: &Path, prefixes: &[String]) -> Result<ExcludeSet> {
     let excludes = ExcludeSet::new(&config.exclude, config.no_default_excludes)
         .with_hidden(config.hidden)
-        .with_gitignore(root, config.use_gitignore)?;
+        .with_gitignore(root, config.use_gitignore)?
+        .with_prefixes(prefixes);
     excludes.validate()?;
+
+    // A prune rule about a place that is not there prunes nothing. That is not
+    // an error — the directory may appear later, or live on a volume that is
+    // not mounted — but it must not look like a rule in force, because the
+    // scope block below is about to print it as one.
+    for prefix in ExcludeSet::unresolvable_prefixes(prefixes) {
+        eprintln!(
+            "WARNING: --exclude-prefix {prefix:?} does not resolve to an existing path, \
+             so it will not prune anything in this crawl"
+        );
+    }
     Ok(excludes)
 }
 
@@ -213,6 +245,11 @@ fn print_scope(root: &Path, excludes: &ExcludeSet) {
         println!("excluded dirs: (none)");
     } else {
         println!("excluded dirs: {}", excludes.names().join(", "));
+    }
+    if excludes.prefixes().is_empty() {
+        println!("pruned paths : (none)");
+    } else {
+        println!("pruned paths : {}", excludes.prefixes().join(", "));
     }
     println!(
         "hidden       : {}",

@@ -658,12 +658,16 @@ pub(crate) enum Rejection {
 
 impl Rejection {
     /// Whether the whole directory the path sits in can be abandoned, or only
-    /// this one entry. A name or gitignore rule is a statement about the
-    /// directory; a hidden *file* and a database sibling are not.
+    /// this one entry. A name, prefix or gitignore rule is a statement about
+    /// the directory; a hidden *file* and a database sibling are not.
     pub(crate) fn prunes_directory(&self) -> bool {
         matches!(
             self,
-            Rejection::Excluded(walk::ExcludeReason::Name(_) | walk::ExcludeReason::Gitignore)
+            Rejection::Excluded(
+                walk::ExcludeReason::Name(_)
+                    | walk::ExcludeReason::Prefix
+                    | walk::ExcludeReason::Gitignore
+            )
         )
     }
 }
@@ -881,6 +885,15 @@ impl DeltaSource for MtimeDeltaSource {
                         return WalkState::Continue;
                     }
                 };
+                // Prune, don't filter — same rule as the crawl (walk.rs): a
+                // directory at or below an excluded prefix (a pseudo-filesystem
+                // like /proc) must never be descended into. The crawl pruned
+                // it, the delta scan must prune it too, or the delta set fills
+                // up with files the index has no row for (issue #43).
+                if config.excludes.prefix_matched(entry.path()) {
+                    excluded.fetch_add(1, Ordering::Relaxed);
+                    return WalkState::Skip;
+                }
                 if !entry.file_type().is_some_and(|t| t.is_file()) {
                     return WalkState::Continue;
                 }

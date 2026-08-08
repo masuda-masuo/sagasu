@@ -75,8 +75,10 @@ browse の行が「結果」ではなく「グループの中身のプレビュ�
 
 ### 2-2. 各サブコマンド固有の引数(現状の記録)
 
-`index`: `--exclude`(repeatable) / `--no-default-excludes` / `--skip-hidden` /
-`--use-gitignore` / `--threads`
+`index`: `--exclude`(repeatable) / `--exclude-prefix <PATH>`(repeatable、絶対パス。
+下に降りない prune。issue #43 の擬似ファイルシステム既定は Linux では
+`/proc` `/sys` `/dev` `/run`。Windows / macOS の OS ディレクトリは既定対象外) /
+`--no-default-excludes` / `--skip-hidden` / `--use-gitignore` / `--threads`
 `hash`: `--max-size`(既定 4 MiB)
 `fulltext`: `--index-dir` / `--max-size`(既定 2 MiB) / `--ext`(repeatable) /
 `--no-sniff` / `--threads` / `--heap-mb`
