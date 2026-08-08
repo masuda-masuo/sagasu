@@ -33,7 +33,7 @@ use serde_json::{json, Map, Value};
 
 use sagasu_core::browse::BrowseView;
 use sagasu_core::config::ConfigOrigin;
-use sagasu_core::delta::{DeltaStatus, ScanMarker};
+use sagasu_core::delta::{DeltaStatus, JournalCheck, ScanMarker};
 use sagasu_core::fresh::{FreshOutcome, HitOrigin};
 use sagasu_core::fulltext::{FulltextSummary, SearchOutcome};
 use sagasu_core::store::{FileRow, IndexStats};
@@ -754,7 +754,13 @@ pub(crate) fn browse(
 // ── status ──────────────────────────────────────────────────────────────────
 
 /// `sagasu status`.
-pub(crate) fn status(stats: &IndexStats, exclusion_value: Value, unreadable: u64, report: &Report) {
+pub(crate) fn status(
+    stats: &IndexStats,
+    exclusion_value: Value,
+    unreadable: u64,
+    report: &Report,
+    journal: &sagasu_core::delta::JournalCheck,
+) {
     // 64-bit journal identifiers go out as strings: they are the one value in
     // this schema that can exceed 2^53, and a consumer reading the stream in
     // JavaScript would silently round them (docs/cli.md §4-3).
@@ -779,6 +785,46 @@ pub(crate) fn status(stats: &IndexStats, exclusion_value: Value, unreadable: u64
             "recorded_ns": recorded_ns.to_string(),
         }),
         None => json!({"kind": Value::Null}),
+    };
+
+    // The one value `cmd_status` decided, rendered as-is — the JSON must not
+    // recompute anything the human report already computed from the same
+    // `JournalCheck` (docs/cli.md §4-6).
+    let journal_value = match journal {
+        JournalCheck::NotChecked { reason } => json!({"checked": false, "reason": reason}),
+        JournalCheck::Checked {
+            next_usn_now,
+            lifetime,
+            live_maximum_size,
+            journal_matches,
+            rolled_off,
+        } => json!({
+            "checked": true,
+            // A USN is a byte offset that can exceed 2^53; stringified like the
+            // marker's own `next_usn` (docs/cli.md §4-3).
+            "next_usn": next_usn_now.to_string(),
+            "consumed_bytes": lifetime.consumed,
+            "rate_bytes_per_sec": lifetime.rate_bytes_per_sec,
+            // Seconds since the marker was taken — the "over N h" of the human
+            // line, so every number there has a counterpart here.
+            "elapsed_secs": lifetime.elapsed_secs,
+            // Null when the rate cannot be observed yet — never an invented
+            // number, never an omitted key.
+            "remaining_secs": lifetime.remaining_secs,
+            // Estimate only: "consumed has reached the capacity recorded in
+            // the marker". NOT a statement that the records are gone — that is
+            // `rolled_off`, which mirrors the delta read. The two can disagree
+            // because NTFS treats MaximumSize as a target and trims lazily.
+            "expired": lifetime.expired,
+            // Capacity the journal reports now, against the marker's recorded
+            // copy above: when they differ, `remaining_secs` is the weaker
+            // number and this is why.
+            "live_maximum_size": live_maximum_size,
+            // The two verdicts the warnings are built from, as data rather
+            // than prose: a consumer can decide without parsing stderr.
+            "journal_matches": journal_matches,
+            "rolled_off": rolled_off,
+        }),
     };
 
     summary(
@@ -811,11 +857,7 @@ pub(crate) fn status(stats: &IndexStats, exclusion_value: Value, unreadable: u64
                 "behind": stats.tag_scan_generation.map(|g| stats.scan_generation - g),
                 "rules": stats.tag_rules,
             },
-            // The USN marker's remaining lifetime needs the journal's current
-            // NextUsn, which means opening the volume. `status` stays read-only
-            // unless asked; the design for the opt-in probe is docs/cli.md §9-1,
-            // and it is not implemented.
-            "journal": {"checked": false, "reason": "not implemented (docs/cli.md §9-1)"},
+            "journal": journal_value,
         })),
         report,
     );

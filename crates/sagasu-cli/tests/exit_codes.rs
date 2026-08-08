@@ -373,3 +373,73 @@ fn json_flag_does_not_change_exit_codes() {
         assert_eq!(json, *expected, "{label}: --json must not change the exit code");
     }
 }
+
+// ── status --check-journal (issue #60, docs/cli.md §9-1) ────────────────────
+
+#[test]
+fn status_help_lists_the_journal_flags_on_every_platform() {
+    // The flags must exist everywhere: a script that runs on Linux and
+    // Windows would get a clap usage error (exit 2) on one of them otherwise.
+    let (code, stdout, _) = run(&["status", "--help"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("--check-journal"),
+        "the flag must be documented: {stdout}"
+    );
+    assert!(
+        stdout.contains("--journal-warn-hours"),
+        "the flag must be documented: {stdout}"
+    );
+}
+
+#[test]
+fn status_with_check_journal_on_linux_reports_not_checked_and_exits_0() {
+    // `status` is a report: one unavailable line is not a failed command, so
+    // the exit code stays 0 even though the probe cannot run here.
+    let fx = Fixture::new("status-journal", "a.txt", "needle\n");
+    assert_eq!(fx.index(), 0);
+
+    let (code, stdout, _) = run(&[
+        "status",
+        "--db",
+        fx.db.to_str().unwrap(),
+        "--check-journal",
+        "--journal-warn-hours",
+        "6",
+    ]);
+    assert_eq!(code, 0, "a report is always an answer");
+    assert!(
+        stdout.contains("not checked —"),
+        "the human report must say the check did not run: {stdout}"
+    );
+    assert!(
+        stdout.contains("mtime marker"),
+        "the fixture's marker is an mtime marker and the reason must name it: {stdout}"
+    );
+
+    let (code, stdout, _) = run(&[
+        "status",
+        "--db",
+        fx.db.to_str().unwrap(),
+        "--check-journal",
+        "--json",
+    ]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("\"checked\":false") && stdout.contains("\"reason\""),
+        "the JSON must carry checked:false with a reason: {stdout}"
+    );
+}
+
+#[test]
+fn status_without_check_journal_keeps_the_not_requested_json_shape() {
+    // The off shape is the documented contract (docs/cli.md §4-5).
+    let fx = Fixture::new("status-no-flag", "a.txt", "needle\n");
+    assert_eq!(fx.index(), 0);
+    let (code, stdout, _) = run(&["status", "--db", fx.db.to_str().unwrap(), "--json"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("\"checked\":false") && stdout.contains("not requested (--check-journal)"),
+        "without the flag the JSON must say not requested: {stdout}"
+    );
+}
