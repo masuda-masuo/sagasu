@@ -192,6 +192,37 @@ pub fn minimal_pdf(text: &str, info: Option<(&str, &str, &str)>) -> Vec<u8> {
     // The content stream addresses each character by its 1-based index.
     let hex: String = (1..=chars.len()).map(|i| format!("{i:04X}")).collect();
     let content = format!("BT /F1 24 Tf 72 700 Td <{hex}> Tj ET\n");
+    pdf_with_content(text, &content, info)
+}
+
+/// A minimal PDF whose content stream is a single kerned `TJ` array: the text
+/// is split after `split` characters (1-based) and a kerning adjustment of
+/// `kern` is placed between the two halves.
+///
+/// This is the shape Word, LibreOffice and TeX actually emit for Japanese: a
+/// glyph gap **inside** a word. `lopdf` turns an adjustment past its threshold
+/// into an ASCII space on the assumption that a large glyph gap means a word
+/// boundary — an assumption that holds for Latin, where Japanese is kerned
+/// between individual characters.
+pub fn kerned_pdf(text: &str, split: usize, kern: i32) -> Vec<u8> {
+    let chars: Vec<char> = text.chars().collect();
+    assert!(
+        split > 0 && split < chars.len(),
+        "split must fall inside the text"
+    );
+    let left: String = (1..=split).map(|i| format!("{i:04X}")).collect();
+    let right: String = (split + 1..=chars.len()).map(|i| format!("{i:04X}")).collect();
+    let content = format!("BT /F1 24 Tf 72 700 Td [<{left}> {kern} <{right}>] TJ ET\n");
+    pdf_with_content(text, &content, None)
+}
+
+/// The `minimal_pdf` machinery with the content stream supplied by the caller.
+///
+/// Everything both PDF fixtures share: the per-character `ToUnicode` CMap, the
+/// Type0 font with Identity-H encoding, and the trailer. `info` is
+/// `(author, title, creation_date)` for the info dictionary.
+fn pdf_with_content(text: &str, content: &str, info: Option<(&str, &str, &str)>) -> Vec<u8> {
+    let chars: Vec<char> = text.chars().collect();
 
     let bfchars: String = chars
         .iter()
