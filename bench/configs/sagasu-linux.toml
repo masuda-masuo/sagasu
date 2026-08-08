@@ -1,0 +1,164 @@
+# Configuration for measuring the shipped `sagasu` implementation on Linux.
+#
+# Binary location
+# ---------------
+# The command is given as a bare name (`sagasu`) and resolved through PATH.
+# It must NOT be `./sagasu`: the harness spawns every command with its working
+# directory set to that target's `{workdir}` (bench/src/run.rs), so a `./`
+# prefix would look for the binary inside the per-target scratch directory and
+# fail.  On Linux `std::process::Command` searches PATH but not the current
+# directory, so the binary must be reachable through PATH:
+#
+#   cargo build --release
+#   export PATH="$PWD/target/release:$PATH"
+#
+# The Windows config uses the same bare name: CreateProcess searches the
+# current directory implicitly and appends `.exe` itself.
+#
+# The pipeline
+# ------------
+# The shipped engine builds its searchable state in stages, each a separate
+# subcommand reading what the previous one wrote (docs/cli.md §2):
+#
+#   sagasu index <ROOT> --db <DB>                  metadata crawl -> SQLite
+#   sagasu hash --db <DB>                          BLAKE3 backfill
+#   sagasu fulltext --db <DB> --index-dir <DIR>    body extraction -> tantivy
+#   sagasu search <QUERY> --db <DB> --index-dir <DIR>
+#
+# A `search` needs BOTH the metadata DB and the full-text index in its work
+# directory.  The harness's `setup` key historically ran a single command and
+# the CLI has no subcommand that both crawls and builds the full-text index,
+# so the search targets below use the *chain* form of `setup` (an array of
+# commands, run untimed, in order, in the same work directory).  That is a
+# deliberate, documented harness extension (bench/src/run.rs `SetupSpec`);
+# the single-command form is unchanged and still works everywhere.
+#
+# Repeat counts
+# -------------
+# index / fulltext are I/O-bound and slow (seconds to minutes) -> repeat = 3.
+# `hash` uses repeat = 1 on purpose: BLAKE3 backfill is idempotent (it only
+# hashes rows that have no hash yet), so trial 1 does the whole backfill (every
+# file the size limit admits — larger ones are skipped and stay NULL) and
+# trials 2+ would hash nothing.  A warm p50 of "hash nothing" would be a
+# silently wrong number; the one honest measurement is the first backfill.
+# Search is fast (milliseconds) -> repeat = 10.
+#
+# Floor targets and exit codes
+# ----------------------------
+# `sagasu` follows rg's three-value exit contract (docs/cli.md §6):
+# 0 = hits, 1 = no hits, 2 = error.  The harness treats any non-zero exit as a
+# failure and drops that trial — so a floor probe that matches nothing would
+# exit 1 on every trial, and every trial would be discarded, leaving the floor
+# without warm statistics and the net columns at "cannot derive".
+#
+# The solution is a deliberate, documented harness rule (bench/src/run.rs):
+# a *floor* target (one referenced by another target's `floor` key) accepts
+# exit 1 as success.  That is exactly the rg-style meaning of 1 — "ran
+# correctly, the answer is empty" — and the floor's whole purpose is to probe
+# a query that matches nothing.  Exit 2 (a real error) is still a failure, so
+# a broken floor still surfaces as "cannot derive" instead of a wrong number.
+# The prototype configs are unaffected: their floor probes exit 0.
+#
+# `--no-fresh` decision
+# ---------------------
+# Freshness merging is on by default, so every default search also pays a
+# delta walk over the tree (stat'ing every file to see what changed since the
+# crawl — on a static bench tree nothing changed, but the walk itself is real
+# per-search work).  Both sides are worth measuring, so they are SEPARATE
+# named targets rather than one target whose flag a reader has to guess:
+#
+#   search-ja / search-en               what a user experiences (merge on)
+#   search-ja-no-fresh / search-en-no-fresh   the index path alone (--no-fresh)
+#
+# Each pair has its own floor, so the net numbers always mean the same thing:
+# query work after the fixed cost, with the delta walk on the same side of
+# the subtraction as the raw value it is subtracted from.
+#
+# Search terms (`全文検索`, `benchmark`) are from the planted-terms set that
+# `bench gen` embeds into every generated tree, so they are guaranteed to hit.
+# The floor term (`qzxv9floorprobe`) is deliberately in no pool, so it is
+# guaranteed to match nothing.
+
+[[target]]
+name = "index"
+command = "sagasu"
+args = ["index", "{root}", "--db", "{workdir}/index.db"]
+repeat = 3
+
+[[target]]
+name = "hash"
+command = "sagasu"
+args = ["hash", "--db", "{workdir}/index.db"]
+repeat = 1
+setup = { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] }
+
+[[target]]
+name = "fulltext"
+command = "sagasu"
+args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 3
+setup = { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] }
+
+[[target]]
+name = "search-floor"
+command = "sagasu"
+args = ["search", "qzxv9floorprobe", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+
+[[target]]
+name = "search-ja"
+command = "sagasu"
+args = ["search", "全文検索", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+floor = "search-floor"
+
+[[target]]
+name = "search-en"
+command = "sagasu"
+args = ["search", "benchmark", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+floor = "search-floor"
+
+[[target]]
+name = "search-floor-no-fresh"
+command = "sagasu"
+args = ["search", "qzxv9floorprobe", "--no-fresh", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+
+[[target]]
+name = "search-ja-no-fresh"
+command = "sagasu"
+args = ["search", "全文検索", "--no-fresh", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+floor = "search-floor-no-fresh"
+
+[[target]]
+name = "search-en-no-fresh"
+command = "sagasu"
+args = ["search", "benchmark", "--no-fresh", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+floor = "search-floor-no-fresh"

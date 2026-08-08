@@ -1,0 +1,109 @@
+# Configuration for measuring the shipped `sagasu` implementation on Windows.
+#
+# This file is a faithful mirror of `sagasu-linux.toml` (same targets, same
+# arguments).  It has NOT been executed in this repository's CI or on any
+# Windows machine here — it is unverified on Windows and must be validated on
+# real hardware before its numbers are quoted.
+#
+# Binary location
+# ---------------
+# The command is given as a bare name (`sagasu`) and resolved through PATH or
+# the current directory: Windows `CreateProcess` searches the current
+# directory implicitly and appends `.exe` itself, so `sagasu` finds
+# `sagasu.exe` with no prefix.  A `./` prefix would NOT work here either: the
+# harness spawns every command with its working directory set to that
+# target's `{workdir}` (bench/src/run.rs), so a `./` prefix would look for
+# the binary inside the per-target scratch directory.  Build with
+#
+#   cargo build --release
+#   set PATH=%CD%\target\release;%PATH%
+#
+# The pipeline, repeat counts, floor/exit-code rule and the `--no-fresh`
+# decision are identical to the Linux config — see its header comments.
+# (The delta source differs on Windows — the USN journal when available
+# instead of an mtime walk — but that is a property of `sagasu` itself, not
+# of this config, and the same targets measure it.)
+
+[[target]]
+name = "index"
+command = "sagasu"
+args = ["index", "{root}", "--db", "{workdir}/index.db"]
+repeat = 3
+
+[[target]]
+name = "hash"
+command = "sagasu"
+args = ["hash", "--db", "{workdir}/index.db"]
+repeat = 1
+setup = { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] }
+
+[[target]]
+name = "fulltext"
+command = "sagasu"
+args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 3
+setup = { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] }
+
+[[target]]
+name = "search-floor"
+command = "sagasu"
+args = ["search", "qzxv9floorprobe", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+
+[[target]]
+name = "search-ja"
+command = "sagasu"
+args = ["search", "全文検索", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+floor = "search-floor"
+
+[[target]]
+name = "search-en"
+command = "sagasu"
+args = ["search", "benchmark", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+floor = "search-floor"
+
+[[target]]
+name = "search-floor-no-fresh"
+command = "sagasu"
+args = ["search", "qzxv9floorprobe", "--no-fresh", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+
+[[target]]
+name = "search-ja-no-fresh"
+command = "sagasu"
+args = ["search", "全文検索", "--no-fresh", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+floor = "search-floor-no-fresh"
+
+[[target]]
+name = "search-en-no-fresh"
+command = "sagasu"
+args = ["search", "benchmark", "--no-fresh", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"]
+repeat = 10
+setup = [
+  { command = "sagasu", args = ["index", "{root}", "--db", "{workdir}/index.db"] },
+  { command = "sagasu", args = ["fulltext", "--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft-index"] },
+]
+floor = "search-floor-no-fresh"

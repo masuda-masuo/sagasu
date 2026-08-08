@@ -11,7 +11,11 @@
 //! * **Cold = trial 0, warm = trials 1..N.**  No attempt is made to drop OS
 //!   caches between trials.  The first trial runs with whatever state the OS
 //!   has; subsequent trials may benefit from cached data.
-//! * **A non-zero exit is a recorded failure, not a silent skip.**
+//! * **A non-zero exit is a recorded failure, not a silent skip** — with one
+//!   deliberate exception: a **floor** target (one referenced by another
+//!   target's `floor` key) additionally accepts exit 1.  By contract a floor's
+//!   probe query matches nothing, and tools with rg-style 3-value exit codes
+//!   report "no matches" as 1 — a correct, measurable answer, not a failure.
 
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -51,10 +55,13 @@ pub struct TargetDef {
     pub args: Vec<String>,
     /// Number of repeated measurements (including the first, which is "cold").
     pub repeat: u64,
-    /// Optional setup command that runs once before the trials (not timed).
+    /// Optional setup that runs once before the timed trials (not timed).
     /// When present, the work directory is NOT cleaned between trials.
+    /// Either a single command (`setup = { command = ..., args = [...] }`)
+    /// or an ordered chain of commands (`setup = [{...}, {...}]`); see
+    /// [`SetupSpec`].
     #[serde(default)]
-    pub setup: Option<SetupDef>,
+    pub setup: Option<SetupSpec>,
     /// Optional name of a "floor" target defined in the same config.  The
     /// floor target's warm p50 (the fixed cost: process startup, index open,
     /// and dictionary load) is subtracted from this target's raw warm times
@@ -69,6 +76,37 @@ pub struct TargetDef {
 pub struct SetupDef {
     pub command: String,
     pub args: Vec<String>,
+}
+
+/// A target's `setup`: a single command, or an ordered chain of them.
+///
+/// Read the commands through [`SetupSpec::commands`] — it is the only accessor,
+/// so the two forms cannot drift apart at a call site.
+///
+/// The chain form exists because a measurable state can need more than one
+/// command to produce: the shipped `sagasu` search needs both a metadata
+/// crawl and a full-text build in the work directory, and the CLI has no
+/// subcommand that does both.  All commands run untimed, in order, before the
+/// first trial; the work directory is not cleaned between trials when a setup
+/// of either form is present; a non-zero exit from any command aborts the
+/// target.  An empty chain is rejected at load time.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SetupSpec {
+    /// The original form: `setup = { command = ..., args = [...] }`.
+    Single(SetupDef),
+    /// The chain form: `setup = [{ command = ..., args = [...] }, ...]`.
+    Chain(Vec<SetupDef>),
+}
+
+impl SetupSpec {
+    /// The setup commands in execution order (one for the single form).
+    pub fn commands(&self) -> &[SetupDef] {
+        match self {
+            SetupSpec::Single(c) => std::slice::from_ref(c),
+            SetupSpec::Chain(v) => v,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,8 +244,18 @@ pub fn parse_config_text(text: &str) -> Result<Config, Box<dyn std::error::Error
             return Err(format!("target '{}' has repeat=0", t.name).into());
         }
         if let Some(ref setup) = t.setup {
-            if setup.command.is_empty() {
-                return Err(format!("target '{}' has an empty setup.command", t.name).into());
+            let commands = setup.commands();
+            if commands.is_empty() {
+                return Err(format!("target '{}' has an empty setup chain", t.name).into());
+            }
+            for c in commands {
+                if c.command.is_empty() {
+                    return Err(format!(
+                        "target '{}' has an empty setup.command",
+                        t.name
+                    )
+                    .into());
+                }
             }
         }
     }
@@ -271,6 +319,19 @@ pub fn run_benchmarks(
 
     let mut target_results = Vec::new();
 
+    // Floor targets run a no-match probe by contract (see `floor` on
+    // [`TargetDef`]): the probe query must match nothing so its wall time is
+    // the fixed cost with ~zero query work.  Tools with rg-style 3-value exit
+    // codes report "no matches" as exit 1 — a *correct* answer, not a
+    // failure — so a floor target's exit 1 is accepted as success below.
+    // Exit 2 (a real error) is still a failure, and so is any non-zero exit
+    // of a non-floor target.
+    let floor_names: std::collections::HashSet<&str> = config
+        .target
+        .iter()
+        .filter_map(|t| t.floor.as_deref())
+        .collect();
+
     for def in &config.target {
         // Create a fresh workdir for this target
         let workdir = root.join(format!(".workdir-{}", sanitise_name(&def.name)));
@@ -292,46 +353,53 @@ pub fn run_benchmarks(
 
         if let Some(setup) = &def.setup {
             setup_ran = true;
-            let setup_args = resolve_args(&setup.command, &setup.args, &root_str, &workdir);
-            eprintln!(
-                "[bench] target '{}': running setup: {} {}",
-                def.name,
-                setup_args[0],
-                setup_args[1..].join(" ")
-            );
+            // A setup may be a chain of commands (see [`SetupSpec`]): each runs
+            // untimed, in order, in the same work directory; a non-zero exit
+            // from any of them aborts the target.
+            for cmd in setup.commands() {
+                let setup_args = resolve_args(&cmd.command, &cmd.args, &root_str, &workdir);
+                eprintln!(
+                    "[bench] target '{}': running setup: {} {}",
+                    def.name,
+                    setup_args[0],
+                    setup_args[1..].join(" ")
+                );
 
-            let output = std::process::Command::new(&setup_args[0])
-                .args(&setup_args[1..])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .current_dir(&workdir)
-                .output()
-                .map_err(|e| {
-                    format!(
-                        "failed to spawn setup command '{}': {} (os error {})",
-                        setup_args[0],
-                        e.kind(),
-                        e.raw_os_error().unwrap_or(0),
-                    )
-                });
+                let output = std::process::Command::new(&setup_args[0])
+                    .args(&setup_args[1..])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .current_dir(&workdir)
+                    .output()
+                    .map_err(|e| {
+                        format!(
+                            "failed to spawn setup command '{}': {} (os error {})",
+                            setup_args[0],
+                            e.kind(),
+                            e.raw_os_error().unwrap_or(0),
+                        )
+                    });
 
-            match output {
-                Ok(out) => {
-                    if !out.status.success() {
-                        setup_succeeded = false;
-                        let code = out.status.code().unwrap_or(-1);
-                        eprintln!(
-                            "[bench] target '{}': setup failed (exit code {})",
-                            def.name, code
-                        );
+                match output {
+                    Ok(out) => {
+                        if !out.status.success() {
+                            setup_succeeded = false;
+                            let code = out.status.code().unwrap_or(-1);
+                            eprintln!(
+                                "[bench] target '{}': setup failed (exit code {})",
+                                def.name, code
+                            );
+                            break;
+                        }
                     }
-                }
-                Err(e) => {
-                    setup_succeeded = false;
-                    eprintln!(
-                        "[bench] target '{}': setup command {}: {}",
-                        def.name, setup_args[0], e
-                    );
+                    Err(e) => {
+                        setup_succeeded = false;
+                        eprintln!(
+                            "[bench] target '{}': setup command {}: {}",
+                            def.name, setup_args[0], e
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -418,7 +486,7 @@ pub fn run_benchmarks(
                         cold: is_cold,
                         elapsed_secs: elapsed.as_secs_f64(),
                         exit_code,
-                        failure: !out.status.success(),
+                        failure: trial_is_failure(exit_code, floor_names.contains(def.name.as_str())),
                     });
                 }
                 Err(e) => {
@@ -629,6 +697,18 @@ pub fn print_summary(results: &RunResults) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Whether a trial with the given exit code counts as a failure.
+///
+/// Exit 0 is always success.  A **floor** target (one referenced by another
+/// target's `floor` key) additionally accepts exit 1: by contract its probe
+/// query matches nothing, and tools with rg-style 3-value exit codes report
+/// "no matches" as 1 — a correct, measurable answer, not a failure.  Any
+/// other non-zero exit (in particular 2, the rg-style "error") is a failure,
+/// and so is a failed spawn, recorded as -1.
+fn trial_is_failure(exit_code: i32, is_floor_target: bool) -> bool {
+    exit_code != 0 && !(is_floor_target && exit_code == 1)
+}
 
 /// Resolve `{root}` and `{workdir}` placeholders in a command definition.
 fn resolve_args(cmd: &str, args: &[String], root: &str, workdir: &Path) -> Vec<String> {
@@ -1126,7 +1206,7 @@ setup = { command = "build-index", args = ["{root}", "--out", "{workdir}/idx"] }
         let t = &cfg.target[0];
         assert_eq!(t.name, "search");
         assert!(t.setup.is_some());
-        let s = t.setup.as_ref().unwrap();
+        let s = &t.setup.as_ref().unwrap().commands()[0];
         assert_eq!(s.command, "build-index");
         assert_eq!(s.args, vec!["{root}", "--out", "{workdir}/idx"]);
     }
@@ -1634,5 +1714,108 @@ repeat = 2
         assert!(json.contains("\"floor\":\"floor\""), "json: {json}");
         assert!(json.contains("\"p50_secs\":0.026"), "json: {json}");
         assert!(json.contains("\"setup_succeeded\":true"), "json: {json}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Setup chains and floor exit codes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_single_setup_still_parses_as_before() {
+        let toml = r#"
+[[target]]
+name = "search"
+command = "my-search"
+args = ["q"]
+repeat = 2
+setup = { command = "build", args = ["{root}"] }
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let t = &cfg.target[0];
+        let setup = t.setup.as_ref().unwrap();
+        let cmds = setup.commands();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].command, "build");
+        assert_eq!(cmds[0].args, vec!["{root}"]);
+    }
+
+    #[test]
+    fn test_setup_chain_parses_and_preserves_order() {
+        let toml = r#"
+[[target]]
+name = "search"
+command = "my-search"
+args = ["query", "--db", "{workdir}/index.db"]
+repeat = 3
+setup = [
+  { command = "my-index", args = ["{root}", "--db", "{workdir}/index.db"] },
+  { command = "my-fulltext", args = ["--db", "{workdir}/index.db", "--index-dir", "{workdir}/ft"] },
+]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let t = &cfg.target[0];
+        let setup = t.setup.as_ref().expect("setup must parse");
+        let cmds = setup.commands();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].command, "my-index");
+        assert_eq!(cmds[1].command, "my-fulltext");
+        assert_eq!(cmds[1].args[3], "{workdir}/ft");
+    }
+
+    #[test]
+    fn test_load_config_rejects_empty_setup_chain() {
+        let toml = r#"
+[[target]]
+name = "empty-chain"
+command = "echo"
+args = ["hi"]
+repeat = 1
+setup = []
+"#;
+        let result = parse_config_text(toml);
+        assert!(result.is_err(), "an empty chain must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("empty setup chain"), "error: {err}");
+    }
+
+    #[test]
+    fn test_load_config_rejects_empty_command_in_chain() {
+        let toml = r#"
+[[target]]
+name = "bad-chain"
+command = "echo"
+args = ["hi"]
+repeat = 1
+setup = [
+  { command = "ok", args = [] },
+  { command = "", args = [] },
+]
+"#;
+        let result = parse_config_text(toml);
+        assert!(result.is_err(), "an empty command in a chain must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("empty setup.command"), "error: {err}");
+    }
+
+    #[test]
+    fn test_floor_exit_1_is_not_a_failure() {
+        // rg-style exit contract: a floor probe that matches nothing exits 1
+        // ("ran correctly, the answer is empty").  That trial must be measured,
+        // not dropped, or the floor has no warm stats and net columns show
+        // "cannot derive".
+        assert!(!trial_is_failure(0, true));
+        assert!(!trial_is_failure(1, true));
+        assert!(trial_is_failure(2, true));
+        // A failed spawn is recorded as -1 and is never a success.
+        assert!(trial_is_failure(-1, true));
+    }
+
+    #[test]
+    fn test_non_floor_exit_1_is_a_failure() {
+        // A non-floor target that exits 1 is a bug in the config (a planted
+        // query that missed, or a tool that failed): it must stay visible.
+        assert!(!trial_is_failure(0, false));
+        assert!(trial_is_failure(1, false));
+        assert!(trial_is_failure(2, false));
     }
 }
