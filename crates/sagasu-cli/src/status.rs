@@ -6,12 +6,20 @@
 //! each name the scan generation they were built from, because a derived index
 //! that is a crawl or two behind answers as if the files added since do not
 //! exist, and nothing else in this output would reveal that.
+//!
+//! `--check-journal` is the one opt-in exception to "reads the DB and nothing
+//! else": it opens the USN journal's volume to ask how much of the marker's
+//! ring-buffer runway is left (docs/cli.md §9-1). Everything it learns goes
+//! through [`sagasu_core::delta::check_journal`], which decides on every
+//! platform what there is to report — the CLI never branches on the platform
+//! to choose what to print.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
 
+use sagasu_core::delta::{self, JournalCheck};
 use sagasu_core::walk::{self, ExcludeSet};
 use sagasu_core::Store;
 
@@ -24,6 +32,16 @@ pub struct StatusArgs {
     /// Path to the SQLite database file.
     #[arg(long, default_value = "index.db")]
     db: PathBuf,
+    /// Probe the live USN journal and report the marker's remaining runway.
+    /// Off by default: `status` stays a read-only report unless asked
+    /// (docs/cli.md §9-1). Accepted on every platform; where there is no USN
+    /// journal to ask, the report says so instead of failing.
+    #[arg(long)]
+    check_journal: bool,
+    /// Warn when the USN marker's remaining lifetime is below this many hours.
+    /// Only meaningful together with `--check-journal`.
+    #[arg(long, default_value_t = 24)]
+    journal_warn_hours: u64,
 }
 
 /// What the index says about the exclusion policy it was crawled with.
@@ -56,6 +74,12 @@ pub fn cmd_status(args: StatusArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
     let store = Store::open(&args.db)?;
     let stats = store.get_stats()?;
+    // One wall clock for the whole report: the scan-marker age and the live
+    // journal probe must not disagree about what "now" is.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
 
     // The exclusion policy, decoded once. Three states rather than one shape,
     // because they mean three different things at query time and only one of
@@ -76,6 +100,16 @@ pub fn cmd_status(args: StatusArgs, mode: Output) -> Result<Outcome> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
+    // The live journal probe, decided once: the human report and the JSON
+    // object split from this one value (docs/cli.md §4-6), so neither can
+    // drift from the other. Without `--check-journal` the probe is not run and
+    // the report prints exactly what it always printed; the JSON says so.
+    let journal = if args.check_journal {
+        delta::check_journal(stats.delta_marker.as_ref(), now_ns)
+    } else {
+        JournalCheck::not_checked(delta::JOURNAL_CHECK_NOT_REQUESTED)
+    };
+
     if !report.is_json() {
         print_status(
             &stats,
@@ -83,10 +117,18 @@ pub fn cmd_status(args: StatusArgs, mode: Output) -> Result<Outcome> {
             excludes.as_ref(),
             policy_detail.as_deref(),
             unreadable,
+            now_ns,
+            &journal,
         );
     }
 
-    warn_status(&stats, policy_state, &mut report);
+    warn_status(
+        &stats,
+        policy_state,
+        &mut report,
+        &journal,
+        args.journal_warn_hours,
+    );
 
     if report.is_json() {
         // Written once, at the end: a summary-shaped command is one object, so
@@ -100,6 +142,7 @@ pub fn cmd_status(args: StatusArgs, mode: Output) -> Result<Outcome> {
             ),
             unreadable,
             &report,
+            &journal,
         );
     }
 
@@ -115,6 +158,8 @@ fn print_status(
     excludes: Option<&ExcludeSet>,
     policy_detail: Option<&str>,
     unreadable: u64,
+    now_ns: i64,
+    journal: &JournalCheck,
 ) {
     println!(
         "root path      : {}",
@@ -123,10 +168,6 @@ fn print_status(
     println!("schema version : {}", stats.schema_version);
 
     if let Some(marker_ns) = stats.scan_marker_ns {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
         let age_secs = ((now_ns - marker_ns) as f64) / 1e9;
         println!("scan marker    : {:.1}s ago", age_secs);
     } else {
@@ -137,25 +178,68 @@ fn print_status(
     // is decides how the delta is read back — and, for USN, whether it is still
     // valid at all (issue #16).
     match &stats.delta_marker {
-        Some(marker @ sagasu_core::ScanMarker::Usn { volume, .. }) => {
+        Some(sagasu_core::ScanMarker::Usn {
+            volume,
+            maximum_size,
+            next_usn,
+            ..
+        }) => {
             println!("delta marker   : usn on {volume}");
-            // A live estimate needs the journal's current NextUsn, which means
-            // opening the volume; `sagasu status` stays read-only and prints the
-            // stored inputs so the estimate is at least reproducible by hand.
-            if let sagasu_core::ScanMarker::Usn {
-                maximum_size,
-                next_usn,
-                ..
-            } = marker
-            {
-                println!("  journal size : {:.1} MiB", mib(*maximum_size));
-                println!("  marker usn   : {next_usn}");
-            }
+            // The stored inputs, printed even when `--check-journal` adds the
+            // live ones below: the report stays readable without the probe.
+            println!("  journal size : {:.1} MiB", mib(*maximum_size));
+            println!("  marker usn   : {next_usn}");
         }
         Some(sagasu_core::ScanMarker::Mtime { .. }) => {
             println!("delta marker   : mtime (wall clock; never expires)");
         }
         None => println!("delta marker   : (none — searches cannot merge changes)"),
+    }
+
+    // Everything `--check-journal` adds to this report, from the one value
+    // `cmd_status` decided (docs/cli.md §9-1). The not-requested case prints
+    // nothing at all: that is today's output, unchanged.
+    match journal {
+        JournalCheck::Checked {
+            lifetime,
+            journal_matches,
+            rolled_off,
+            ..
+        } => {
+            // 8 MiB in 15.4 h reads as 0.8 MiB/h: bytes/s → MiB/h.
+            println!(
+                "  consumed     : {:.1} MiB since the marker ({:.1} MiB/h over {:.1}h)",
+                mib(lifetime.consumed),
+                lifetime.rate_bytes_per_sec * 3600.0 / (1024.0 * 1024.0),
+                lifetime.elapsed_secs / 3600.0,
+            );
+            let lifetime_line = if *rolled_off {
+                "expired".to_string()
+            } else if !*journal_matches {
+                "(journal was recreated — the stored USN numbers are meaningless)"
+                    .to_string()
+            } else if lifetime.expired {
+                // The estimate says the recorded capacity is used up, but the
+                // journal still holds the marker's records. NTFS treats
+                // MaximumSize as a target and trims lazily, so this is a real
+                // state, not a contradiction — and saying "expired" here would
+                // demand a reindex the delta read does not need.
+                "(past the capacity recorded at index time, but the marker's records are still in the journal)"
+                    .to_string()
+            } else {
+                match lifetime.remaining_secs {
+                    Some(secs) => format!("~{:.1}h remaining", secs / 3600.0),
+                    None => "(not enough data to estimate yet)".to_string(),
+                }
+            };
+            println!("  lifetime     : {lifetime_line}");
+        }
+        JournalCheck::NotChecked { reason }
+            if reason != delta::JOURNAL_CHECK_NOT_REQUESTED =>
+        {
+            println!("  journal check : not checked — {reason}");
+        }
+        JournalCheck::NotChecked { .. } => {}
     }
 
     // The exclusion policy the crawl ran under, replayed from what it stored.
@@ -261,6 +345,8 @@ fn warn_status(
     stats: &sagasu_core::store::IndexStats,
     policy_state: PolicyState,
     report: &mut Report,
+    journal: &JournalCheck,
+    journal_warn_hours: u64,
 ) {
     if stats.root_path.is_some() {
         // The two branches lead to different query behaviour, so they get
@@ -309,5 +395,180 @@ fn warn_status(
              `sagasu search` answers empty. Re-run `sagasu fulltext` and read the \
              `skipped` breakdown — `--ext <EXT>` or a config file may be needed.",
         );
+    }
+
+    // The USN marker's runway, when the probe ran (docs/cli.md §9-1). At
+    // most one of these fires: a dead marker's remaining-time warning would
+    // add nothing to the rescan demand next to it.
+    if let JournalCheck::Checked {
+        lifetime,
+        journal_matches,
+        rolled_off,
+        ..
+    } = journal
+    {
+        if !journal_matches {
+            report.warn(
+                "the USN journal was recreated since the marker (its id no \
+                 longer matches), so the marker's USN numbers are meaningless. \
+                 The next search cannot compute a delta and will demand a full \
+                 rescan — re-run `sagasu index <root>`.",
+            );
+        } else if *rolled_off {
+            report.warn(
+                "the USN marker has rolled off the journal, so the next search \
+                 cannot compute a delta and will demand a full rescan — re-run \
+                 `sagasu index <root>`.",
+            );
+        } else if let Some(remaining_secs) = lifetime.remaining_secs {
+            if remaining_secs < journal_warn_hours as f64 * 3600.0 {
+                report.warn(format!(
+                    "the USN marker has roughly {:.1} hours of journal headroom \
+                     left (below the {journal_warn_hours} hour warning threshold); \
+                     once it rolls off, the next search cannot compute a delta \
+                     and will demand a full rescan.",
+                    remaining_secs / 3600.0,
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sagasu_core::delta::MarkerLifetime;
+
+    /// An index report with nothing else wrong with it, so `warn_status`
+    /// raises exactly the journal warnings under test and nothing more.
+    fn quiet_stats() -> sagasu_core::store::IndexStats {
+        sagasu_core::store::IndexStats {
+            root_path: Some("/srv/data".into()),
+            schema_version: 2,
+            scan_marker_ns: None,
+            delta_marker: None,
+            scan_generation: 1,
+            live_count: 1,
+            tombstone_count: 0,
+            null_hash_count: 0,
+            fulltext_dir: None,
+            fulltext_docs: None,
+            fulltext_scan_generation: None,
+            tag_scan_generation: None,
+            tag_files: None,
+            tag_rules: None,
+            tag_rows: 0,
+            distinct_tags: 0,
+        }
+    }
+
+    fn checked(lifetime: MarkerLifetime, journal_matches: bool, rolled_off: bool) -> JournalCheck {
+        JournalCheck::Checked {
+            next_usn_now: 0,
+            lifetime,
+            live_maximum_size: 32 * 1024 * 1024,
+            journal_matches,
+            rolled_off,
+        }
+    }
+
+    /// A lifetime with 24 MiB of headroom consumed at 232.7 B/s: whatever the
+    /// `remaining_secs` argument says, it is a consistent value.
+    fn lifetime(remaining_secs: Option<f64>, expired: bool) -> MarkerLifetime {
+        MarkerLifetime {
+            maximum_size: 32 * 1024 * 1024,
+            consumed: 8 * 1024 * 1024,
+            headroom: 24 * 1024 * 1024,
+            elapsed_secs: 15.4 * 3600.0,
+            rate_bytes_per_sec: 232.7,
+            remaining_secs,
+            expired,
+        }
+    }
+
+    fn journal_warnings(journal: &JournalCheck, warn_hours: u64) -> Vec<String> {
+        let mut report = Report::new(Output::Human);
+        warn_status(&quiet_stats(), PolicyState::Present, &mut report, journal, warn_hours);
+        report.warnings().to_vec()
+    }
+
+    #[test]
+    fn a_rolled_off_marker_warns_that_the_next_search_demands_a_rescan() {
+        let warnings = journal_warnings(&checked(lifetime(Some(0.0), true), true, true), 24);
+        assert_eq!(warnings.len(), 1, "one warning, not a stack of them");
+        assert!(warnings[0].contains("rolled off"), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains("sagasu index <root>"),
+            "the fix must be named: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn a_recreated_journal_warns_instead_of_the_remaining_time() {
+        // The id mismatch makes every number meaningless: the rescan warning
+        // fires, and the remaining-time warning must not (at most one fires).
+        let warnings = journal_warnings(
+            &checked(lifetime(Some(10.0 * 3600.0), false), false, false),
+            24,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("recreated"), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains("cannot compute a delta"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn low_headroom_warns_with_the_approximate_time_left() {
+        let warnings = journal_warnings(
+            &checked(lifetime(Some(10.5 * 3600.0), false), true, false),
+            24,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("10.5 hours"),
+            "the approximate time must be in the warning: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("24 hour"),
+            "the threshold that fired must be named: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn a_healthy_marker_does_not_warn() {
+        let warnings = journal_warnings(
+            &checked(lifetime(Some(48.0 * 3600.0), false), true, false),
+            24,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn an_unobservable_rate_never_warns() {
+        // `remaining_secs` is None: no invented number, and nothing to warn.
+        let warnings = journal_warnings(&checked(lifetime(None, false), true, false), 24);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_not_checked_journal_never_warns() {
+        // Neither the not-requested case nor a probe that failed is a warning:
+        // the report just carries `checked: false` with its reason.
+        let warnings = journal_warnings(
+            &JournalCheck::not_checked(delta::JOURNAL_CHECK_NOT_REQUESTED),
+            24,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let warnings = journal_warnings(
+            &JournalCheck::not_checked("USN journal checks are only available on Windows"),
+            24,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

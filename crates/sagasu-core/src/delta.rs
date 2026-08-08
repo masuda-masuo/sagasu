@@ -240,6 +240,162 @@ pub fn estimate_lifetime(
     })
 }
 
+// ── Live journal probe for `status --check-journal` (issue #60) ─────────────
+
+/// The reason `--check-journal` did not run because it was not asked for.
+///
+/// The one not-checked case the CLI decides itself (the flag is a CLI concept);
+/// every other reason comes from [`check_journal`]. Kept as a named constant so
+/// the human rendering can tell "nothing new to print" from "the probe failed".
+pub const JOURNAL_CHECK_NOT_REQUESTED: &str = "not requested (--check-journal)";
+
+/// Live journal values from one `FSCTL_QUERY_USN_JOURNAL`, in the shape the
+/// lifetime check needs.
+///
+/// Platform-neutral on purpose: the fetch ([`crate::usn::query_live_journal`])
+/// is Windows-only, but the decision on top of it must be testable everywhere.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveJournal {
+    /// `UsnJournalID` — the identity check against the marker's.
+    pub journal_id: u64,
+    /// `FirstUsn` — the oldest record still in the ring.
+    pub first_usn: i64,
+    /// `NextUsn` — where the journal writes next; the live half of the
+    /// consumed-bytes arithmetic.
+    pub next_usn: i64,
+    /// `MaximumSize` — the ring capacity the journal reports today.
+    pub maximum_size: u64,
+}
+
+/// What the optional live journal probe found, or why it did not run.
+///
+/// One value for both renderings of `sagasu status` (docs/cli.md §4-6): the
+/// human report and the JSON object split from this, never recompute it.
+#[derive(Debug, Clone)]
+pub enum JournalCheck {
+    /// The probe did not run. `checked: false` with the reason, whatever the
+    /// reason is — a probe that did not happen is never reported as one that
+    /// did.
+    NotChecked {
+        /// Why: not requested, not a USN marker, no marker at all, not
+        /// Windows, or a Win32 failure (volume open / journal query).
+        reason: String,
+    },
+    /// The probe ran. The lifetime estimate is delivered alongside the two
+    /// verdicts that decide whether it means anything.
+    Checked {
+        /// The journal's live `NextUsn` (goes out as a string: USN values can
+        /// exceed 2^53, docs/cli.md §4-3).
+        next_usn_now: i64,
+        /// The estimate against the marker's recorded capacity.
+        lifetime: MarkerLifetime,
+        /// `MaximumSize` the journal reports **now**. Recorded separately from
+        /// the marker's copy because the two can differ (the journal can be
+        /// resized, and NTFS lets the ring exceed its target before trimming),
+        /// and that difference is exactly what makes the estimate in
+        /// `lifetime` approximate. Reported so the discrepancy is visible
+        /// instead of silently skewing a number.
+        live_maximum_size: u64,
+        /// Whether the live journal id still matches the marker's. False means
+        /// the USN number space restarted and every number is meaningless.
+        journal_matches: bool,
+        /// Whether the marker's records have already rolled off the ring.
+        ///
+        /// This is the **authoritative** check and it mirrors the delta read
+        /// exactly ([`crate::usn`]): the journal's live `FirstUsn` has passed
+        /// the marker. The estimate's own `expired` flag deliberately does not
+        /// feed in — it is computed against the `MaximumSize` recorded at index
+        /// time, and NTFS treats that as a target rather than a hard cap
+        /// (trimming is lazy; a journal observed on real hardware held far more
+        /// than its `MaximumSize` without wrapping, issue #37). Letting the
+        /// estimate decide would tell a user their index is dead and demand a
+        /// full reindex while the next search would in fact merge normally.
+        rolled_off: bool,
+    },
+}
+
+impl JournalCheck {
+    /// The not-checked variant with a reason.
+    pub fn not_checked(reason: impl Into<String>) -> Self {
+        JournalCheck::NotChecked {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Probe the live journal for a marker, if the platform and the marker allow.
+///
+/// The single entry point `sagasu status --check-journal` calls; it decides
+/// everything the report needs to print, so the CLI never branches on the
+/// platform. Returns the not-checked variant with a reason when there is no
+/// marker, when the marker is an mtime marker, when the platform has no USN
+/// journal to ask, and when the Win32 probe itself fails (volume open needs
+/// administrator rights; a disabled or non-NTFS journal is reported by the
+/// query). The classification itself is [`classify_journal`], kept separate so
+/// it is testable with observable inputs on any platform.
+pub fn check_journal(marker: Option<&ScanMarker>, now_ns: i64) -> JournalCheck {
+    let Some(marker) = marker else {
+        return JournalCheck::not_checked("no delta marker in the index");
+    };
+    match marker {
+        ScanMarker::Mtime { .. } => JournalCheck::not_checked(
+            "the delta marker is an mtime marker (wall clock; never expires)",
+        ),
+        ScanMarker::Usn { volume, .. } => match fetch_live_journal(volume) {
+            Ok(live) => classify_journal(marker, &live, now_ns),
+            Err(e) => JournalCheck::not_checked(format!("{e:#}")),
+        },
+    }
+}
+
+/// Classify a marker against live journal values: still fine, about to expire,
+/// or already gone — or why the check cannot apply to this marker.
+///
+/// Pure, so it runs and means something on every platform: the values a real
+/// `FSCTL_QUERY_USN_JOURNAL` would return are passed in, and the verdicts the
+/// CLI prints and warns about come out. `None` is impossible to produce here —
+/// `estimate_lifetime` only returns `None` for an mtime marker, which this
+/// function has already returned as not-checked.
+pub fn classify_journal(marker: &ScanMarker, live: &LiveJournal, now_ns: i64) -> JournalCheck {
+    let ScanMarker::Usn {
+        journal_id,
+        next_usn,
+        ..
+    } = marker
+    else {
+        return JournalCheck::not_checked(
+            "the delta marker is an mtime marker (wall clock; never expires)",
+        );
+    };
+    let lifetime = estimate_lifetime(marker, live.next_usn, now_ns)
+        .expect("a USN marker always yields a lifetime estimate");
+    JournalCheck::Checked {
+        next_usn_now: live.next_usn,
+        journal_matches: live.journal_id == *journal_id,
+        // Authoritative only: exactly the condition the delta read applies
+        // (`marker.next_usn < journal.FirstUsn`). See the field's doc comment
+        // for why `lifetime.expired` is deliberately not ORed in here.
+        rolled_off: live.first_usn > *next_usn,
+        live_maximum_size: live.maximum_size,
+        lifetime,
+    }
+}
+
+/// Fetch the live journal values for `volume`.
+///
+/// Windows: one volume open + one `FSCTL_QUERY_USN_JOURNAL`, exactly what the
+/// delta source's own probe does. Everywhere else there is no USN journal to
+/// ask, and the probe reports itself as not-checked with that reason.
+#[cfg(windows)]
+fn fetch_live_journal(volume: &str) -> Result<LiveJournal> {
+    crate::usn::query_live_journal(volume)
+}
+
+#[cfg(not(windows))]
+fn fetch_live_journal(_volume: &str) -> Result<LiveJournal> {
+    anyhow::bail!("USN journal checks are only available on Windows")
+}
+
 // ── Delta set ───────────────────────────────────────────────────────────────
 
 /// One file the delta source says changed since the marker.

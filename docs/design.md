@@ -477,11 +477,14 @@ PowerShell 一時ファイルで差分集合が埋まる。除外件数は集計
   実機で rename の live hit を確認済み。mtime を強制した場合(`SAGASU_DELTA_SOURCE=mtime`)
   と USN probe が失敗する環境では従来どおり「リネームされたファイルは再索引まで答えから
   消える」が仕様
-- **マーカー寿命の能動的な警告**。`estimate_lifetime` は用意したが、
-  `sagasu status` は現在の NextUsn を取りに行かない(read-only を保つため)。
-  **設計は `docs/cli.md` §9-1 で確定した**(オプトインの `--check-journal`、
-  既定 off、失効/残り 24h 未満で警告、照会失敗は `checked: false` + 理由)。
-  実装は issue #6 のスコープ外で、Windows 実機での確認も残件
+- **マーカー寿命の能動的な警告** — **実装済み(2026-08-08、issue #60)**。
+  `estimate_lifetime` を PR #36 で用意した後、`sagasu status` は現在の NextUsn を
+  取りに行かなかった(read-only を保つため)。issue #60 でオプトインの
+  `--check-journal` として実装した: 実 fetch は `usn::query_live_journal`(Windows のみ)、
+  判定は `delta::check_journal` / `delta::classify_journal`(全プラットフォームで
+  コンパイルされ、Linux で単体テスト済み)。警告は stderr の `WARNING:` + JSON の
+  `warnings` で、`checked: false` は理由を必ず伴う(挙動の詳細は `docs/cli.md` §9-1)。
+  残件は Windows 実機での確認のみ
 - ~~**クロールの `--exclude` の再現**~~ → 解消(§4-1)。クロールの除外規則は
   `meta.exclude_policy` に保存され、差分側は `DeltaConfig::from_index` で復元する。
   規則を読めない索引に対しては差分照会をせず、索引のみの答えを stale として返す

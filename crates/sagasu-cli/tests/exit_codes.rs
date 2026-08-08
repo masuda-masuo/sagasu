@@ -30,6 +30,25 @@ fn run(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Run the real binary with extra environment variables.
+///
+/// Used to pin the delta source: since #58 the marker `sagasu index` writes is
+/// platform-dependent (USN on Windows, mtime elsewhere), so a test that wants
+/// one specific marker has to ask for it rather than assume the platform's.
+fn run_with_env(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(bin());
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("failed to spawn sagasu");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// A unique temporary directory, removed on drop.
@@ -372,4 +391,131 @@ fn json_flag_does_not_change_exit_codes() {
         assert_eq!(plain, *expected, "{label}: human mode");
         assert_eq!(json, *expected, "{label}: --json must not change the exit code");
     }
+}
+
+// ── status --check-journal (issue #60, docs/cli.md §9-1) ────────────────────
+
+#[test]
+fn status_help_lists_the_journal_flags_on_every_platform() {
+    // The flags must exist everywhere: a script that runs on Linux and
+    // Windows would get a clap usage error (exit 2) on one of them otherwise.
+    let (code, stdout, _) = run(&["status", "--help"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("--check-journal"),
+        "the flag must be documented: {stdout}"
+    );
+    assert!(
+        stdout.contains("--journal-warn-hours"),
+        "the flag must be documented: {stdout}"
+    );
+}
+
+#[test]
+fn status_with_check_journal_on_an_mtime_marker_reports_not_checked_and_exits_0() {
+    // The marker is pinned to mtime rather than assumed: since #58 `sagasu
+    // index` writes a USN marker on Windows, so a test that assumed "this
+    // fixture has an mtime marker" passed on Linux and failed on the Windows
+    // CI runner — which is an administrator and therefore really can read the
+    // journal.  `status` is a report: one unavailable line is not a failed
+    // command, so the exit code stays 0 either way.
+    let fx = Fixture::new("status-journal", "a.txt", "needle\n");
+    let mtime = [("SAGASU_DELTA_SOURCE", "mtime")];
+    assert_eq!(
+        run_with_env(
+            &["index", fx.root.to_str().unwrap(), "--db", fx.db.to_str().unwrap()],
+            &mtime,
+        )
+        .0,
+        0
+    );
+
+    let (code, stdout, _) = run_with_env(
+        &[
+            "status",
+            "--db",
+            fx.db.to_str().unwrap(),
+            "--check-journal",
+            "--journal-warn-hours",
+            "6",
+        ],
+        &mtime,
+    );
+    assert_eq!(code, 0, "a report is always an answer");
+    assert!(
+        stdout.contains("not checked —"),
+        "the human report must say the check did not run: {stdout}"
+    );
+    assert!(
+        stdout.contains("mtime marker"),
+        "the fixture's marker is an mtime marker and the reason must name it: {stdout}"
+    );
+
+    let (code, stdout, _) = run_with_env(
+        &[
+            "status",
+            "--db",
+            fx.db.to_str().unwrap(),
+            "--check-journal",
+            "--json",
+        ],
+        &mtime,
+    );
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("\"checked\":false") && stdout.contains("\"reason\""),
+        "the JSON must carry checked:false with a reason: {stdout}"
+    );
+}
+
+#[test]
+fn status_with_check_journal_on_the_platform_default_marker_is_always_an_answer() {
+    // Whatever marker this platform writes, and whether or not the probe can
+    // reach a journal, the report must come back: exit 0, and a `journal`
+    // object that either says it did not run *and why*, or says it ran *and
+    // carries the numbers*.  Never `checked: true` with nothing behind it.
+    //
+    // On the Windows CI runner this is the one test that reaches the real
+    // `FSCTL_QUERY_USN_JOURNAL` (the runner is an administrator and, since
+    // #58, `index` writes a USN marker there).  On Linux it takes the
+    // not-checked branch.  Either way the assertion is about observable
+    // output, not about which platform is compiling it.
+    let fx = Fixture::new("status-journal-native", "a.txt", "needle\n");
+    assert_eq!(fx.index(), 0);
+
+    let (code, stdout, _) = run(&[
+        "status",
+        "--db",
+        fx.db.to_str().unwrap(),
+        "--check-journal",
+        "--json",
+    ]);
+    assert_eq!(code, 0, "a report is always an answer");
+
+    if stdout.contains("\"checked\":true") {
+        for key in ["next_usn", "consumed_bytes", "rolled_off", "journal_matches"] {
+            assert!(
+                stdout.contains(&format!("\"{key}\"")),
+                "a checked probe must carry {key}: {stdout}"
+            );
+        }
+    } else {
+        assert!(
+            stdout.contains("\"checked\":false") && stdout.contains("\"reason\""),
+            "an unchecked probe must say why: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn status_without_check_journal_keeps_the_not_requested_json_shape() {
+    // The off shape is the documented contract (docs/cli.md §4-5).
+    let fx = Fixture::new("status-no-flag", "a.txt", "needle\n");
+    assert_eq!(fx.index(), 0);
+    let (code, stdout, _) = run(&["status", "--db", fx.db.to_str().unwrap(), "--json"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("\"checked\":false") && stdout.contains("not requested (--check-journal)"),
+        "without the flag the JSON must say not requested: {stdout}"
+    );
 }

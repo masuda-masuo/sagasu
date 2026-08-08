@@ -8,7 +8,8 @@ design.md §2 の「CLI ファースト」の具体化。サブコマンド体�
 **両方とも実装済み**(PR #48 / #50、issue #6 はクローズ)。
 **実装済みでない項目は §9 に隔離して「設計のみ」と明記する** — 設計書が実装を
 先取りしていること自体は正しいが、どちらなのか読者に分からない状態は事故のもと。
-§9 の `--check-journal` は今も未実装で、この文書で唯一の「設計のみ」の節。
+§9-1 の `--check-journal` は **issue #60 で実装済み**で、§9 に残る未実装は §9-2
+(色付き出力、`RIPGREP_CONFIG_PATH` 相当)のみ。
 
 ---
 
@@ -84,7 +85,8 @@ browse の行が「結果」ではなく「グループの中身のプレビュ�
 `--embedded-max-size`
 `tags`: `--file <PATH>`(1 ファイルの説明モード)
 `browse`: `--axes` / `--values` / `--label-terms`
-`status`: なし(`--db` のみ)
+`status`: `--check-journal`(既定 off) / `--journal-warn-hours <N>`(既定 24。`--check-journal`
+と併用時のみ意味がある)
 
 ---
 
@@ -228,6 +230,19 @@ PoC 段階なので**破壊的変更はありうる**。そのうえで最低限
 `delta_marker` は USN のとき
 `{"kind":"usn","volume":"C:","journal_id":"…","next_usn":"…","maximum_size":33554432}`。
 **`journal_id` と `next_usn` は文字列**(§4-3 の 2^53 の理由)。
+
+`--check-journal` を付けたときは `journal` が次の形になる(詳細は §9-1):
+
+```json
+"journal": {"checked": true, "next_usn": "1247000012345678", "consumed_bytes": 12897845,
+            "rate_bytes_per_sec": 232.7, "elapsed_secs": 55440, "remaining_secs": 88560,
+            "expired": false, "live_maximum_size": 33554432,
+            "journal_matches": true, "rolled_off": false}
+```
+
+`next_usn` は**文字列**(2^53 の理由)。`remaining_secs` はレートが未観測なら `null`。
+`elapsed_secs` は人間向けの「over N h」に対応する。`journal_matches` / `rolled_off`
+は §4-3 の「追加はいつでも可」に従って追加した**判定フィールド**で、`checked: true` のときだけ現れる。
 
 ### 4-6. 実装方針
 
@@ -439,7 +454,7 @@ rg は `0` = マッチあり、`1` = マッチなし、`2` = エラー。sagasu 
 | 2 | `-n` の既定値が 10 / 20 / 20 / 5 とばらばら | **直さない。** §2-1 の通り用途差 |
 | 3 | `find` だけ索引が空でも警告も非 0 終了もしない | **修正済み(PR #48)。** `search` と同じ「メタデータ索引が空」警告を追加(終了コードは当時の §6 に従い変えなかった。その後 issue #49 でこの空索引ケースは終了コード 2 に変更 — §6) |
 | 4 | `--ext` が `fulltext` と `search` にあり `tag` に無い | **直さない。** `--ext` は本文抽出の判定を触るフラグで、タグ生成は本文を読まない |
-| 5 | `--no-fresh` が `status` に無い | **直さない。** `status` は差分プローブをしない(read-only を保つ設計)。§9 で `--check-journal` を足す設計はあるが既定 off |
+| 5 | `--no-fresh` が `status` に無い | **直さない。** `status` は差分プローブをしない(read-only を保つ設計)。USN マーカーの寿命を知りたいときだけ `--check-journal`(§9-1、**実装済み**)で能動的に照会できる(既定 off) |
 | 6 | 設定フラグが `--rules` と `--text-config` の 2 つ | **修正済み(PR #48)**(§5-3、`--config` に統合) |
 | 7 | rg の `--files` 相当が無い | **入れない。** `sagasu find ""` や `sagasu tags` が同じ用途を埋めており、名前が `browse --files` と衝突する |
 | 8 | 色付き出力 / `--color` が無い | **入れない。** 現状 stdout に ANSI は一切出ておらず(依存に termcolor 類なし)、パイプ検出まで含めると独立した仕事。`--json` が先 |
@@ -469,25 +484,33 @@ PR #41 が `sagasu browse` に `--json` を入れなかった理由は
 
 ---
 
-## 9. 設計のみ(未実装)
+## 9. 設計メモ — 実装済み(§9-1)と持ち越し(§9-2)
 
-### 9-1. `sagasu status` の USN マーカー寿命警告
+### 9-1. `sagasu status --check-journal` — USN マーカー寿命の能動的な警告(実装済み、issue #60)
 
-PR #36 が `delta::estimate_lifetime(marker, next_usn_now, now_ns)
--> Option<MarkerLifetime>` を実装したうえで、`sagasu status` からは呼んでいない。
-理由は **`status` を read-only に保つため** — 現在の NextUsn を得るには
-ボリュームハンドルを開いて USN ジャーナルに問い合わせる必要があり、
-`status` は「DB を読むだけ」を保っている。
+USN ジャーナルはリングバッファで、実測で数分に約 8 MiB 消費される。マーカーが
+ロールオフすると次回検索は `RescanRequired`(安全側)になるが、利用者には予告が
+なかった。PR #36 が `delta::estimate_lifetime(marker, next_usn_now, now_ns)
+-> Option<MarkerLifetime>` を実装した時点では `sagasu status` からは呼んでおらず、
+その理由は **`status` を read-only に保つため** — 現在の NextUsn を得るには
+ボリュームハンドルを開いて USN ジャーナルに問い合わせる必要があり、`status` は
+「DB を読むだけ」を保っていた。issue #60 でオプトインの照会として実装した。
 
-**設計**:
+**現状の挙動**:
 
-- **オプトインのフラグ `--check-journal` を足す。既定は off。**
-  「read-only を保つ」は既定の話であって、利用者が明示的に頼んだ照会まで
-  禁じる理由はない。`status` が黙って I/O を増やさなければよい。
-- off のとき: 現状どおり `delta marker : usn on C:` と保存済みの
-  `journal size` / `marker usn` を出す。JSON では
+- **オプトインのフラグ `--check-journal`。既定は off。**「read-only を保つ」は既定の
+  話であって、利用者が明示的に頼んだ照会まで禁じる理由はない。`status` が黙って
+  I/O を増やさなければよい。
+- **`--journal-warn-hours <N>`**(既定 **24**)。残り時間がこの闇値未満のときの
+  警告を制御する。`--check-journal` との併用時のみ意味がある。
+- **どちらのフラグも全プラットフォームで受け付ける。** Linux と Windows で
+  使い分けるスクリプトが片方だけで clap の usage エラー(終了コード 2)になるのを
+  避けるため、フラグ定義を `cfg(windows)` で消さない。非 Windows では
+  `--check-journal` は受け付けたうえで「not checked」と理由を報告する。
+- off のとき: 従来どおり `delta marker : usn on C:` と保存済みの
+  `journal size` / `marker usn` を出す(人間向け出力は従来と同一)。JSON では
   `"journal": {"checked": false, "reason": "not requested (--check-journal)"}`。
-- on のとき: `estimate_lifetime` の結果を出す。
+- on + 成功: `estimate_lifetime` の結果を出す。
 
   ```
   delta marker   : usn on C:
@@ -499,19 +522,47 @@ PR #36 が `delta::estimate_lifetime(marker, next_usn_now, now_ns)
 
   JSON:
   ```json
-  "journal": {"checked": true, "next_usn": "1247... ", "consumed_bytes": 12897845,
-              "rate_bytes_per_sec": 232.7, "remaining_secs": 88560, "expired": false}
+  "journal": {"checked": true, "next_usn": "1247000012345678", "consumed_bytes": 12897845,
+              "rate_bytes_per_sec": 232.7, "elapsed_secs": 55440, "remaining_secs": 88560,
+              "expired": false, "live_maximum_size": 33554432,
+              "journal_matches": true, "rolled_off": false}
   ```
-- **警告の条件は 2 つ**、どちらも stderr の `WARNING:` + JSON の `warnings`:
-  - `expired`(マーカーがジャーナルの先頭より古い) → 「次の検索は差分を
-    判定できず全再走査を要求する。`sagasu index <root>` を実行せよ」
-  - 残り時間が閾値未満 → 「あと約 N 時間でマーカーが失効する」。閾値は
-    **24 時間**を既定とし、`--journal-warn-hours` で変更可能にする。
-- **照会に失敗したら失敗として出す。** 非 Windows / 権限不足 / ジャーナル無効は
-  `"checked": false, "reason": "<なぜ>"` で、`checked: true` を騙らない。
-  `status` 自体は失敗させない(レポートの 1 項目が取れなかっただけ)。
-- **未検証**: `estimate_lifetime` 自体は純関数として Linux で単体テスト済み
-  (PR #36)。実際の NextUsn 取得を含む経路は Windows 実機での確認が必要。
+
+  `next_usn` は**文字列**(§4-3 の 2^53 の理由)。`remaining_secs` はレートが未観測
+  (経過時間ゼロ、またはマーカー以降 0 バイト)なら `null` — 数値を捏造せず、キーを
+  省かない。`elapsed_secs` は人間向けの「over N h」に対応する。`journal_matches` /
+  `rolled_off` は判定フィールド(§4-5)。
+- **警告は 2 条件**、どちらも stderr の `WARNING:` + JSON の `warnings`。1 回の
+  実行で出るのは最大 1 つ(死んだマーカーの残り時間警告は rescan 要求に付け足す
+  情報がない):
+  - マーカーが既にロールオフ(`rolled_off`、またはライブの journal id がマーカーと
+    不一致) → 「次回検索は差分を判定できず全再走査を要求する。`sagasu index <root>`
+    を実行せよ」
+  - `remaining_secs` が `--journal-warn-hours` 未満 → およそ残り何時間かを告げる。
+
+  **`rolled_off` の判定は差分読み取りと同一**、すなわちライブの `FirstUsn` が
+  マーカーを追い越したか(＋journal id 不一致)だけで決める。**推定値の `expired` は
+  この判定に混ぜない。** `expired` はマーカーに**記録された** `MaximumSize` に対する
+  消費量の計算で、NTFS はこの値を上限ではなく目標として扱い、トリムも遅延する
+  (issue #37 の実機では 512 KB のジャーナルが約 9 万レコードを一周させずに保持した)。
+  混ぜると、**差分読み取りは成功するのに「索引は死んだ、再索引せよ」と言う偽警告**に
+  なる。`expired` が立ったが `rolled_off` は立っていない状態は矛盾ではなく実在する
+  状態なので、人間向けにはその旨を明示する(「記録容量は超えたが、マーカーのレコードは
+  まだジャーナルにある」)。同じ理由で JSON にはライブの容量 `live_maximum_size` も
+  出す — 記録値と食い違うとき、`remaining_secs` が弱い数字である理由がそこにある。
+- **照会に失敗したら失敗として出す。** 非 Windows / 権限不足(ボリュームが開けない)/
+  ジャーナル無効・非 NTFS は `"checked": false, "reason": "<なぜ>"` で、人間向けには
+  `journal check : not checked — <なぜ>` の 1 行を出す。**起きていない照会を
+  `checked: true` と報告しない。** `status` 自体は失敗しない(レポートの 1 項目が
+  取れなかっただけ) — 終了コードは従来どおり 0 または 2(§6)。
+- **実装の置き場所**: 判定は `delta::check_journal(marker, now_ns)` /
+  `delta::classify_journal(marker, &LiveJournal, now_ns)` が全プラットフォームで
+  コンパイルされる形で持ち、CLI はプラットフォーム分岐をしない。実 fetch は
+  `usn::query_live_journal(volume)`(Windows のみ、`FSCTL_QUERY_USN_JOURNAL` 1 回)。
+  人間向けと JSON は同じ 1 つの `JournalCheck` 値から分岐する(§4-6)。
+- **未検証**: 判定は純関数として Linux で単体テスト済み(issue #60)。実際の
+  `FSCTL_QUERY_USN_JOURNAL` を含む経路は Windows 実機での確認が残件
+  (x86_64-pc-windows-gnu へのコンパイルはゲートとして確認済み)。
 
 ### 9-2. 別 issue に切るもの
 
@@ -533,7 +584,8 @@ PR #36 が `delta::estimate_lifetime(marker, next_usn_now, now_ns)
 4. `docs/index_scope.md` §2-2、`docs/tag_rules.md` §2、
    `docs/examples/sagasu-tags.toml` → `docs/examples/sagasu.toml` の追随。
 
-**入らなかったもの**: §9 の全部(`--check-journal` は今も未実装)。
+**入らなかったもの**: §9-2 の全部(`--color` / `RIPGREP_CONFIG_PATH` 相当。§9-1 の
+`--check-journal` は issue #60 で実装済み)。
 §4-7 の索引健全性フィールドはその後 issue #52 / PR #54 で入った。
 
 **受け入れの確認は「件数が一致すること」で行う**: `--json` の出力を `jq` で

@@ -87,7 +87,7 @@ use windows::Win32::System::IO::DeviceIoControl;
 
 use crate::delta::{
     now_ns, DeltaConfig, DeltaEntry, DeltaSet, DeltaSource, DeltaSourceKind, DeltaStatus,
-    RescanReason, ScanMarker,
+    LiveJournal, RescanReason, ScanMarker,
 };
 use crate::walk::ExcludeSet;
 
@@ -545,6 +545,30 @@ fn query_journal(handle: HANDLE) -> Result<USN_JOURNAL_DATA_V0> {
     }
     .context("FSCTL_QUERY_USN_JOURNAL failed (journal disabled, or not an NTFS volume)")?;
     Ok(data)
+}
+
+/// One live `FSCTL_QUERY_USN_JOURNAL` for `volume`, for
+/// `sagasu status --check-journal` (issue #60).
+///
+/// The same two syscalls the source's own probe performs — open `\\.\C:` (which
+/// requires administrator rights) and ask for the journal's current state — and
+/// it fails the same way, with the same reasons: the volume cannot be opened,
+/// or the journal is disabled / the volume is not NTFS. No records are read.
+/// The caller ([`crate::delta::check_journal`]) turns the values into the
+/// platform-neutral lifetime verdict.
+pub fn query_live_journal(volume: &str) -> Result<LiveJournal> {
+    let handle = open_volume(volume)?;
+    let data = query_journal(handle);
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    let data = data?;
+    Ok(LiveJournal {
+        journal_id: data.UsnJournalID,
+        first_usn: data.FirstUsn,
+        next_usn: data.NextUsn,
+        maximum_size: data.MaximumSize,
+    })
 }
 
 /// Resolve a parent directory's file reference number to a path, memoising both
