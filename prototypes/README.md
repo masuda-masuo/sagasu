@@ -2,6 +2,8 @@
 
 技術リスクの高い要素を個別に検証する使い捨てプロトタイプ群。本体実装とは独立した Cargo ワークスペース。ここでの計測結果は issue #7(ベンチ基盤)の目標値設定に還流する。
 
+**検証はすべて決着済み**(下記「確認したい仮説」参照)。本番実装は `crates/sagasu-core` + `crates/sagasu-cli` にあり、このディレクトリは**当時の計測を再現するための記録**として残してある。プロトタイプの割り切り(下記「既知の制約」)は本番実装には引き継がれていない。
+
 Windows 用ビルド済み .exe は GitHub Release(`proto-YYYYMMDD` タグ)に添付してある。ダウンロードすればビルド不要で試せる。
 `.github/workflows/prototypes.yml` が Windows ランナー上でネイティブに MSVC ビルドして添付したもので、手元の
 mingw クロスビルドを人手でアップロードする経路ではない(詳しくは末尾の「ビルド」参照)。
@@ -12,6 +14,9 @@ mingw クロスビルドを人手でアップロードする経路ではない(�
 | proto-fulltext | tantivy + Lindera の索引/検索、**fresh-search**(mtime 差分マージ) | #2 (M1), #3 (M2 フォールバック) |
 | proto-ftcompare | tantivy vs SQLite FTS5 の対比計測(同一コーパス・同一本文抽出・同一トークナイザ) | #35 (design.md §11) |
 | proto-usn | NTFS USN Journal の差分照会速度(Windows 専用・要管理者権限) | #3 (M2 本命) |
+| proto-gui / proto-gui-core | Tauri v2 の**計測器**(UI 試作ではない)。インクリメンタル検索の1打鍵あたりコストと鮮度モード3種の比較 | #17 (M2 の前倒し計測) |
+
+`proto-gui` は Windows でしかビルドできない(シェルが webkit2gtk を要求するため Linux 側の `default-members` から外してある)ので、実コンパイルの門番は CI の Windows ジョブ。ロジックは `proto-gui-core`(rlib)側にあり Linux でテストが走る。
 
 ## VM (Linux) での計測結果 — 2026-07-27
 
@@ -106,16 +111,27 @@ Remove-MpPreference -ExclusionPath "C:\path\to\sagasu-proto"
 # レコード数が多い時は --close-only で CLOSE のみ表示
 ```
 
-### 確認したい仮説
+### 確認したい仮説 — 4 つとも決着済み(2026-07-29、自宅 Windows 実機)
 
-1. 実データ数十万ファイルでも proto-crawl が数十秒以内(M0 の速度目標の根拠になる)
-2. proto-fulltext の日本語検索が実文書(Office 系以外)で実用精度
-3. **USN 差分照会が数十 ms 級** → 「インデックスは古くてよい」設計の成立
-4. fresh-search の delta-walk が実データ規模でどこまで伸びるか(mtime フォールバックの限界確認)
+| # | 仮説 | 結果 |
+|---|---|---|
+| 1 | 実データ数十万ファイルでも proto-crawl が数十秒以内(M0 の速度目標の根拠になる) | ✅ 151,674 件を **1.43s**(メタデータのみ) |
+| 2 | proto-fulltext の日本語検索が実文書(Office 系以外)で実用精度 | ✅ grep 全数との突き合わせで再現率 1.00 |
+| 3 | **USN 差分照会が数十 ms 級** → 「インデックスは古くてよい」設計の成立 | ✅ 85 レコード **2.3ms** |
+| 4 | fresh-search の delta-walk が実データ規模でどこまで伸びるか(mtime フォールバックの限界確認) | ✅ 7.3ms(Linux VM の 9.8ms と同等) |
+
+**最大の発見はハッシュがクロールの 60 倍**(同一対象でメタデータのみ 1.43s に対し
+`--hash` 込み 85.39s)。本番実装が `blake3` を NULL 可にして `sagasu hash` で後追いする
+設計(design.md §7)はこの実測から来ている。計測の全文は issue #7 / #1 のコメント。
+
+その後の実機検証も記録が残っている: #17(proto-gui、2026-08-05)、
+#35(proto-ftcompare、design.md §11)、#37(USN 本番経路、2026-08-08)。
 
 ## 既知の制約(プロトタイプの割り切り)
 
-- proto-usn はファイル名しか出さない。FRN→フルパス解決(MFT 列挙 or OpenFileById)は次の検証項目
+- proto-usn はファイル名しか出さない(FRN→フルパス解決を持たない)。本番実装は
+  `OpenFileById` + `GetFinalPathNameByHandleW` で親 FRN を解決する経路を持ち、
+  2026-08-08 に実機検証済み(issue #37。解決失敗の計上は issue #57 で継続)
 - proto-fulltext の live-grep は素朴な部分一致で、索引側のトークナイズ検索と一致条件が違う
 - 結果を `| head` に繋ぐと broken pipe で panic する(SIGPIPE 未処理、実害なし)
 - Windows .exe は CI(`.github/workflows/prototypes.yml`)が Windows ランナー上で msvc ネイティブビルドする。

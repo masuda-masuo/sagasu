@@ -385,12 +385,25 @@ on Linux it does not.  The prototype configs handle this difference (see below).
 
 ## Prototype measurement configs
 
-Two pre-built configs are provided under `bench/configs/`:
+The two prototype configs under `bench/configs/` are:
 
 | Config | Platform | Binary prefix |
 |---|---|---|
 | `prototypes-linux.toml` | Linux | `./proto-crawl`, `./proto-fulltext` |
 | `prototypes-windows.toml` | Windows | `proto-crawl`, `proto-fulltext` |
+
+Two more configs live in the same directory: `ftcompare-linux.toml` (drives
+`proto-ftcompare` for the tantivy vs SQLite FTS5 comparison; results and the
+resulting decision are in `docs/design.md` §11, usage in
+`prototypes/README.md`) and
+`smoke.toml` / `smoke-setup.toml` (wiring checks that run standard system
+commands and need no prototype binaries).
+
+**No config targets the real implementation (`sagasu`) yet.** The harness
+itself is implementation-agnostic — targets are declared entirely in TOML — but
+the `crates/` binaries have no config here, so nothing in `bench/` measures the
+shipped engine — every number in this file is a prototype number. Adding a
+`sagasu` config is open work with no issue filed for it yet.
 
 ### Targets covered
 
@@ -444,17 +457,17 @@ alongside the prototypes on every push and PR:
 - **`check`** (Linux + Windows): builds `bench` with `cargo build --release`
   and runs `cargo clippy --all-targets -- -D warnings`.
 - **`release-windows`**: builds `bench.exe` targeting
-  `x86_64-pc-windows-msvc` and stages it alongside the three prototype
+  `x86_64-pc-windows-msvc` and stages it alongside the prototype
   binaries.  The Release attachment for every `proto-*` tag therefore
-  includes four Windows executables: `proto-crawl.exe`, `proto-fulltext.exe`,
-  `proto-usn.exe`, and `bench.exe`.
+  includes five Windows executables: `proto-crawl.exe`, `proto-fulltext.exe`,
+  `proto-usn.exe`, `proto-gui.exe`, and `bench.exe`.  (`proto-ftcompare` is
+  Linux-only in practice and is not attached.)
 
 ## Non-goals
 
 This harness does *not*:
 
 - Set or propose any speed target numbers.
-- Include comparisons between tantivy and SQLite FTS5.
 - Generate a 1,000,000-file tree as part of any smoke test.
 - Measure resident memory (no persistent sagasu process exists yet).
 - Run the prototype configs automatically in CI (they require actual

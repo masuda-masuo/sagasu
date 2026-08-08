@@ -5,9 +5,10 @@ design.md §2 の「CLI ファースト」の具体化。サブコマンド体�
 
 **この文書の射程**: M0〜M3 で実装済みの 9 サブコマンドの現状を棚卸しし、
 (a) 機械可読出力 `--json`、(b) 設定ファイルの 1 本化、の 2 点を決める。
-実装は issue #6 の 2 本目の PR で入る。**実装済みでない項目は §9 に隔離して
-「設計のみ」と明記する** — 設計書が実装を先取りしていること自体は正しいが、
-どちらなのか読者に分からない状態は事故のもと。
+**両方とも実装済み**(PR #48 / #50、issue #6 はクローズ)。
+**実装済みでない項目は §9 に隔離して「設計のみ」と明記する** — 設計書が実装を
+先取りしていること自体は正しいが、どちらなのか読者に分からない状態は事故のもと。
+§9 の `--check-journal` は今も未実装で、この文書で唯一の「設計のみ」の節。
 
 ---
 
@@ -279,8 +280,9 @@ Lindera は `\n` `\t` `。` `、` でしか文を切らない。**空白は区�
 
 ### 5-1. 決定
 
-現状の `sagasu-tags.toml`(タグルール) と `sagasu-text.toml`(本文抽出の拡張子)を
-**単一の `sagasu.toml`** に統合する。
+旧 `sagasu-tags.toml`(タグルール) と `sagasu-text.toml`(本文抽出の拡張子)を
+**単一の `sagasu.toml`** に統合した(実装済み。以下は現行仕様。例は
+`docs/examples/sagasu.toml`)。
 
 ```toml
 # sagasu.toml
@@ -300,12 +302,12 @@ file = "*.psd"
 tags = ["app:photoshop"]
 ```
 
-- `[text]` の中身は現行 `sagasu-text.toml` のトップレベルと**同一**
+- `[text]` の中身は旧 `sagasu-text.toml` のトップレベルと**同一**
   (`text_ext` / `binary_ext`)。
-- `[[tags.rule]]` の中身は現行 `sagasu-tags.toml` の `[[rule]]` と**同一**
+- `[[tags.rule]]` の中身は旧 `sagasu-tags.toml` の `[[rule]]` と**同一**
   (`name` / `path` / `file` / `ext` / `tags`)。
-- **未知のキーはエラー**(`deny_unknown_fields`)。これは両ファイルの現行仕様で、
-  統合後も維持する。`text_exts` と打ち間違えた設定が「読めたが何もしない」に
+- **未知のキーはエラー**(`deny_unknown_fields`)。これは旧両ファイルの仕様で、
+  統合後も維持している。`text_exts` と打ち間違えた設定が「読めたが何もしない」に
   なると、利用者は sniffer を疑うことになる。
 - **セクションはどちらも省略可。** `[text]` だけの `sagasu.toml` も
   `[[tags.rule]]` だけのものも正当。
@@ -435,14 +437,14 @@ rg は `0` = マッチあり、`1` = マッチなし、`2` = エラー。sagasu 
 |---|---|---|
 | 1 | `-n` が `search`/`find`/`tags` では `--limit`、`browse` では `--files` | **直さない。** 意味(出力行数の上限)は揃っており、フラグ名の差は「結果」と「プレビュー」の差を反映している。改名は docs/browse.md の到達ログを全部無効にする |
 | 2 | `-n` の既定値が 10 / 20 / 20 / 5 とばらばら | **直さない。** §2-1 の通り用途差 |
-| 3 | `find` だけ索引が空でも警告も非 0 終了もしない | **PR2 で直す。** `search` と同じ「メタデータ索引が空」警告を追加(終了コードは当時の §6 に従い変えない。その後 issue #49 でこの空索引ケースは終了コード 2 に変更 — §6) |
+| 3 | `find` だけ索引が空でも警告も非 0 終了もしない | **修正済み(PR #48)。** `search` と同じ「メタデータ索引が空」警告を追加(終了コードは当時の §6 に従い変えなかった。その後 issue #49 でこの空索引ケースは終了コード 2 に変更 — §6) |
 | 4 | `--ext` が `fulltext` と `search` にあり `tag` に無い | **直さない。** `--ext` は本文抽出の判定を触るフラグで、タグ生成は本文を読まない |
 | 5 | `--no-fresh` が `status` に無い | **直さない。** `status` は差分プローブをしない(read-only を保つ設計)。§9 で `--check-journal` を足す設計はあるが既定 off |
-| 6 | 設定フラグが `--rules` と `--text-config` の 2 つ | **PR2 で直す**(§5-3、`--config` に統合) |
+| 6 | 設定フラグが `--rules` と `--text-config` の 2 つ | **修正済み(PR #48)**(§5-3、`--config` に統合) |
 | 7 | rg の `--files` 相当が無い | **入れない。** `sagasu find ""` や `sagasu tags` が同じ用途を埋めており、名前が `browse --files` と衝突する |
 | 8 | 色付き出力 / `--color` が無い | **入れない。** 現状 stdout に ANSI は一切出ておらず(依存に termcolor 類なし)、パイプ検出まで含めると独立した仕事。`--json` が先 |
 | 9 | `tags` の 3 モード(名前空間一覧 / 値一覧 / ファイル絞り込み)が位置引数の形で暗黙に切り替わる | **直さない。** `sagasu tags` / `sagasu tags ext:` / `sagasu tags ext:png` の階段は rg の `--files`/`-l`/通常と同じ「引数が増えるほど具体的」の形で、`--json` では `type` が違うイベントとして明示的に区別される(§4-4) |
-| 10 | `browse` だけ先頭に空行を出す | **PR2 で直す**(整形の一貫性。`--json` では無関係) |
+| 10 | `browse` だけ先頭に空行を出す | **修正済み(PR #48)**(整形の一貫性。`--json` では無関係) |
 
 ---
 
@@ -467,7 +469,7 @@ PR #41 が `sagasu browse` に `--json` を入れなかった理由は
 
 ---
 
-## 9. 設計のみ(実装は issue #6 のスコープ外)
+## 9. 設計のみ(未実装)
 
 ### 9-1. `sagasu status` の USN マーカー寿命警告
 
@@ -521,7 +523,7 @@ PR #36 が `delta::estimate_lifetime(marker, next_usn_now, now_ns)
 
 ## 10. 実装の割り当て
 
-**issue #6 の 2 本目の PR に入るもの**:
+**PR #48 で入ったもの**(issue #6、2026-08-07):
 
 1. `--json` を 9 サブコマンドに実装(§4)。`crates/sagasu-cli/src/json.rs` 新設、
    `serde_json` を workspace 依存に追加。
@@ -531,7 +533,8 @@ PR #36 が `delta::estimate_lifetime(marker, next_usn_now, now_ns)
 4. `docs/index_scope.md` §2-2、`docs/tag_rules.md` §2、
    `docs/examples/sagasu-tags.toml` → `docs/examples/sagasu.toml` の追随。
 
-**入らないもの**: §9 の全部。
+**入らなかったもの**: §9 の全部(`--check-journal` は今も未実装)。
+§4-7 の索引健全性フィールドはその後 issue #52 / PR #54 で入った。
 
 **受け入れの確認は「件数が一致すること」で行う**: `--json` の出力を `jq` で
 数えた結果が、人間向け出力の数字と一致すること。§4-2 の規約 1

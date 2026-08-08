@@ -103,10 +103,12 @@ database carrying structures it never wrote.
 | `tag_rows` | `sagasu tag` | Rows written to `file_tags`. |
 | `tag_rules` | `sagasu tag` | Path of the user rule file used, or empty. |
 | `tag_rules_digest` | `sagasu tag` | BLAKE3 (hex) of that file's bytes, so the tags can be attributed to an exact rule set. It is recorded, not re-checked: verifying it would mean re-reading the rule file on every query. |
+| `exclude_policy` | `sagasu index` | The exclusion rules that crawl actually applied, stored as rules rather than as a reference to the file they came from (design.md §4-1). Search-time delta queries restore it, so crawl and delta never scan different sets. An index without it falls back to the built-in defaults and `sagasu status` warns, because that is a guess. |
+| `text_policy` | `sagasu fulltext` | The body-extraction verdicts that the full-text build actually applied (design.md §4-2), restored by `sagasu search` so the live grep classifies files the same way the index did. Its `source=` field names the config file for information only and is never re-read. |
 
-All seven are cleared at the start of a tag build and written together at its
-end, inside the same transaction as the rows, so they never describe a build that
-did not finish.
+The six `tag_*` keys are cleared at the start of a tag build and written together
+at its end, inside the same transaction as the rows, so they never describe a
+build that did not finish.
 
 ## `delta_marker` encoding
 
