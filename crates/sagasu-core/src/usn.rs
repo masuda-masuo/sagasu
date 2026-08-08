@@ -26,6 +26,13 @@
 //!   [`ExcludeSet`] and the crawl root are applied to every record, and what
 //!   they drop is counted in [`DeltaSet::excluded`] (issue #16 measured 94% on a
 //!   real machine).
+//! - **Unresolvable parents.** A record whose parent FRN cannot be opened is
+//!   not an exclusion — nobody asked for it to be dropped. Issue #57 splits
+//!   those failures three ways: resolved (normal), a *gone* parent with a
+//!   deletion record (benign — the file does not exist; counted in
+//!   [`DeltaSet::gone`]), and anything else (counted in [`DeltaSet::errors`]).
+//!   The gone/error decision is the platform-neutral pure function
+//!   [`crate::delta::classify_frn_failure`], unit-tested on Linux.
 //!
 //! ## Marker invalidation (issue #16)
 //!
@@ -86,16 +93,13 @@ use windows::Win32::System::Ioctl::{
 use windows::Win32::System::IO::DeviceIoControl;
 
 use crate::delta::{
-    now_ns, DeltaConfig, DeltaEntry, DeltaSet, DeltaSource, DeltaSourceKind, DeltaStatus,
-    LiveJournal, RescanReason, ScanMarker,
+    classify_frn_failure, now_ns, DeltaConfig, DeltaEntry, DeltaSet, DeltaSource, DeltaSourceKind,
+    DeltaStatus, FrnFailure, LiveJournal, RescanReason, ScanMarker, USN_REASON_FILE_DELETE,
 };
 use crate::walk::ExcludeSet;
 
 /// Journal read buffer, in 8-byte words. 64 KiB per `DeviceIoControl` round.
 const READ_BUF_WORDS: usize = 64 * 1024 / 8;
-
-/// `USN_REASON_FILE_DELETE`.
-const USN_REASON_FILE_DELETE: u32 = 0x0000_0200;
 
 /// Reasons that cannot change a file's content or name, and so cannot change a
 /// search result. Filtering them here keeps the delta set (and therefore the
@@ -300,13 +304,24 @@ impl UsnDeltaSource {
     ) -> Result<DeltaSet> {
         let mut buf = vec![0u64; READ_BUF_WORDS];
         let mut cursor = start_usn;
-        let mut parents: HashMap<u64, Option<PathBuf>> = HashMap::new();
+        let mut parents: HashMap<u64, ParentOpen> = HashMap::new();
         // Records are per-change, not per-file: one save produces several. The
         // delta set is a set.
         let mut seen: HashMap<String, usize> = HashMap::new();
         let mut entries: Vec<DeltaEntry> = Vec::new();
         let mut scanned: u64 = 0;
         let mut excluded: u64 = 0;
+        // Records dropped because their parent directory no longer exists
+        // (issue #57): the path they describe is gone, so dropping them loses
+        // no real change. Neither a policy exclusion nor a read failure — its
+        // own counter, see [`crate::delta::FrnFailure`].
+        let mut gone: u64 = 0;
+        let mut frn_error_codes: Vec<u32> = Vec::new();
+        // Records whose parent could not be resolved in a way that may hide a
+        // real change: the open failed for a reason other than "it does not
+        // exist" (access denied, a sharing violation, a transient lock), so
+        // the directory is live and we simply could not read it.
+        let mut errors: u64 = 0;
         let mut truncated = false;
 
         loop {
@@ -387,10 +402,33 @@ impl UsnDeltaSource {
                     String::from_utf16_lossy(std::slice::from_raw_parts(ptr, name_len))
                 };
 
-                let Some(dir) = resolve_parent(handle, rec.ParentFileReferenceNumber, &mut parents)
-                else {
-                    excluded += 1;
-                    continue;
+                // Three-way, not two-way (issue #57): a record whose parent
+                // cannot be resolved is counted in exactly one of `gone` (the
+                // parent directory no longer exists, so the path this record
+                // describes is gone and nothing is lost by dropping it) or
+                // `errors` (the parent is live and could not be read, so a
+                // real change may be hidden). Never in `excluded`, which is
+                // reserved for deliberate policy drops. The verdict comes from
+                // the platform-neutral [`classify_frn_failure`] and depends on
+                // the open's error code alone; the outcome is memoised per FRN
+                // below, since a directory that cannot be opened will not
+                // become openable within one query.
+                let dir = match resolve_parent(handle, rec.ParentFileReferenceNumber, &mut parents)
+                {
+                    ParentOpen::Resolved(dir) => dir,
+                    ParentOpen::Failed(code) => {
+                        // Every code actually seen is reported: the "gone" set
+                        // is documented, not observed, and this is what lets
+                        // one run on real NTFS settle it.
+                        if !frn_error_codes.contains(&code) {
+                            frn_error_codes.push(code);
+                        }
+                        match classify_frn_failure(code) {
+                            FrnFailure::Gone => gone += 1,
+                            FrnFailure::Unresolved => errors += 1,
+                        }
+                        continue;
+                    }
                 };
                 let path = dir.join(&name);
                 if !self.accepts(&path) {
@@ -460,9 +498,19 @@ impl UsnDeltaSource {
             detects_renames: true,
             scanned,
             excluded,
-            // The journal read either succeeds or fails as a whole; there is no
-            // per-entry read to fail the way a directory walk has.
-            errors: 0,
+            // Records dropped because their parent directory no longer exists
+            // — the path is gone, so no real change is lost.
+            gone,
+            // Sorted so the report is stable run to run; usually one code, and
+            // empty when nothing failed to resolve.
+            frn_error_codes: {
+                frn_error_codes.sort_unstable();
+                frn_error_codes
+            },
+            // A parent-FRN open that failed for a reason other than "it does
+            // not exist" (access denied, a sharing violation) may hide a real
+            // change, so this answer is reported as possibly incomplete.
+            errors,
             error_samples: Vec::new(),
             elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
             marker: marker.clone(),
@@ -481,6 +529,8 @@ fn failed(marker: &ScanMarker, reason: RescanReason, t0: Instant) -> DeltaSet {
         detects_renames: false,
         scanned: 0,
         excluded: 0,
+        gone: 0,
+        frn_error_codes: Vec::new(),
         errors: 0,
         error_samples: Vec::new(),
         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -571,24 +621,55 @@ pub fn query_live_journal(volume: &str) -> Result<LiveJournal> {
     })
 }
 
+/// Outcome of opening a parent directory FRN, memoised per FRN.
+///
+/// The resolution verdict is three-way at the counting level (issue #57): a
+/// resolved parent proceeds; a parent that is *gone* is benign for a deletion
+/// record and an error otherwise; any other open failure is an error. The
+/// gone/error split depends on the record's own reason too, so this cache
+/// holds the FRN-dependent half — the open outcome with the Win32 error code
+/// from it — and [`crate::delta::classify_frn_failure`] applies the
+/// record-dependent half per record. A parent that failed will fail the same
+/// way for every record in this query, and each attempt is a syscall, so the
+/// open is attempted once per FRN.
+#[derive(Clone)]
+enum ParentOpen {
+    /// The parent opened and its path was recovered.
+    Resolved(PathBuf),
+    /// The open (or, after a successful open, the path recovery) failed.
+    /// `code` is the raw Win32 error code from `OpenFileById` — `0` when the
+    /// open itself succeeded but `GetFinalPathNameByHandleW` failed, which is
+    /// never a real failure code and so can only classify as an error, never
+    /// as benign.
+    Failed(u32),
+}
+
 /// Resolve a parent directory's file reference number to a path, memoising both
 /// successes and failures (a directory that cannot be opened will not become
 /// openable within one delta query, and each attempt is a syscall).
-fn resolve_parent(
-    volume: HANDLE,
-    frn: u64,
-    cache: &mut HashMap<u64, Option<PathBuf>>,
-) -> Option<PathBuf> {
+fn resolve_parent(volume: HANDLE, frn: u64, cache: &mut HashMap<u64, ParentOpen>) -> ParentOpen {
     if let Some(hit) = cache.get(&frn) {
         return hit.clone();
     }
-    let resolved = open_by_id(volume, frn).and_then(|h| {
-        let path = final_path(h);
-        unsafe {
-            let _ = CloseHandle(h);
+    let resolved = match open_by_id(volume, frn) {
+        Ok(h) => {
+            let path = final_path(h);
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            match path {
+                Some(p) => ParentOpen::Resolved(p),
+                None => ParentOpen::Failed(0),
+            }
         }
-        path
-    });
+        Err(e) => {
+            // The windows crate hands the code back HRESULT-encoded
+            // (`HRESULT::from_win32(GetLastError())`), and that encoding keeps
+            // only the low 16 bits of the Win32 code — so the low 16 bits are
+            // exactly the raw code the classifier compares against.
+            ParentOpen::Failed((e.code().0 as u32) & 0xFFFF)
+        }
+    };
     cache.insert(frn, resolved.clone());
     resolved
 }
@@ -597,7 +678,11 @@ fn resolve_parent(
 ///
 /// `FILE_FLAG_BACKUP_SEMANTICS` is required to open a *directory* handle, which
 /// is what every parent FRN is.
-fn open_by_id(volume: HANDLE, frn: u64) -> Option<HANDLE> {
+///
+/// The error is kept (not `.ok()`-ed away): the Win32 code from a failed open
+/// is what distinguishes "the parent is gone" from "the open was refused"
+/// (issue #57).
+fn open_by_id(volume: HANDLE, frn: u64) -> windows::core::Result<HANDLE> {
     let descriptor = FILE_ID_DESCRIPTOR {
         dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
         Type: FILE_ID_TYPE(0), // FileIdType
@@ -613,7 +698,6 @@ fn open_by_id(volume: HANDLE, frn: u64) -> Option<HANDLE> {
             FILE_FLAG_BACKUP_SEMANTICS,
         )
     }
-    .ok()
 }
 
 /// `GetFinalPathNameByHandleW`, stripped of the `\\?\` prefix so the result
@@ -660,8 +744,7 @@ fn rel_under(root: &Path, path: &Path) -> Option<PathBuf> {
     let root = root.trim_end_matches(['\\', '/']);
     let path = path.to_string_lossy();
     let bytes = path.as_bytes();
-    if path.starts_with(root) {
-        let rest = &path[root.len()..];
+    if let Some(rest) = path.strip_prefix(root) {
         if rest.is_empty() || rest.starts_with(['\\', '/']) {
             return Some(PathBuf::from(rest.trim_start_matches(['\\', '/'])));
         }

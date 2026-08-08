@@ -396,6 +396,92 @@ fn fetch_live_journal(_volume: &str) -> Result<LiveJournal> {
     anyhow::bail!("USN journal checks are only available on Windows")
 }
 
+// ── Unresolvable parent FRNs (issue #57) ──────────────────────────────────
+
+/// Win32 `ERROR_FILE_NOT_FOUND` (2): the FRN names a file record that no
+/// longer exists.
+///
+/// The "the parent no longer exists" verdict `OpenFileById` gives for a stale
+/// FRN. `ERROR_PATH_NOT_FOUND` and `ERROR_INVALID_PARAMETER` are the other
+/// documented "does not exist"-class codes the API can return.
+///
+/// **This set is taken from the API documentation, not from observation.** The
+/// #37 session saw parent opens fail in bulk for deleted directories but did
+/// not record which code each failure carried, and this container cannot run
+/// NTFS. `ERROR_INVALID_PARAMETER` in particular is a generic
+/// parameter-validation code rather than a documented "does not exist"
+/// verdict. If a *live* parent can fail with one of these, its records land in
+/// the benign counter and understate the incompleteness signal — so
+/// [`DeltaSet::frn_error_codes`] reports every code actually seen, and a single
+/// run on real hardware settles the question without instrumentation.
+pub const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+/// Win32 `ERROR_PATH_NOT_FOUND` (3) — see [`ERROR_FILE_NOT_FOUND`].
+pub const ERROR_PATH_NOT_FOUND: u32 = 3;
+
+/// Win32 `ERROR_INVALID_PARAMETER` (87) — see [`ERROR_FILE_NOT_FOUND`].
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
+
+/// `USN_REASON_FILE_DELETE` (0x0200): the journal reason bit that marks a
+/// deletion record.
+///
+/// Shared by the USN source ([`crate::usn`]) and the classification below;
+/// one definition so the two cannot drift apart.
+pub const USN_REASON_FILE_DELETE: u32 = 0x0000_0200;
+
+/// Verdict on an unresolvable parent-FRN open (issue #57).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrnFailure {
+    /// The parent directory is gone: the open failed with a "does not exist"
+    /// error, so the path this record describes does not exist any more.
+    /// Dropping it loses no real change — nobody can search for a file at a
+    /// path that is not there. Counted in [`DeltaSet::gone`], neither excluded
+    /// nor an error.
+    Gone,
+    /// The open failed for a reason other than "it does not exist" — access
+    /// denied, a sharing violation, a transient lock. The parent is *live* and
+    /// we could not read it, so a real change may be hidden behind it.
+    /// Counted in [`DeltaSet::errors`].
+    Unresolved,
+}
+
+/// Classify a failed `OpenFileById` on a journal record's parent FRN.
+///
+/// Pure and platform-neutral on purpose (same reasoning as
+/// [`classify_journal`], issue #60): the Win32 error code from the open goes
+/// in, the verdict comes out, and the CLI and the counters never branch on
+/// `cfg(windows)`. The code is the raw Win32 value (2, 3, 87, 5, 32, …), not
+/// an HRESULT — the caller recovers it from the windows crate's `Error`.
+///
+/// Three-way, not two-way: folding every resolution failure into `excluded`
+/// made `errors` structurally unreachable on this path, and simply moving the
+/// count to `errors` was rejected because an ordinary churn workload (issue
+/// #37 measured 90,016 failures after a 30,000-file create+delete) would keep
+/// the counter permanently huge — and a signal that is always huge gets
+/// ignored just as thoroughly as one that is always zero.
+///
+/// **The record's own reason does not enter the verdict**, and that is a
+/// correction to the first cut of this design (which required a
+/// `USN_REASON_FILE_DELETE` bit for the benign verdict). A gone parent means
+/// the *path* is gone, whatever the record says happened at it: a create under
+/// a directory that was later deleted describes a file that no longer exists,
+/// exactly like the deletion record does. Requiring the delete bit sent every
+/// create record of a create+delete churn to `errors` — roughly half of the
+/// 90,016 — which reproduced the "always huge" failure the split exists to
+/// avoid. A file that was *moved out* before its directory was deleted is not
+/// lost either: its `RENAME_NEW_NAME` record carries the new, live parent and
+/// resolves normally.
+pub fn classify_frn_failure(error_code: u32) -> FrnFailure {
+    if matches!(
+        error_code,
+        ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_PARAMETER
+    ) {
+        FrnFailure::Gone
+    } else {
+        FrnFailure::Unresolved
+    }
+}
+
 // ── Delta set ───────────────────────────────────────────────────────────────
 
 /// One file the delta source says changed since the marker.
@@ -500,6 +586,23 @@ pub struct DeltaSet {
     /// Candidates dropped by the exclusion set. `excluded / (excluded +
     /// entries)` is the noise ratio issue #16 measured at 94%.
     pub excluded: u64,
+    /// Records dropped because their parent directory no longer exists
+    /// (issue #57, USN source only). The path they describe is gone, so
+    /// dropping them loses no real change — a *fact*, not a policy decision
+    /// and not a read failure, so it gets its own counter instead of
+    /// [`DeltaSet::excluded`] (where it used to be) or [`DeltaSet::errors`]
+    /// (where it would drown the signal).
+    pub gone: u64,
+    /// Distinct Win32 error codes seen when a parent FRN failed to open,
+    /// sorted and deduplicated (issue #57, USN source only).
+    ///
+    /// Reported because the "which codes mean *gone*" set in
+    /// [`classify_frn_failure`] comes from the API documentation and has never
+    /// been observed on real NTFS. This turns that open question into
+    /// something one run on real hardware answers: the codes are simply in the
+    /// report. Empty whenever no parent open failed, which is the ordinary
+    /// case.
+    pub frn_error_codes: Vec<u32>,
     /// Entries the scan could not read (an unopenable directory, a file it
     /// could not stat). Not exclusions — nobody asked for these to be dropped
     /// — so they are counted apart, and a delta set with errors in it is
@@ -527,6 +630,8 @@ impl DeltaSet {
             detects_renames: false,
             scanned: 0,
             excluded: 0,
+            gone: 0,
+            frn_error_codes: Vec::new(),
             errors: 0,
             error_samples: Vec::new(),
             elapsed_ms: ms,
@@ -949,6 +1054,10 @@ impl DeltaSource for MtimeDeltaSource {
             detects_renames: self.detects_renames(),
             scanned: scanned.load(Ordering::Relaxed),
             excluded: excluded.load(Ordering::Relaxed),
+            // The mtime walk sees only what still exists, so a record whose
+            // parent is gone cannot occur on this path.
+            gone: 0,
+            frn_error_codes: Vec::new(),
             errors: error_count,
             error_samples,
             elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,

@@ -140,13 +140,38 @@ pub(crate) fn print_fresh(outcome: &FreshOutcome) {
             0.0
         };
         println!(
-            "delta   : {} changed via {}{} ({} scanned, {} excluded = {:.0}% noise)",
+            "delta   : {} changed via {}{} ({} scanned, {} excluded = {:.0}% noise{})",
             d.entries,
             d.kind.as_str(),
             if d.cached { ", cached" } else { "" },
             d.scanned,
             d.excluded,
             ratio,
+            // Records whose parent directory no longer exists (issue #57): the
+            // path is gone, so they are dropped without losing a real change —
+            // counted apart from exclusions and errors. The Win32 codes ride
+            // along because the set that counts as "gone" is documented rather
+            // than observed on NTFS, and this is what settles it.
+            if d.gone > 0 {
+                format!(
+                    ", {} dropped (parent dir gone{})",
+                    d.gone,
+                    if d.frn_error_codes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            ", win32 {}",
+                            d.frn_error_codes
+                                .iter()
+                                .map(|c| c.to_string())
+                                .collect::<Vec<_>>()
+                                .join("/")
+                        )
+                    }
+                )
+            } else {
+                String::new()
+            },
         );
         if let DeltaStatus::RescanRequired(reason) = d.status {
             println!("          rescan required: {}", reason.as_str());
