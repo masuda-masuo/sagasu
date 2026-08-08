@@ -9,7 +9,6 @@
 //! query time.
 
 use std::path::{Path, PathBuf};
-use std::process;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -22,7 +21,7 @@ use sagasu_core::CrawlConfig;
 
 use crate::json;
 use crate::output::{mib, Output, Report};
-use crate::DEFAULT_INDEX_DIR;
+use crate::{Outcome, DEFAULT_INDEX_DIR};
 
 /// How many entries of the skipped-extension breakdown to print.
 const SKIPPED_EXT_ROWS: usize = 8;
@@ -62,7 +61,7 @@ pub struct IndexArgs {
     threads: usize,
 }
 
-pub fn cmd_index(args: IndexArgs, mode: Output) -> Result<()> {
+pub fn cmd_index(args: IndexArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
     let root = args
         .root
@@ -138,11 +137,14 @@ pub fn cmd_index(args: IndexArgs, mode: Output) -> Result<()> {
         json::index(&root.display().to_string(), &excludes, &summary, &report);
     }
 
+    // Zero files indexed was exit 1 under the old 2-value contract; it is a
+    // failure ("no work was performed"), not a legitimate empty answer, so it
+    // moves to 2 with the rest. The warning above already said why.
     if summary.indexed == 0 {
-        process::exit(1);
+        Ok(Outcome::Unusable)
+    } else {
+        Ok(Outcome::Success)
     }
-
-    Ok(())
 }
 
 /// The human rendering of what the crawl did.
@@ -260,7 +262,7 @@ pub struct HashArgs {
     max_size: u64,
 }
 
-pub fn cmd_hash(args: HashArgs, mode: Output) -> Result<()> {
+pub fn cmd_hash(args: HashArgs, mode: Output) -> Result<Outcome> {
     let report = Report::new(mode);
     let summary = sagasu_core::walk::hash_backfill(&args.db, args.max_size)?;
 
@@ -272,7 +274,9 @@ pub fn cmd_hash(args: HashArgs, mode: Output) -> Result<()> {
         println!("skipped (unreadable): {}", summary.skipped_unreadable);
     }
 
-    Ok(())
+    // `hash` has no empty-answer concept: hashing nothing (everything already
+    // hashed) is a success, not an empty answer.
+    Ok(Outcome::Success)
 }
 
 // ── fulltext ────────────────────────────────────────────────────────────────
@@ -346,7 +350,7 @@ pub(crate) fn load_config(explicit: Option<&Path>, exts: &[String]) -> Result<Co
     Ok(config)
 }
 
-pub fn cmd_fulltext(args: FulltextArgs, mode: Output) -> Result<()> {
+pub fn cmd_fulltext(args: FulltextArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
     reject_removed_config_flag("--text-config", args.text_config.as_deref())?;
     let loaded = load_config(args.config.as_deref(), &args.ext)?;
@@ -396,11 +400,14 @@ pub fn cmd_fulltext(args: FulltextArgs, mode: Output) -> Result<()> {
         );
     }
 
+    // Zero documents indexed was exit 1 under the old 2-value contract; it is
+    // a failure ("indexed but not findable"), not an empty answer, so it moves
+    // to 2 with the rest. The warning above already said why.
     if summary.indexed == 0 {
-        process::exit(1);
+        Ok(Outcome::Unusable)
+    } else {
+        Ok(Outcome::Success)
     }
-
-    Ok(())
 }
 
 /// The human rendering of a full-text build.

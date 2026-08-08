@@ -33,7 +33,6 @@
 //! the time had no tests at all.
 
 use std::path::{Path, PathBuf};
-use std::process;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -46,6 +45,7 @@ use sagasu_core::tags::Tag;
 
 use crate::json;
 use crate::output::{print_tag_freshness, tag_freshness, Output, Report, TagFreshness};
+use crate::Outcome;
 
 /// Default database path, so the reprinted command can leave `--db` out when it
 /// would be redundant.
@@ -91,7 +91,7 @@ pub struct BrowseArgs {
 }
 
 /// Run `sagasu browse`.
-pub fn cmd_browse(args: BrowseArgs, mode: Output) -> Result<()> {
+pub fn cmd_browse(args: BrowseArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
     let store = Store::open(&args.db)
         .with_context(|| format!("failed to open metadata index {:?}", args.db))?;
@@ -173,14 +173,20 @@ pub fn cmd_browse(args: BrowseArgs, mode: Output) -> Result<()> {
     }
 
     // An index with no tag layer has no facet tree at all — the same situation
-    // `sagasu tags` (with no query) exits 1 for. Exiting 0 here would let a
+    // `sagasu tags` (with no query) exits 2 for now. Exiting 0 here would let a
     // scripted `browse` treat "there is nothing to browse" as a successful
     // empty answer, which is the silent-omission failure with a warning stapled
     // to it. The stderr warning itself already came from `tag_freshness`.
     if !view.snapshot.built() {
-        process::exit(1);
+        return Ok(Outcome::Unusable);
     }
-    Ok(())
+    // The layer exists but the selection matches no live file: a legitimate
+    // empty answer. The no-selection root view counts its corpus, so an empty
+    // corpus lands here too.
+    if view.matched == 0 {
+        return Ok(Outcome::Empty);
+    }
+    Ok(Outcome::Success)
 }
 
 // ── String builders (unit-tested below) ─────────────────────────────────────
