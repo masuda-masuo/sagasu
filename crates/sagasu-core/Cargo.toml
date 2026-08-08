@@ -45,3 +45,10 @@ windows = { workspace = true }
 # though the crate itself only ever reads.
 [dev-dependencies]
 zip = { workspace = true }
+# The freshness tests (tests/fresh_tests.rs) stamp files' mtimes explicitly,
+# relative to the recorded crawl marker, instead of sleeping and hoping the
+# kernel clock moved past it: that is the only way "changed since the marker"
+# stops being a race on a host whose kernel clock lags `SystemTime::now()`.
+# Dev-only — the runtime crate never sets timestamps (the dependency comments
+# above concern normal deps, not dev-deps).
+filetime = "0.2"
