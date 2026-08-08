@@ -147,12 +147,14 @@ policy へ写す。参照にとどめた版は実測で2通りに壊れた:索�
 (成分単位、`/sys` は `/system` に一致しない)。Windows では ASCII case-insensitive
 (`delta::path_under` と同断)。既定プレフィックスも `--no-default-excludes` で落ちる。
 
-policy の互換: `prefix=` 行は**有効なリストを明示的に**書く(「defaults=1」から推定しない —
-`.gitignore` の行と同様、index は自分が使った規則を所有する)。`v1` policy(この変更前の
-index)は prefix 空で復元され、**新しい既定は適用されない** — クロールと差分の集合が
-食い違うのが encoding の存在理由だから。古いバイナリが新しい policy に会うと `prefix`
-キーが未知で decode 失敗 → クエリ側は index-only へ degrade して stale notice を出す
-(既存の契約、弱めない)。
+policy の互換: 形式は **v2**(`prefix=` を運ぶ)。`prefix=` 行は**有効なリストを明示的に**書く
+(「defaults=1」から推定しない — `.gitignore` の行と同様、index は自分が使った規則を所有する)。
+`v1` policy(この変更前の index)は**読めるが書かれない**: prefix 空で復元され、
+**新しい既定は適用されない** — クロールと差分の集合が食い違うのが encoding の存在理由だから。
+版を上げるのは `decode` の契約が「policy に規則を足す版は v1 を上げる」と明記しているため。
+古いバイナリが v2 に会うと**版で**弾かれ(「newer sagasu が書いた」)、クエリ側は index-only へ
+degrade して stale notice を出す(既存の契約、弱めない)。未知キーで弾くのと結果は同じだが、
+失敗の理由が読めるのは版のほう。
 
 **除外は数え上げる。読めなかったものは別に数える** — 除外ディレクトリの中身も
 walk して数える。速度と引き換えに「何件消えたか言えない除外」を作らないため。

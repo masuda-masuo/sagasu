@@ -1360,9 +1360,19 @@ fn a_prefix_exclusion_prunes_and_is_replayed_by_the_delta_side() {
     write_file(&d, "sys/kernel/osrelease", "6.1");
 
     let root = d.canonicalize().unwrap();
-    let proc_prefix = root.join("proc").to_string_lossy().into_owned();
+    let typed_prefix = root.join("proc").to_string_lossy().into_owned();
     let excludes =
-        walk::ExcludeSet::new(&[], false).with_prefixes(std::slice::from_ref(&proc_prefix));
+        walk::ExcludeSet::new(&[], false).with_prefixes(std::slice::from_ref(&typed_prefix));
+    // What gets stored is the *resolved* spelling, which is not always what we
+    // typed: on Windows `canonicalize` returns the verbatim `\\?\C:\…` form and
+    // the set stores it stripped. Matching normalises both sides, but the
+    // policy text below is a literal comparison, so ask the set what it kept
+    // rather than assuming our own spelling survived.
+    let proc_prefix = excludes
+        .prefixes()
+        .last()
+        .expect("the user prefix is last in the effective list")
+        .clone();
 
     let summary = walk::crawl_with_excludes(
         CrawlConfig {

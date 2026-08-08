@@ -643,7 +643,11 @@ impl ExcludeSet {
     /// the rules it was built with; a search must not depend on a file that may
     /// have been edited, deleted or broken since.
     pub fn encode(&self) -> String {
-        let mut out = String::from("v1\n");
+        // v2 carries `prefix=` (issue #43). The bump is what this type's own
+        // decode contract promises for "a release that adds a rule to the
+        // policy": an older binary meeting v2 then fails with "written by a
+        // newer sagasu" instead of the less legible "unknown key prefix".
+        let mut out = String::from("v2\n");
         out.push_str(&format!("defaults={}\n", u8::from(!self.no_default)));
         out.push_str(&format!("hidden={}\n", self.hidden.as_str()));
         out.push_str(&format!("gitignore={}\n", u8::from(self.uses_gitignore())));
@@ -690,7 +694,12 @@ impl ExcludeSet {
     pub fn decode(text: &str) -> Result<Self> {
         let mut lines = text.lines();
         match lines.next() {
-            Some("v1") => {}
+            // v1 predates the `prefix=` rule (issue #43). It decodes with an
+            // empty prefix list, and this build's *new* defaults are
+            // deliberately not injected: that index was crawled without them,
+            // and a delta query has to replay the set the crawl actually used,
+            // not the set this build would choose today.
+            Some("v1") | Some("v2") => {}
             other => bail!(
                 "unsupported exclusion policy format {other:?} — this index was written by a \
                  newer sagasu. Re-run `sagasu index <root>` with this build, or upgrade."
@@ -1651,10 +1660,17 @@ mod tests {
     fn a_policy_we_cannot_read_is_an_error_not_a_shrug() {
         // Falling back to the defaults would give the delta path a different
         // exclusion set than the crawl used, without saying so.
-        assert!(ExcludeSet::decode("v2\n").is_err());
-        assert!(ExcludeSet::decode("v1\nhidden=maybe\n").is_err());
-        assert!(ExcludeSet::decode("v1\nnonsense\n").is_err());
-        assert!(ExcludeSet::decode("v1\nfuture_key=1\n").is_err());
+        //
+        // The refused version has to be one this build does not know: v1 and
+        // v2 are both readable now (v2 added `prefix=`, issue #43), so the
+        // "written by a newer sagasu" case is v3.
+        assert!(ExcludeSet::decode("v3\n").is_err());
+        assert!(ExcludeSet::decode("\n").is_err());
+        assert!(ExcludeSet::decode("v2\nhidden=maybe\n").is_err());
+        assert!(ExcludeSet::decode("v2\nnonsense\n").is_err());
+        assert!(ExcludeSet::decode("v2\nfuture_key=1\n").is_err());
+        // …and the older shape is still read, not refused.
+        assert!(ExcludeSet::decode("v1\ndefaults=1\nhidden=include\ngitignore=0\n").is_ok());
     }
 
     #[test]
@@ -2082,10 +2098,13 @@ mod prefix_tests {
         assert!(set.contains("node_modules"));
         assert_eq!(set.hidden_policy(), HiddenPolicy::Include);
 
-        // And re-encoding it produces the same `v1` string, prefix lines or no.
+        // Re-encoding writes the current version — v1 is a shape this build
+        // reads, not one it writes. The prefix list stays empty, so no
+        // `prefix=` line appears and the crawl's original meaning survives the
+        // round trip.
         assert_eq!(
             set.encode(),
-            "v1\ndefaults=1\nhidden=include\ngitignore=0\n"
+            "v2\ndefaults=1\nhidden=include\ngitignore=0\n"
         );
     }
 
@@ -2095,7 +2114,7 @@ mod prefix_tests {
         // reader never needs to know what this build's defaults happened to be.
         let original = ExcludeSet::new(&[], false);
         let encoded = original.encode();
-        assert!(encoded.starts_with("v1\n"), "{encoded}");
+        assert!(encoded.starts_with("v2\n"), "{encoded}");
         for default in DEFAULT_PREFIX_EXCLUDES {
             assert!(encoded.contains(&format!("prefix={default}\n")), "{encoded}");
         }
