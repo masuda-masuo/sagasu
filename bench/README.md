@@ -227,6 +227,22 @@ repeat = 10
 setup = { command = "build-index", args = ["{root}", "--out", "{workdir}/index"] }
 ```
 
+`setup` may also be an ordered **chain** of commands, written as an array of
+tables:
+
+```toml
+setup = [
+  { command = "build-index", args = ["{root}", "--out", "{workdir}/index.db"] },
+  { command = "build-fulltext", args = ["{root}", "--out", "{workdir}/ft"] },
+]
+```
+
+The chain exists because a measurable state can need more than one command to
+produce — the shipped `sagasu` search needs both a metadata crawl and a
+full-text build, and no `sagasu` subcommand does both.  All commands run
+untimed, in order, in the same work directory, and the work directory is not
+cleaned between trials when a setup of either form is present.
+
 Behaviour:
 
 - **When `setup` is present**, the work directory is **not** cleaned between
@@ -234,9 +250,10 @@ Behaviour:
   substitution works in both `setup` and the command.
 - **When `setup` is absent**, current behaviour is unchanged (the work
   directory is cleaned before each trial after the first).
-- **A non-zero exit from `setup`** aborts the target: no trials run, the
-  target is recorded as a setup failure in the results, and timing fields are
-  `null`.  The harness does not fall through and produce meaningless timings.
+- **A non-zero exit from any `setup` command** (single or chain) aborts the
+  target: no trials run, the target is recorded as a setup failure in the
+  results, and timing fields are `null`.  The harness does not fall through
+  and produce meaningless timings.
 - The results JSON per target includes `setup_ran` (bool) and
   `setup_succeeded` (bool).
 
@@ -291,6 +308,14 @@ floor = "fulltext-search-floor"
   `qzxv9floorprobe`, an ASCII token `bench gen` never plants.  Its wall time is
   therefore the fixed cost with ~zero query work: process startup + index open
   + dictionary load.
+- **Floor probes may exit 1.**  Tools that follow rg's three-value exit
+  contract (0 = matches, 1 = no matches, 2 = error) report the floor's
+  no-match probe as exit 1.  The harness accepts exit 1 on **floor targets**
+  (targets referenced by another target's `floor` key) as a success — "ran
+  correctly, the answer is empty" — so the fixed cost is measured instead of
+  every trial being dropped.  Exit 2 is still a failure, so a genuinely broken
+  floor surfaces as `cannot derive`; non-floor targets accept only 0, so a
+  planted query that missed stays visible as a failure.
 - **How net values are derived.**  Net warm p50/p95 = the target's raw warm
   p50/p95 **minus the floor target's warm p50**.  Both raw and net numbers are
   always labelled: in the Markdown summary, the `Warm p50/p95` columns are
@@ -358,6 +383,12 @@ If every trial of a target fails, the timing fields (`min_secs`, `max_secs`,
 `p50_secs`, `p95_secs`) are `null` in the JSON and displayed as `—` in the
 Markdown summary.  The failure count is always visible.
 
+The one exception is a **floor target** exiting 1: by contract its probe query
+matches nothing, and for rg-style tools exit 1 means "no matches" — a correct
+answer, so those trials are measured, not dropped (see the `floor` section).
+Every other non-zero exit — including exit 2 on a floor, and exit 1 on a
+non-floor target — is a failure.
+
 ## Dependencies
 
 The dependency set is intentionally minimal:
@@ -383,29 +414,30 @@ No shelling out to `sh -c`.
 On Windows, `std::process::Command` searches the current directory by default;
 on Linux it does not.  The prototype configs handle this difference (see below).
 
-## Prototype measurement configs
+## Measurement configs
 
-The two prototype configs under `bench/configs/` are:
+Seven config files live under `bench/configs/`:
 
-| Config | Platform | Binary prefix |
+| Config | Platform | What it drives |
 |---|---|---|
-| `prototypes-linux.toml` | Linux | `./proto-crawl`, `./proto-fulltext` |
-| `prototypes-windows.toml` | Windows | `proto-crawl`, `proto-fulltext` |
+| `prototypes-linux.toml` | Linux | the `proto-crawl` / `proto-fulltext` prototypes (`./proto-*` in the working directory) |
+| `prototypes-windows.toml` | Windows | the same prototypes (bare `proto-*` on PATH / current directory) |
+| `ftcompare-linux.toml` | Linux | `proto-ftcompare` — the tantivy vs SQLite FTS5 comparison (`docs/design.md` §11, usage in `prototypes/README.md`) |
+| `sagasu-linux.toml` | Linux | the shipped `sagasu` binary (bare `sagasu` on PATH) |
+| `sagasu-windows.toml` | Windows | the shipped `sagasu` binary — a faithful mirror of the Linux config, **not executed on Windows in this repository** (see below) |
+| `smoke.toml` / `smoke-setup.toml` | any | wiring checks that run stock system commands and need no project binary |
 
-Two more configs live in the same directory: `ftcompare-linux.toml` (drives
-`proto-ftcompare` for the tantivy vs SQLite FTS5 comparison; results and the
-resulting decision are in `docs/design.md` §11, usage in
-`prototypes/README.md`) and
-`smoke.toml` / `smoke-setup.toml` (wiring checks that run standard system
-commands and need no prototype binaries).
+The harness itself is implementation-agnostic — targets are declared entirely
+in TOML — so the prototype configs and the `sagasu` configs are the same
+mechanism pointed at different binaries.  They are **not** interchangeable
+baselines: the prototypes and the shipped engine do not index the same set of
+files (the shipped code has different default exclusions, a three-stage
+body-format decision, and PDF/Office extraction), so every number in the
+prototype rows of this file is a prototype number and must never be read as
+the shipped engine's baseline.  The `sagasu` configs below measure the real
+implementation.
 
-**No config targets the real implementation (`sagasu`) yet.** The harness
-itself is implementation-agnostic — targets are declared entirely in TOML — but
-the `crates/` binaries have no config here, so nothing in `bench/` measures the
-shipped engine — every number in this file is a prototype number. Adding a
-`sagasu` config is open work with no issue filed for it yet.
-
-### Targets covered
+### Targets covered (prototypes)
 
 | Target | What it measures |
 |---|---|
@@ -421,7 +453,90 @@ The search terms (`全文検索`, `benchmark`) are from the planted-terms set th
 The floor term (`qzxv9floorprobe`) is deliberately **not** in any pool or
 planted set, so its query is guaranteed to match nothing.
 
-### Where the binaries must be
+### Targets covered (the shipped `sagasu`)
+
+| Target | What it measures |
+|---|---|
+| `index` | `sagasu index {root} --db {workdir}/index.db` — the first metadata crawl into a fresh SQLite index |
+| `hash` | `sagasu hash --db {workdir}/index.db` (with an `index` setup) — the BLAKE3 backfill |
+| `fulltext` | `sagasu fulltext --db {workdir}/index.db --index-dir {workdir}/ft-index` (with an `index` setup) — body extraction + tantivy build |
+| `search-floor` | `sagasu search qzxv9floorprobe --db {workdir}/index.db --index-dir {workdir}/ft-index` (with an `index` + `fulltext` setup) — the floor for the fresh searches: same binary, same setup, query matches nothing, so it measures the fixed cost (process startup + index open + Lindera dictionary load) plus the delta walk |
+| `search-ja` | `sagasu search 全文検索 ...` (same setup), `floor = "search-floor"` |
+| `search-en` | `sagasu search benchmark ...` (same setup), `floor = "search-floor"` |
+| `search-floor-no-fresh` | Same as `search-floor` with `--no-fresh` — the floor for the index-path searches (fixed cost, no delta walk) |
+| `search-ja-no-fresh` | `sagasu search 全文検索 --no-fresh ...`, `floor = "search-floor-no-fresh"` |
+| `search-en-no-fresh` | `sagasu search benchmark --no-fresh ...`, `floor = "search-floor-no-fresh"` |
+
+Each search target runs the full pipeline in its own scratch directory: the
+`setup` is a **chain** of two commands (crawl, then full-text build), because
+a `sagasu` search needs both the metadata DB and the tantivy index and the CLI
+has no subcommand that produces both.  The chain form of `setup` is a
+deliberate harness extension — see the `setup` key section above.
+
+#### Where the binary must be
+
+- **Linux (`sagasu-linux.toml`)**: bare `sagasu` on `PATH`.  A `./sagasu`
+  prefix would not work: the harness spawns every command with its working
+  directory set to the target's `{workdir}` (inside the tree), so a relative
+  path resolves against the scratch directory, not the shell's.  On Linux,
+  `std::process::Command` does not search the current directory, so PATH is
+  the only resolution.  Build once, then export:
+
+  ```bash
+  cargo build --release
+  export PATH="$PWD/target/release:$PATH"
+  ```
+
+- **Windows (`sagasu-windows.toml`)**: bare `sagasu` as well.  Windows
+  `CreateProcess` searches the current directory implicitly and appends
+  `.exe`, so the same bare name finds `sagasu.exe` on PATH or next to the
+  harness.  The config is a faithful mirror of the Linux one and **has not
+  been executed on Windows in this repository** — validate it on real
+  hardware before quoting its numbers.
+
+#### The `--no-fresh` decision
+
+Freshness merging is on by default, so every default search also pays a delta
+walk over the tree (stat'ing every file to see what changed since the crawl —
+on a static bench tree nothing changed, but the walk itself is real
+per-search work, and on Windows it is a USN journal query).  Both sides are
+worth measuring, so they are **separate named targets** — a number read six
+months from now must say which one it is:
+
+- `search-ja` / `search-en` measure what a user actually experiences
+  (merge on);
+- `search-ja-no-fresh` / `search-en-no-fresh` measure the index path alone
+  (`--no-fresh`).
+
+Each pair has its own floor (`search-floor` / `search-floor-no-fresh`), so
+the net numbers always mean the same thing: query work after the fixed cost,
+with the delta walk on the same side of the subtraction as the raw value it
+is subtracted from.
+
+#### Exit codes and the floor probe
+
+`sagasu` follows rg's three-value exit contract (`docs/cli.md` §6):
+0 = matches, 1 = no matches, 2 = error.  A floor probe that matches nothing
+therefore exits 1 on every trial, and the harness would normally drop those
+trials as failures, leaving the floor without warm statistics and the net
+columns at `cannot derive`.  The harness therefore accepts exit 1 on **floor
+targets** (targets referenced by another target's `floor` key) as success:
+"ran correctly, the answer is empty" is exactly what the floor is for.  Exit 2
+is still a failure, so a genuinely broken floor still surfaces as
+`cannot derive` rather than a wrong number; and non-floor targets accept only
+0, so a planted query that missed (a config bug) stays visible as a failure.
+The prototype configs are unaffected — their floor probes exit 0.
+
+#### `hash` uses `repeat = 1`
+
+The BLAKE3 backfill is idempotent: it only hashes rows that have no hash yet,
+so trial 1 does the whole backfill (every file the size limit admits — larger
+ones are skipped and stay NULL) and trials 2+ would hash nothing.  A warm p50 of
+"hash nothing" would be a silently wrong number, so `hash` runs exactly one
+trial — the first backfill is the only honest measurement, and the harness
+records it as the cold trial with no warm statistics.
+
+### Where the binaries must be (prototypes)
 
 - **Linux (`prototypes-linux.toml`)**: expects `./proto-crawl` and
   `./proto-fulltext` in the current working directory.  Run `bench` from the
@@ -435,7 +550,10 @@ planted set, so its query is guaranteed to match nothing.
 
 Crawl and index targets are I/O-bound and slow (seconds to minutes), so they
 use `repeat = 3`.  Search targets are CPU-bound and fast (milliseconds), so
-they use `repeat = 10` to give meaningful p50/p95.
+they use `repeat = 10` to give meaningful p50/p95.  The `sagasu` configs
+follow the same logic, with one deliberate exception: `hash` uses
+`repeat = 1` because the BLAKE3 backfill is idempotent (see the `sagasu`
+section).
 
 ### What is **not** covered
 
