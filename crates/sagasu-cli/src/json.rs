@@ -167,6 +167,15 @@ pub(crate) fn fresh(outcome: &FreshOutcome) {
             "cached": d.cached,
             "scanned": d.scanned,
             "excluded": d.excluded,
+            // Records dropped because their parent directory no longer exists
+            // (issue #57): the path is gone, so no real change is lost —
+            // neither a policy exclusion nor an error.
+            "gone": d.gone,
+            // Distinct Win32 codes behind those failed parent opens. The set
+            // that counts as "gone" is documented rather than observed, so the
+            // codes ride along and one run on real NTFS settles it. Empty in
+            // the ordinary case.
+            "frn_error_codes": d.frn_error_codes,
             "errors": d.errors,
             "detects_renames": d.detects_renames,
             "status": status,

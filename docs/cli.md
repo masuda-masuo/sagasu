@@ -172,7 +172,7 @@ PoC 段階なので**破壊的変更はありうる**。そのうえで最低限
 |---|---|---|
 | `meta` | 全ストリーム系 | `schema` `command` + コマンド固有(`query` `db` `fresh` など) |
 | `summary` | `search` `find` `tags` | `hits` `total`(あれば) `live_hits` `index_hits` |
-| `delta` | `search` `find` `tags` `browse` | `entries` `source` `cached` `scanned` `excluded` `status` `rescan_reason` `errors` `detects_renames` |
+| `delta` | `search` `find` `tags` `browse` | `entries` `source` `cached` `scanned` `excluded` `gone` `frn_error_codes` `status` `rescan_reason` `errors` `detects_renames` |
 | `timing` | `search` `find` | `setup_ms` `index_ms` `delta_ms` `live_ms` `merge_ms` `overhead_ms` `total_ms` |
 | `merge` | `search` `find` | `index_candidates` `dropped_changed` `dropped_deleted` |
 | `hit` | `search` `find` | `origin` `file_id` `path` `score` `size` `mtime_ns` `snippet` |
@@ -188,6 +188,16 @@ PoC 段階なので**破壊的変更はありうる**。そのうえで最低限
 `axis` の値リストだけは**入れ子の配列**にする(1 行 1 イベントの例外)。
 値は軸に属していて、平坦化すると消費側が親子を組み直すことになるため。
 
+`delta` の `gone` は**親ディレクトリがもう存在しないレコード**の件数 — そのレコードが指す
+パス自体が無いので、落としても実際の変更は失われない(レコードが作成か削除かは問わない。
+理由は design.md §5-2)。ポリシーによる除外(`excluded`)でも読み取り失敗(`errors`)でも
+ないため、専用カウンタに計上する(issue #57)。
+
+`frn_error_codes` はその失敗したオープンで実際に観測した Win32 コード(重複なし・昇順)。
+どのコードが「存在しない」を意味するかの集合は API ドキュメント由来で実機未観測なので、
+コードそのものを報告に載せてある — 実機 1 回の走行で確定できる。失敗が無ければ空配列。
+mtime 経路では常に空。
+
 ### 4-5. 具体例
 
 `sagasu search "needle" --json`:
@@ -195,7 +205,7 @@ PoC 段階なので**破壊的変更はありうる**。そのうえで最低限
 ```json
 {"type":"meta","schema":"v0","command":"search","query":"needle","db":"index.db","index_dir":"fulltext-index","fresh":true,"text_policy":"+text obj (sagasu.toml)"}
 {"type":"summary","hits":3,"live_hits":1,"index_hits":2,"total_docs":1234}
-{"type":"delta","entries":20,"source":"mtime","cached":false,"scanned":63901,"excluded":900,"status":"complete","rescan_reason":null,"errors":0,"detects_renames":true}
+{"type":"delta","entries":20,"source":"mtime","cached":false,"scanned":63901,"excluded":900,"gone":0,"frn_error_codes":[],"status":"complete","rescan_reason":null,"errors":0,"detects_renames":true}
 {"type":"timing","setup_ms":4.1,"index_ms":2.2,"delta_ms":32.5,"live_ms":0.7,"merge_ms":0.15,"overhead_ms":33.35,"total_ms":35.55}
 {"type":"merge","index_candidates":10,"dropped_changed":1,"dropped_deleted":0}
 {"type":"hit","origin":"live","file_id":null,"path":"/home/u/notes/新しい原稿.md","score":3.0,"size":812,"mtime_ns":1754500000000000000,"snippet":"…needle…"}

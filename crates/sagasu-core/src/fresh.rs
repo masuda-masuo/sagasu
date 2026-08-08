@@ -224,6 +224,15 @@ pub struct DeltaReport {
     pub scanned: u64,
     /// Candidates dropped by the exclusion set (issue #16's noise ratio).
     pub excluded: u64,
+    /// Records dropped because their parent directory no longer exists
+    /// (issue #57, USN source only). The path they describe is gone, so
+    /// dropping them loses no real change — counted apart from
+    /// [`DeltaReport::excluded`] and [`DeltaReport::errors`] on purpose.
+    pub gone: u64,
+    /// Distinct Win32 codes seen on failed parent-FRN opens, sorted (issue
+    /// #57, USN source only). Reported because the "which code means *gone*"
+    /// set is documented rather than observed; empty in the ordinary case.
+    pub frn_error_codes: Vec<u32>,
     /// Entries the scan could not read. Not exclusions: a directory the live
     /// scan cannot open may hold changes this answer does not know about.
     pub errors: u64,
@@ -684,6 +693,8 @@ impl DeltaContext {
             entries: s.entries.len(),
             scanned: s.scanned,
             excluded: s.excluded,
+            gone: s.gone,
+            frn_error_codes: s.frn_error_codes.clone(),
             errors: s.errors,
             cached: self.cached,
         })
