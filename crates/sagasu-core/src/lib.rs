@@ -38,6 +38,7 @@ pub mod delta;
 pub mod docmeta;
 pub mod fresh;
 pub mod fulltext;
+pub mod lattice;
 pub mod store;
 pub mod tagindex;
 pub mod tagrules;

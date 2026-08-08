@@ -1018,3 +1018,129 @@ fn rebuilding_without_a_config_clears_the_recorded_policy() {
     let restored = TextPolicy::from_index(&store).unwrap().unwrap();
     assert!(restored.is_empty(), "{:?}", restored.text_exts());
 }
+
+// ── issue #52: delimiter-free documents lose their tail ─────────────────────
+
+/// Vocabulary for the delimiter-free corpus below.
+///
+/// Mixed Japanese and English on purpose: the per-node costs at a script change
+/// are what drives the Viterbi path cost up fast enough to saturate, and a
+/// single-script corpus of the same length does **not** reproduce the defect
+/// (measured: 1.05 MB of pure English and of pure Japanese both tokenize
+/// cleanly). This is the generator from lindera/lindera#871.
+const LATTICE_WORDS: [&str; 16] = [
+    "delta", "merge", "index", "search", "検索", "索引", "文書", "解析", "tantivy", "lindera",
+    "token", "位置", "情報", "格子", "コスト", "飽和",
+];
+
+/// `words` space-separated words with **no** Lindera sentence delimiter
+/// anywhere (no `\n`, `\t`, `。` or `、`), with `needle` spliced in at
+/// `needle_at_pct` of the way through.
+///
+/// A space is not a delimiter as far as Lindera is concerned, so this is one
+/// sentence and therefore one lattice.
+fn delimiter_free_body(words: usize, needle: &str, needle_at_pct: usize) -> String {
+    let mut out = String::with_capacity(words * 8);
+    let needle_at = words * needle_at_pct / 100;
+    for i in 0..words {
+        if i == needle_at {
+            out.push_str(needle);
+            out.push(' ');
+        }
+        out.push_str(LATTICE_WORDS[i % LATTICE_WORDS.len()]);
+        out.push(' ');
+    }
+    out
+}
+
+/// The regression for issue #52.
+///
+/// A ~1 MB document with no sentence delimiter saturates Lindera's Viterbi
+/// lattice partway through; from that point on the segmenter returns the whole
+/// remainder as a single token, tantivy drops it for exceeding `MAX_TOKEN_LEN`,
+/// and the tail of the document disappears from the index without a word of
+/// explanation. Before the mitigation this assertion finds zero hits for a word
+/// that is unambiguously in the file.
+///
+/// The size is not padding. The break is at roughly 135,000 lattice nodes, so a
+/// smaller document does not reproduce it at all — 700 KB of the same text
+/// tokenizes perfectly. This is the smallest shape that fails.
+#[test]
+fn tail_of_a_delimiter_free_document_stays_searchable() {
+    let (data, db, index) = tmp_dirs("lattice_tail");
+
+    let needle = "zzneedlezz zztailzz";
+    let body = delimiter_free_body(150_000, needle, 99);
+
+    assert!(
+        !body.contains(['\n', '\t', '。', '、']),
+        "the corpus must have no Lindera sentence delimiter, or it proves nothing"
+    );
+    assert!(
+        (body.len() as u64) < fulltext::DEFAULT_MAX_SIZE,
+        "the corpus must be inside the default body limit ({} bytes)",
+        body.len()
+    );
+
+    write_file(&data, "no_delimiters.txt", &body);
+    let summary = index_all(&data, &db, &index);
+    assert_eq!(summary.indexed, 1, "{summary:?}");
+
+    // The mitigation fired, and it is reported rather than silent.
+    assert_eq!(summary.lattice_split_docs, 1, "{summary:?}");
+    assert!(summary.lattice_breaks >= 30, "{summary:?}");
+    assert_eq!(
+        summary.lattice_split_samples.len(),
+        1,
+        "the split document is named in the summary: {summary:?}"
+    );
+
+    // Nothing reached the size at which tantivy would drop it.
+    assert_eq!(summary.dropped_long_tokens, 0, "{summary:?}");
+    assert!(
+        summary.longest_token_bytes < 1024,
+        "a giant token survived: {summary:?}"
+    );
+
+    // The point of the whole exercise: a word that occurs only in the tail is
+    // findable.
+    let outcome = search(&index, "zztailzz");
+    assert_eq!(
+        outcome.hits.len(),
+        1,
+        "the tail of a delimiter-free document is missing from the index"
+    );
+
+    // …as a phrase, too, which is the shape issue #52 was first noticed in.
+    let outcome = search(&index, "\"zzneedlezz zztailzz\"");
+    assert_eq!(outcome.hits.len(), 1, "phrase in the tail is not matched");
+
+    // …and the head still works, i.e. the fix did not trade one end for the
+    // other.
+    let outcome = search(&index, "tantivy");
+    assert_eq!(outcome.hits.len(), 1);
+}
+
+/// The mitigation is inert on ordinary text: prose has a newline well inside
+/// 32 KiB, so nothing is rewritten and the stored body is byte-for-byte the
+/// file. A counter that ticks on normal corpora would be worse than no counter.
+#[test]
+fn ordinary_documents_are_not_rewritten() {
+    let (data, db, index) = tmp_dirs("lattice_inert");
+
+    let prose = std::iter::repeat_n("索引と検索の設計 index and search design", 6000)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prose.len() > 200_000);
+    write_file(&data, "prose.txt", &prose);
+    write_file(&data, "short.txt", "delta merge の位置情報");
+
+    let summary = index_all(&data, &db, &index);
+    assert_eq!(summary.indexed, 2, "{summary:?}");
+    assert_eq!(summary.lattice_split_docs, 0, "{summary:?}");
+    assert_eq!(summary.lattice_breaks, 0, "{summary:?}");
+    assert!(summary.lattice_split_samples.is_empty(), "{summary:?}");
+    assert_eq!(summary.dropped_long_tokens, 0, "{summary:?}");
+
+    assert_eq!(search(&index, "設計").hits.len(), 1);
+}

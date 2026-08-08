@@ -81,9 +81,13 @@ enum Cmd {
         #[arg(long, default_value_t = DEFAULT_MAX_SIZE)]
         max_size: u64,
     },
-    /// Token-stream introspection: how many tokens a file produces and at
-    /// which positions a given token lands. Used to pin down the tantivy
-    /// phrase-position anomaly reported in the issue #35 write-up.
+    /// Token-stream introspection: how many tokens a file produces, how long
+    /// the longest one is, and at which positions a given token lands.
+    ///
+    /// Written to pin down the phrase-position anomaly in the issue #35
+    /// write-up; the token-length report was added afterwards because position
+    /// monotonicity alone reported a clean bill of health while the tail of the
+    /// file was being dropped for exceeding `MAX_TOKEN_LEN` (issue #52).
     Tokens {
         file: PathBuf,
         /// Report the positions of this token (already-lowercased form).
@@ -315,9 +319,15 @@ fn cmd_tokens(file: &Path, needle: Option<&str>) -> Result<()> {
     let mut analyzer = engines::ja_analyzer()?;
     let mut stream = analyzer.token_stream(&body);
 
+    // tantivy silently drops any token at or above this length
+    // (`postings_writer.rs`); the whole tail of a document can go with it.
+    const MAX_TOKEN_LEN: usize = tantivy::tokenizer::MAX_TOKEN_LEN;
+
     let mut count: u64 = 0;
     let mut max_position: usize = 0;
     let mut non_monotonic: u64 = 0;
+    let mut max_token_len: usize = 0;
+    let mut over_limit: u64 = 0;
     let mut last_position: Option<usize> = None;
     let mut needle_positions: Vec<usize> = Vec::new();
     let mut following: Vec<Vec<String>> = Vec::new();
@@ -325,6 +335,10 @@ fn cmd_tokens(file: &Path, needle: Option<&str>) -> Result<()> {
         let token = stream.token();
         count += 1;
         max_position = max_position.max(token.position);
+        max_token_len = max_token_len.max(token.text.len());
+        if token.text.len() >= MAX_TOKEN_LEN {
+            over_limit += 1;
+        }
         if last_position.is_some_and(|p| token.position <= p) {
             non_monotonic += 1;
         }
@@ -350,6 +364,19 @@ fn cmd_tokens(file: &Path, needle: Option<&str>) -> Result<()> {
     println!("tokens        : {count}");
     println!("max position  : {max_position}");
     println!("non-monotonic : {non_monotonic}");
+    // Position monotonicity was the only health check here when issue #52 was
+    // investigated, and it was clean throughout: the token stream really was
+    // ordered, it was just missing everything after the lattice saturated into
+    // one enormous token. Token *length* is the check that would have named the
+    // defect on the first run, so it is printed unconditionally.
+    println!("max token len : {max_token_len}");
+    println!("over MAX_TOKEN_LEN ({MAX_TOKEN_LEN}) : {over_limit}");
+    if over_limit > 0 {
+        println!(
+            "  ^ these tokens are dropped at index time: {over_limit} stretch(es) of this \
+             file are not searchable at all"
+        );
+    }
     if let Some(n) = needle {
         println!("needle        : {n}");
         println!("needle count  : {}", needle_positions.len());
