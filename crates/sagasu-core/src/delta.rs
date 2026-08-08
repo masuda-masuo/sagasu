@@ -577,40 +577,69 @@ pub trait DeltaSource: Send + Sync {
     fn detects_renames(&self) -> bool;
 }
 
-/// Environment variable that opts in to the USN Journal source.
+/// Environment variable that selects or overrides the delta source.
 ///
-/// See [`source_for`] for why the fast path is not the default one.
+/// - `SAGASU_DELTA_SOURCE=mtime` forces the `stat` walk on Windows.
+/// - `SAGASU_DELTA_SOURCE=usn`  selects the USN source (now redundant; the default).
+/// - Unset / any other value: the default behaviour (USN probe, silent mtime fallback).
+///
+/// Non-Windows platforms: always the mtime walk; the env var has no effect.
 pub const DELTA_SOURCE_ENV: &str = "SAGASU_DELTA_SOURCE";
 
 /// The delta source to use for this platform and configuration.
 ///
-/// Returns the `stat` walk unless `SAGASU_DELTA_SOURCE=usn` is set *and* the USN
-/// Journal can actually be opened (Windows, NTFS, administrator rights); the
-/// fallback is silent by design, since it is slower rather than wrong, and
-/// [`DeltaSet::kind`] reports which one ran.
+/// On Windows the USN Journal source is tried first, silently falling back to
+/// the `stat` walk when the journal cannot be opened (non-NTFS, journal disabled,
+/// or no administrator rights).  The fallback is silent by design — slower, not
+/// wrong — and [`DeltaSet::kind`] reports which source actually ran.
 ///
-/// ## Why the fast path is opt-in
+/// `SAGASU_DELTA_SOURCE=mtime` (case-insensitive) forces the `stat` walk on
+/// Windows — the escape hatch now that USN is the default.  `SAGASU_DELTA_SOURCE=usn`
+/// still selects USN explicitly (now redundant; kept for backward compatibility).
+/// Any other value or unset → the default behaviour (USN probe, silent mtime
+/// fallback).
 ///
-/// The USN source has never been executed against a real NTFS volume — the
-/// development environment is Linux, and CI only compiles it. Making unverified
-/// code the default on a whole platform is how you ship a search that quietly
-/// returns nothing: the first time the USN source ran anywhere, it produced an
-/// empty delta set, and the only reason the rest of the suite stayed green is
-/// that `sagasu index` canonicalizes its root, which on Windows yields a `\\?\`
-/// verbatim path that the volume test rejected — so production never reached it
-/// either. Both of those are fixed; the gate stays until the path is exercised
-/// on real hardware, and then it becomes the Windows default.
+/// Non-Windows platforms always return the `stat` walk; the env var has no effect.
+///
+/// ## History
+///
+/// The USN source was opt-in (gated behind `SAGASU_DELTA_SOURCE=usn`) because it
+/// had never run on real hardware — the development environment is Linux, and CI
+/// only compiled it.  The first time the USN source ran on a real NTFS volume it
+/// produced an empty delta set, masked in production by a `\\?\` verbatim-path
+/// issue that prevented the source from being reached at all.  Both bugs were
+/// fixed, and the source was verified on real hardware on 2026-08-08 (issue #37):
+/// normal add/change/delete/rename deltas correct, ~17× faster than the stat walk,
+/// silent fallback confirmed for non-administrator and journal-absent cases.
+/// The opt-in gate was then removed.
+///
+/// ## Upgrading from a pre-USN-default index
+///
+/// An index recorded under the old default holds a `stat`-walk marker, which the
+/// USN source rejects as a marker-kind mismatch: the first search after the
+/// upgrade reports [`DeltaStatus::RescanRequired`] once, warns, and answers from
+/// the index as of the last crawl until `sagasu index` is re-run.  One-time,
+/// visible, and observed behaving exactly this way on real hardware (issue #37).
 pub fn source_for(config: &DeltaConfig) -> Box<dyn DeltaSource> {
     #[cfg(windows)]
     {
-        let opted_in = std::env::var(DELTA_SOURCE_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("usn"));
-        if opted_in {
+        if !forces_mtime(std::env::var(DELTA_SOURCE_ENV).ok().as_deref()) {
             if let Some(src) = crate::usn::UsnDeltaSource::for_config(config) {
                 return Box::new(src);
             }
         }
     }
     Box::new(MtimeDeltaSource::new(config.clone()))
+}
+
+/// True when the [`DELTA_SOURCE_ENV`] value asks for the `stat` walk.
+///
+/// Pure so the override decision is unit-testable on every platform;
+/// [`source_for`] feeds it the real environment (Windows only — elsewhere the
+/// walk is unconditional).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn forces_mtime(env_value: Option<&str>) -> bool {
+    env_value.is_some_and(|v| v.eq_ignore_ascii_case("mtime"))
 }
 
 // ── mtime fallback ──────────────────────────────────────────────────────────
@@ -1087,12 +1116,37 @@ mod tests {
     }
 
     #[test]
-    fn the_default_source_is_the_verified_one() {
-        // The USN path is opt-in until it has been exercised on real hardware,
-        // so an unconfigured process gets the `stat` walk on every platform.
+    fn usn_is_the_default_on_windows_with_mtime_fallback() {
+        // On non-Windows platforms the default is always the mtime source.
+        // On Windows the USN source is tried first; it falls back silently
+        // to mtime when the probe fails (no admin rights, non-NTFS, etc.).
         let source = source_for(&DeltaConfig::new("."));
-        assert_eq!(source.kind(), DeltaSourceKind::Mtime);
-        assert_eq!(source.detects_renames(), cfg!(unix));
+        #[cfg(not(windows))]
+        {
+            assert_eq!(source.kind(), DeltaSourceKind::Mtime);
+            assert_eq!(source.detects_renames(), cfg!(unix));
+        }
+        #[cfg(windows)]
+        {
+            // The probe may succeed or fail depending on the CI runner's
+            // privileges and filesystem — both outcomes are valid defaults.
+            assert!(matches!(
+                source.kind(),
+                DeltaSourceKind::Usn | DeltaSourceKind::Mtime
+            ));
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_mtime_value_forces_the_stat_walk() {
+        // The override decision is pure so it can be pinned on every platform
+        // without mutating the process environment.
+        assert!(forces_mtime(Some("mtime")));
+        assert!(forces_mtime(Some("MTIME")));
+        assert!(!forces_mtime(Some("usn")));
+        assert!(!forces_mtime(Some("")));
+        assert!(!forces_mtime(Some("anything-else")));
+        assert!(!forces_mtime(None));
     }
 
     #[test]

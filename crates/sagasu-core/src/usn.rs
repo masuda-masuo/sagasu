@@ -42,21 +42,28 @@
 //! All three are [`DeltaStatus::RescanRequired`], which is a different branch
 //! from hitting the delta cap: this one cannot be fixed by raising a limit.
 //!
-//! ## Verification status — this source is opt-in
+//! ## Verification status — this source is the Windows default
 //!
-//! Compiled for `x86_64-pc-windows-*`; **not** exercised on real hardware — the
-//! development environment is Linux. [`crate::delta::source_for`] therefore only
-//! selects it when `SAGASU_DELTA_SOURCE=usn` is set, and the `stat` fallback is
-//! the default on every platform.
+//! Compiled for `x86_64-pc-windows-*`.  Verified on real NTFS hardware on
+//! 2026-08-08 (issue #37): normal add/change/delete/rename deltas correct,
+//! ~17× faster than the stat walk (19–25 ms vs 332–360 ms), silent fallback
+//! confirmed for non-administrator and journal-absent cases.  The opt-in gate
+//! has been removed — [`crate::delta::source_for`] now tries the USN source
+//! first on Windows with no environment variable required.
 //!
-//! That gate exists because of what happened without it. `sagasu index`
-//! canonicalizes its root, and `std::fs::canonicalize` on Windows returns a
-//! `\\?\C:\…` verbatim path — which [`volume_of`] rejected, so production never
-//! reached this source at all. The single test that happened to pass a raw
-//! `C:\…` root did reach it, and got an empty delta set back. Both bugs are
-//! fixed, but "compiles and is therefore the default on a whole platform" is
-//! exactly the reasoning that produced a search silently returning nothing.
-//! The gate comes off when the path has run against a real NTFS volume.
+//! ## History — why verification was demanded
+//!
+//! The USN source was initially gated behind `SAGASU_DELTA_SOURCE=usn` because
+//! it had never been exercised on real hardware: the development environment is
+//! Linux, and CI only compiled it.  That gate existed because of what happened
+//! without it. `sagasu index` canonicalizes its root, and
+//! `std::fs::canonicalize` on Windows returns a `\\?\C:\…` verbatim path —
+//! which [`volume_of`] rejected, so production never reached this source at all.
+//! The single test that happened to pass a raw `C:\…` root did reach it, and
+//! got an empty delta set back.  Both bugs are fixed, but "compiles and is
+//! therefore the default on a whole platform" is exactly the reasoning that
+//! produced a search silently returning nothing.  The source was verified on
+//! real hardware on 2026-08-08 (issue #37) and the gate was removed.
 
 use std::collections::HashMap;
 use std::mem::size_of;

@@ -390,10 +390,14 @@ PowerShell 一時ファイルで差分集合が埋まる。除外件数は集計
 
 ### 5-1-1. 差分源の選択と、経路ごとの検出能力
 
-**USN 経路は既定で使わない(opt-in)**。`SAGASU_DELTA_SOURCE=usn` を設定したときだけ
-`delta::source_for` が USN を試し、それ以外は全プラットフォームで mtime 走査を使う。
+**USN 経路は Windows の既定**(2026-08-08 に opt-in ゲートを撤去、issue #37)。
+`delta::source_for` はまず USN を試し、ジャーナルが開けないとき(非NTFS・ジャーナル
+無効・非管理者)は黙って mtime 走査に落ちる。`SAGASU_DELTA_SOURCE=mtime` で mtime を
+強制できる(既定化後の脱出ハッチ)。Windows 以外は従来どおり常に mtime 走査。
+旧既定で作られた索引は最初の検索1回だけ RescanRequired(マーカー種別不一致)になり、
+`sagasu index` の再実行で回復する(実機で確認済み)。
 
-理由は「コンパイルが通るから既定にする」を一度やって壊したから。`sagasu index` は
+かつて opt-in にしていた理由は「コンパイルが通るから既定にする」を一度やって壊したから。`sagasu index` は
 ルートを canonicalize して保存するが、Windows の `std::fs::canonicalize` は
 `\\?\C:\…` 形式(extended length path)を返す。`usn::volume_of` はドライブレターを
 先頭バイトで判定していたためこれを弾き、**製品経路では USN が一度も選ばれていなかった**。
@@ -418,7 +422,10 @@ PowerShell 一時ファイルで差分集合が埋まる。除外件数は集計
 
 ### 5-2. M2 で残した論点
 
-- **USN 経路の実機検証**。opt-in ゲート(§5-1-1)を外すための前提。特に:
+- **USN 経路の実機検証** — **完了(2026-08-08、issue #37)**。正常系4操作・rename検出・
+  ~17倍高速・非管理者/ジャーナル不在の fallback・失効系のフェイルセーフを実機で確認し、
+  opt-in ゲート(§5-1-1)を撤去した。FRN 解決の失敗が excluded に合流する計上問題は #57。
+  当時の論点は以下(記録として残す):
   - **FRN → フルパス解決**。親 FRN を `OpenFileById` + `GetFinalPathNameByHandleW` で
     解決し、レコードのファイル名を連結する方式で実装した(削除済みファイルでも
     親ディレクトリは残っているのでこの向きにした)。実機未検証
@@ -426,8 +433,10 @@ PowerShell 一時ファイルで差分集合が埋まる。除外件数は集計
     ロング形式を返すので、ルートも canonicalize して `\\?\` を剥がした形に揃え、
     比較は NTFS に合わせて ASCII 大文字小文字を無視する(`delta::path_under`)。
     8.3 短縮名の `%TEMP%` 配下で実際に一致するかは実機で確認が要る
-- **Windows でリネームが検出できない**(§5-1-1)。USN 経路が既定になれば解消する。
-  それまでは「リネームされたファイルは再索引まで答えから消える」が仕様
+- **Windows でリネームが検出できない**(§5-1-1) — **USN 既定化(2026-08-08)で解消**。
+  実機で rename の live hit を確認済み。mtime を強制した場合(`SAGASU_DELTA_SOURCE=mtime`)
+  と USN probe が失敗する環境では従来どおり「リネームされたファイルは再索引まで答えから
+  消える」が仕様
 - **マーカー寿命の能動的な警告**。`estimate_lifetime` は用意したが、
   `sagasu status` は現在の NextUsn を取りに行かない(read-only を保つため)。
   **設計は `docs/cli.md` §9-1 で確定した**(オプトインの `--check-journal`、
