@@ -1466,12 +1466,17 @@ fn a_prefix_exclusion_prunes_and_is_replayed_by_the_delta_side() {
     }
     let delta = source.changes_since(&marker, 1000).unwrap();
     let paths: Vec<&str> = delta.entries.iter().map(|e| e.path.as_str()).collect();
+    // Compared component-wise, not as strings: Windows separates with `\`, so
+    // `ends_with("/b.txt")` and `contains("/proc/")` would both be false there
+    // and the assertions would pass by accident — or fail for the wrong reason.
     assert!(
-        paths.iter().any(|p| p.ends_with("/b.txt")),
+        paths.iter().any(|p| Path::new(p).ends_with("b.txt")),
         "the sibling change must be seen: {paths:?}"
     );
     assert!(
-        !paths.iter().any(|p| p.contains("/proc/")),
+        !paths.iter().any(|p| Path::new(p)
+            .components()
+            .any(|c| c.as_os_str() == "proc")),
         "the pruned subtree must stay out of the delta set: {paths:?}"
     );
 }

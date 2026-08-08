@@ -2141,8 +2141,17 @@ mod prefix_tests {
         assert!(format!("{err:#}").contains("absolute"), "{err:#}");
         // The name list is untouched by all of this.
         assert!(ExcludeSet::new(&["build".to_string()], false).validate().is_ok());
+        // "Absolute" is platform-defined: `/tmp/ok` has no prefix on Windows,
+        // so `Path::is_absolute` is false there and `validate()` would refuse
+        // it for the same reason it refuses `tmp/proc`. Ask each platform for
+        // a shape it actually calls absolute.
+        let ok_prefix = if cfg!(windows) {
+            r"C:\tmp\ok".to_string()
+        } else {
+            "/tmp/ok".to_string()
+        };
         assert!(ExcludeSet::new(&[], false)
-            .with_prefixes(&["/tmp/ok".to_string()])
+            .with_prefixes(std::slice::from_ref(&ok_prefix))
             .validate()
             .is_ok());
     }
