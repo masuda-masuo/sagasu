@@ -189,6 +189,30 @@ fn a_pptx_is_read_in_slide_order_not_archive_order() {
     );
 }
 
+#[cfg(feature = "office")]
+#[test]
+fn office_extraction_keeps_spaces_between_japanese_words() {
+    // The PDF kerning-space rule (issue #66) is PDF-only by design: in
+    // `word/document.xml` a space is a real character the author typed. This
+    // test would fail if the rule leaked into the shared OOXML path.
+    let (data, _db, _index) = tmp_dirs("office_keeps_spaces");
+    let docx = data.join("設定 変更.docx");
+    fixtures::write_docx(&docx, &["設定 変更"], None);
+    let xlsx = data.join("設定 変更.xlsx");
+    fixtures::write_xlsx(&xlsx, &["設定 変更"], &[vec![fixtures::Cell::Shared(0)]], None);
+    let pptx = data.join("設定 変更.pptx");
+    fixtures::write_pptx(&pptx, &["設定 変更"], None);
+
+    for (path, format) in [
+        (&docx, sagasu_core::docmeta::BodyFormat::Docx),
+        (&xlsx, sagasu_core::docmeta::BodyFormat::Xlsx),
+        (&pptx, sagasu_core::docmeta::BodyFormat::Pptx),
+    ] {
+        let body = sagasu_core::docmeta::extract_body(path, format, 1 << 20).unwrap();
+        assert!(body.contains("設定 変更"), "{path:?}: {body}");
+    }
+}
+
 // ── PDF body ────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "pdf")]
@@ -206,6 +230,54 @@ fn a_pdf_with_a_tounicode_cmap_round_trips_japanese() {
     assert_eq!(summary.accepted_by_extract, 1, "{summary:?}");
     assert_ledger(&summary);
     assert_eq!(search_hits(&index, "日本語"), ["設計書.pdf"]);
+}
+
+#[cfg(feature = "pdf")]
+#[test]
+fn a_kerned_tj_array_does_not_split_a_japanese_word() {
+    let (data, db, index) = tmp_dirs("pdf_kerned");
+    // Word, LibreOffice and TeX emit Japanese as a kerned `TJ` array, with the
+    // glyph gap *inside* the word — the shape `lopdf` turns into an ASCII
+    // space on its "big gap = word boundary" assumption (issue #66).
+    fs::write(
+        data.join("設定.pdf"),
+        fixtures::kerned_pdf("バックアップの設定", 4, -300),
+    )
+    .unwrap();
+
+    // The raw extraction is unbroken: no space inside バックアップ.
+    let body = sagasu_core::docmeta::extract_body(
+        &data.join("設定.pdf"),
+        sagasu_core::docmeta::BodyFormat::Pdf,
+        1 << 20,
+    )
+    .unwrap();
+    assert_eq!(body, "バックアップの設定");
+
+    let summary = index_all(&data, &db, &index);
+    assert_eq!(summary.indexed, 1, "{summary:?}");
+    assert_ledger(&summary);
+    // The word that straddled the injected space is reachable again. A split
+    // word is found by neither half, which is silence rather than a worse
+    // ranking.
+    assert_eq!(search_hits(&index, "バックアップ"), ["設定.pdf"]);
+    assert_eq!(search_hits(&index, "設定"), ["設定.pdf"]);
+}
+
+#[cfg(feature = "pdf")]
+#[test]
+fn a_latin_space_between_words_survives_extraction() {
+    let (data, _db, _index) = tmp_dirs("pdf_latin_space");
+    let path = data.join("latin.pdf");
+    fs::write(&path, fixtures::minimal_pdf("hello world", None)).unwrap();
+
+    let body = sagasu_core::docmeta::extract_body(
+        &path,
+        sagasu_core::docmeta::BodyFormat::Pdf,
+        1 << 20,
+    )
+    .unwrap();
+    assert!(body.contains("hello world"), "{body}");
 }
 
 // ── Embedded metadata → tags ────────────────────────────────────────────────
