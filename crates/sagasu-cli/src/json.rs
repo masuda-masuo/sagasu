@@ -372,6 +372,11 @@ pub(crate) fn fulltext(
         .iter()
         .map(|(path, reason)| json!({"path": path, "reason": reason}))
         .collect();
+    let lattice_split_samples: Vec<Value> = summary_data
+        .lattice_split_samples
+        .iter()
+        .map(|(path, breaks)| json!({"path": path, "breaks": breaks}))
+        .collect();
 
     summary(
         "fulltext",
@@ -388,6 +393,11 @@ pub(crate) fn fulltext(
             "skipped_total": summary_data.skipped_total(),
             "skipped_exts": skipped_exts,
             "extract_errors": extract_errors,
+            "lattice_split_docs": summary_data.lattice_split_docs,
+            "lattice_breaks": summary_data.lattice_breaks,
+            "lattice_split_samples": lattice_split_samples,
+            "dropped_long_tokens": summary_data.dropped_long_tokens,
+            "longest_token_bytes": summary_data.longest_token_bytes,
             "text_bytes": summary_data.text_bytes,
             "text_mib": mib(summary_data.text_bytes),
             "index_bytes": summary_data.index_bytes,
