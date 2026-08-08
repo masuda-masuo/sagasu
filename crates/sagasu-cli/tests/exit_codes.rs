@@ -49,6 +49,25 @@ fn run_with_env(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
     )
 }
 
+/// The spelling `sagasu` will print and store for a path it canonicalizes.
+///
+/// Mirrors `walk::canonical_prefix`: resolve, then drop the Windows verbatim
+/// prefix (`std::fs::canonicalize` returns `\\?\C:\…` there and the tool's
+/// output does not carry it). Tests must compare against this rather than
+/// against whatever they typed — on the Windows CI runner `temp_dir()` is an
+/// 8.3 short path and the two differ.
+fn canonical_display(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = resolved.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s
+    }
+}
+
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// A unique temporary directory, removed on drop.
@@ -264,6 +283,71 @@ fn search_on_empty_fulltext_index_exits_2() {
 }
 
 // ── index / hash / fulltext / tag / status (write and report side) ──────────
+
+#[test]
+fn exclude_prefix_prunes_and_status_reports_the_rule() {
+    let fx = Fixture::new("exclude-prefix", "a.txt", "hello\n");
+    // A fixture pseudo-filesystem: the walker must not descend into it, the
+    // same way it must not descend into the real /proc on Linux (issue #43).
+    std::fs::create_dir_all(fx.root.join("proc/self")).unwrap();
+    std::fs::write(fx.root.join("proc/self/status"), "cpu").unwrap();
+    std::fs::write(fx.root.join("proc/cmdline"), "init").unwrap();
+    std::fs::write(fx.root.join("b.txt"), "world\n").unwrap();
+    let prefix = fx.root.join("proc");
+    // What the tool will *display* and store is the canonical spelling, not
+    // the one typed here — prefixes are canonicalized so a symlinked or
+    // short-name spelling still prunes (issue #43). This is not hypothetical
+    // on Windows: the CI runner's `temp_dir()` is an 8.3 short path
+    // (`C:\Users\RUNNER~1\…`) that canonicalizes to the long form, which is
+    // exactly how this assertion first caught the difference.
+    let shown = canonical_display(&prefix);
+
+    // The flag is a sibling of --exclude, clearly named so the two cannot be
+    // confused: names are filtered per file, prefixes prune the walk.
+    let (code, stdout, _) = run(&[
+        "index",
+        fx.root.to_str().unwrap(),
+        "--db",
+        fx.db.to_str().unwrap(),
+        "--exclude-prefix",
+        prefix.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "indexing with the prefix pruned must exit 0");
+    assert!(
+        stdout.contains("(excluded prefix): 1"),
+        "the prune must be attributed to the prefix rule: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("pruned paths : {shown}"))
+            || stdout.contains(&format!(", {shown}")),
+        "the scope must list the pruned prefix as {shown}: {stdout}"
+    );
+
+    // The rule survives into the index and `status` reports it, replayed from
+    // what the crawl wrote — not from the command line.
+    let (code, stdout, _) = run(&["status", "--db", fx.db.to_str().unwrap()]);
+    assert_eq!(code, 0, "a report is always an answer");
+    assert!(
+        stdout.contains(&shown),
+        "status must replay the pruned prefix from the policy as {shown}: {stdout}"
+    );
+
+    // A relative prefix is refused at crawl time rather than silently
+    // matching nothing.
+    let (code, _, stderr) = run(&[
+        "index",
+        fx.root.to_str().unwrap(),
+        "--db",
+        fx.db.to_str().unwrap(),
+        "--exclude-prefix",
+        "proc",
+    ]);
+    assert_eq!(code, 2, "a relative prefix must be refused: {stderr}");
+    assert!(
+        stderr.contains("not an absolute path"),
+        "the refusal must name the problem: {stderr}"
+    );
+}
 
 #[test]
 fn index_with_files_exits_0_and_empty_dir_exits_2() {

@@ -31,6 +31,29 @@
 //! - A `.gitignore` read from the crawl root, applied to **directories only**
 //!   (see [`ExcludeSet::with_gitignore`]).
 //!
+//! ## Path-prefix prune (pseudo-filesystems)
+//!
+//! A third rule exists and is **not** a name rule: absolute path *prefixes*
+//! that the walker must **not descend into** ([`ExcludeSet::prefix_matched`],
+//! [`DEFAULT_PREFIX_EXCLUDES`]). The name list above filters — it still walks
+//! the excluded directory, counting each file inside it — but a prefix prunes:
+//! the directory is skipped at the walker, so its contents are never even
+//! visited. That distinction is the whole point, not an implementation detail.
+//! On Linux `/proc` and `/sys` are pseudo-filesystems: walking them is
+//! wasteful, and a later `sagasu fulltext` pass opens every indexed file,
+//! some of which (`/proc/kmsg` and friends) block forever on read. That is a
+//! hang, not a slowdown, so the walker must never enter them.
+//!
+//! The default prefixes are the pseudo-filesystems (`/proc`, `/sys`, `/dev`,
+//! `/run` on Linux), **not** OS directories: `C:\Windows` and macOS
+//! `Library/Caches` stay indexed by default, because they hold ordinary files
+//! someone may legitimately be searching for (issue #43). What this issue owes
+//! Windows and macOS is the mechanism — `--exclude-prefix <PATH>` — not a
+//! policy. Like the name list, the prefixes are dropped by
+//! `--no-default-excludes`, and like the `.gitignore` rules they are **written
+//! out explicitly** in the persisted policy rather than implied by a
+//! "defaults" flag.
+//!
 //! ## Rescan diff
 //!
 //! On rescan the store is not blindly upserted. Instead the walker compares each
@@ -68,6 +91,30 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".npm",
     ".cargo", // see special-case logic below
 ];
+
+/// Absolute path prefixes the walker must **not descend into**, by default.
+///
+/// These are the pseudo-filesystems, and only them. Walking `/proc` / `/sys` /
+/// `/dev` / `/run` is not merely wasteful — a later `sagasu fulltext` pass
+/// opens every indexed file, and some of those files block forever on read —
+/// so they are pruned (never entered) rather than filtered. This is the
+/// platform-conditional half of the "prune by path prefix" rule (issue #43).
+///
+/// The comparison is a path comparison on whole components, so `/sys` never
+/// matches `/system` ([`prefix_matches`]).
+///
+/// Windows and macOS OS directories (`C:\Windows`, `Library/Caches`, ...) are
+/// deliberately **not** here: they hold ordinary files that someone may be
+/// searching for, and the measured cost of keeping them is a few seconds of
+/// crawl time. What this issue owes those platforms is the mechanism
+/// (`--exclude-prefix <PATH>`), not a policy. On macOS only `/dev` is a
+/// pseudo-filesystem (devfs); `/proc` / `/sys` / `/run` do not exist there.
+#[cfg(target_os = "linux")]
+pub const DEFAULT_PREFIX_EXCLUDES: &[&str] = &["/proc", "/sys", "/dev", "/run"];
+#[cfg(target_os = "macos")]
+pub const DEFAULT_PREFIX_EXCLUDES: &[&str] = &["/dev"];
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const DEFAULT_PREFIX_EXCLUDES: &[&str] = &[];
 
 /// Name of the `meta` row an [`ExcludeSet`] is persisted under, so the
 /// search-time delta path can rebuild the *same* set instead of guessing.
@@ -154,6 +201,12 @@ pub enum ExcludeReason {
     /// Under a directory whose basename is on the exclusion list. Carries the
     /// lowercased basename, which is the key the per-name skip counts use.
     Name(String),
+    /// At or below an excluded absolute path prefix (a pseudo-filesystem, or
+    /// a user's `--exclude-prefix`). Unlike the other reasons this one is a
+    /// **prune**: the walker never descends into the matched directory, so
+    /// this reason is usually produced by the delta side (a USN record for a
+    /// path under `C:\Windows` when the user pruned it), not by the crawl.
+    Prefix,
     /// The entry, or a directory above it, carries the OS hidden flag.
     OsHidden,
     /// A directory above it matched the crawl root's `.gitignore`.
@@ -181,6 +234,19 @@ pub struct ExcludeSet {
     /// The user's additions, kept apart from the built-ins so the policy can be
     /// re-encoded exactly as it was requested.
     extra: Vec<String>,
+    /// Absolute path prefixes the walker must not descend into, in effective
+    /// order: the built-ins ([`DEFAULT_PREFIX_EXCLUDES`]) unless `no_default`,
+    /// then the user's `--exclude-prefix` additions.
+    ///
+    /// This is the **whole** list, defaults included. [`ExcludeSet::encode`]
+    /// writes every entry out explicitly — a policy must never require the
+    /// reader to know what this build's defaults happened to be, any more than
+    /// a `.gitignore` rule is referenced instead of copied — and
+    /// [`ExcludeSet::decode`] replaces the field with what it read, so a `v1`
+    /// policy written before prefixes existed decodes with an empty list and
+    /// the *new* defaults are never applied to an index that was not crawled
+    /// under them (issue #43).
+    prefixes: Vec<String>,
     no_default: bool,
     hidden: HiddenPolicy,
     /// Compiled root `.gitignore`, when the crawl opted into reading one.
@@ -211,7 +277,8 @@ pub struct ExcludeSet {
 
 impl ExcludeSet {
     /// Build the set from the built-in list plus `extra`. `no_default` drops the
-    /// built-in list, leaving only `extra`.
+    /// built-in list **and** the default prefixes, leaving only `extra` and
+    /// whatever [`ExcludeSet::with_prefixes`] adds.
     pub fn new(extra: &[String], no_default: bool) -> Self {
         let mut names: Vec<String> = if no_default {
             Vec::new()
@@ -223,15 +290,52 @@ impl ExcludeSet {
                 names.push(e.clone());
             }
         }
+        let prefixes: Vec<String> = if no_default {
+            Vec::new()
+        } else {
+            DEFAULT_PREFIX_EXCLUDES.iter().map(|s| s.to_string()).collect()
+        };
         Self {
             names,
             extra: extra.to_vec(),
+            prefixes,
             no_default,
             hidden: HiddenPolicy::default(),
             gitignore: None,
             gitignore_lines: Vec::new(),
             gitignore_digest: None,
         }
+    }
+
+    /// Add user-supplied path prefixes to prune (builder style).
+    ///
+    /// Prefixes are absolute paths; the walker does not descend into any path
+    /// at or below one of them. This is the `--exclude-prefix` mechanism —
+    /// what Windows and macOS get for their OS directories, which are
+    /// deliberately **not** in [`DEFAULT_PREFIX_EXCLUDES`] (issue #43).
+    ///
+    /// **Each prefix is canonicalized here**, because the walker's paths come
+    /// from a canonicalized root and a verbatim comparison would silently
+    /// prune nothing whenever the two spellings differ. That is not a corner
+    /// case on the platforms this mechanism exists for: macOS `/tmp` resolves
+    /// to `/private/tmp`, and Windows junctions (`C:\Users\All Users` →
+    /// `C:\ProgramData`) make the typed and the canonical spelling differ
+    /// routinely. Measured on a symlinked root, the un-canonicalized version
+    /// printed the rule as in force and indexed the subtree anyway — the
+    /// tool doing the opposite of what it displayed.
+    ///
+    /// A prefix that cannot be canonicalized (it does not exist yet, or is not
+    /// reachable) is kept as typed: the crawl must not fail over a rule about
+    /// a place that is simply absent. `sagasu index` warns about those
+    /// separately, before the walk.
+    pub fn with_prefixes(mut self, prefixes: &[String]) -> Self {
+        for p in prefixes {
+            let canonical = canonical_prefix(p);
+            if !self.prefixes.iter().any(|q| q == &canonical) {
+                self.prefixes.push(canonical);
+            }
+        }
+        self
     }
 
     /// Set the hidden-entry policy (builder style).
@@ -263,6 +367,28 @@ impl ExcludeSet {
             }
             if name.is_empty() {
                 bail!("exclude name is empty — it would match nothing and hide the mistake");
+            }
+        }
+        for prefix in &self.prefixes {
+            if prefix.contains('\n') || prefix.contains('\r') {
+                bail!(
+                    "exclude prefix {prefix:?} contains a line break. Prefixes are \
+                     recorded one per line in the index's exclusion policy, so a \
+                     prefix that spans lines cannot be replayed by a later search."
+                );
+            }
+            if prefix.is_empty() {
+                bail!(
+                    "exclude prefix is empty — it would match the crawl root itself \
+                     and prune everything, hiding the mistake"
+                );
+            }
+            if !Path::new(prefix).is_absolute() {
+                bail!(
+                    "exclude prefix {prefix:?} is not an absolute path. Prefixes are \
+                     matched against the walker's absolute paths, so a relative \
+                     prefix would match nothing and hide the mistake"
+                );
             }
         }
         Ok(())
@@ -365,6 +491,38 @@ impl ExcludeSet {
         &self.names
     }
 
+    /// The pruned path prefixes, in effective order. Defaults included — this
+    /// is the whole list, exactly as it was (or would be) persisted.
+    pub fn prefixes(&self) -> &[String] {
+        &self.prefixes
+    }
+
+    /// Whether a user-supplied prefix can ever match: it has to exist, or the
+    /// rule is about a place that is not there.
+    ///
+    /// Reported rather than refused. A prefix naming somewhere absent is not
+    /// wrong (a removable volume, a directory created later), but a *silent*
+    /// no-op is — the crawl would print the rule as in force and prune
+    /// nothing, which is the failure this whole mechanism exists to avoid.
+    pub fn unresolvable_prefixes(prefixes: &[String]) -> Vec<String> {
+        prefixes
+            .iter()
+            .filter(|p| std::fs::canonicalize(Path::new(p)).is_err())
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `path` is at or below one of the excluded prefixes, on a
+    /// whole-component boundary (`/sys` does not match `/system`).
+    ///
+    /// This is the **prune** test: the caller skips the entry and the walker
+    /// never descends into it. It is deliberately independent of the crawl
+    /// root — the prefixes are absolute, so a root of `/` and a root of
+    /// `/proc/123` prune the same places.
+    pub fn prefix_matched(&self, path: &Path) -> bool {
+        self.prefixes.iter().any(|p| prefix_matches(path, p))
+    }
+
     /// The hidden-entry policy in force.
     pub fn hidden_policy(&self) -> HiddenPolicy {
         self.hidden
@@ -430,6 +588,11 @@ impl ExcludeSet {
         if let Some(name) = self.matched_dir(path, root) {
             return Some(ExcludeReason::Name(name));
         }
+        // A prefix match is about the path itself, not about a directory name
+        // along it, so it is tested against the full path and needs no root.
+        if self.prefix_matched(path) {
+            return Some(ExcludeReason::Prefix);
+        }
         if let Some(gi) = &self.gitignore {
             for ancestor in path.ancestors().skip(1) {
                 // Stops at the root, and also stops if `path` turns out not to
@@ -480,7 +643,11 @@ impl ExcludeSet {
     /// the rules it was built with; a search must not depend on a file that may
     /// have been edited, deleted or broken since.
     pub fn encode(&self) -> String {
-        let mut out = String::from("v1\n");
+        // v2 carries `prefix=` (issue #43). The bump is what this type's own
+        // decode contract promises for "a release that adds a rule to the
+        // policy": an older binary meeting v2 then fails with "written by a
+        // newer sagasu" instead of the less legible "unknown key prefix".
+        let mut out = String::from("v2\n");
         out.push_str(&format!("defaults={}\n", u8::from(!self.no_default)));
         out.push_str(&format!("hidden={}\n", self.hidden.as_str()));
         out.push_str(&format!("gitignore={}\n", u8::from(self.uses_gitignore())));
@@ -495,6 +662,15 @@ impl ExcludeSet {
         for name in &self.extra {
             out.push_str("extra=");
             out.push_str(name);
+            out.push('\n');
+        }
+        // Every effective prefix, defaults included, written out explicitly.
+        // Like the `.gitignore` rules, the policy carries its own rules: a
+        // reader must not need to know what this build's defaults happened to
+        // be (issue #43).
+        for prefix in &self.prefixes {
+            out.push_str("prefix=");
+            out.push_str(prefix);
             out.push('\n');
         }
         out
@@ -518,7 +694,12 @@ impl ExcludeSet {
     pub fn decode(text: &str) -> Result<Self> {
         let mut lines = text.lines();
         match lines.next() {
-            Some("v1") => {}
+            // v1 predates the `prefix=` rule (issue #43). It decodes with an
+            // empty prefix list, and this build's *new* defaults are
+            // deliberately not injected: that index was crawled without them,
+            // and a delta query has to replay the set the crawl actually used,
+            // not the set this build would choose today.
+            Some("v1") | Some("v2") => {}
             other => bail!(
                 "unsupported exclusion policy format {other:?} — this index was written by a \
                  newer sagasu. Re-run `sagasu index <root>` with this build, or upgrade."
@@ -531,6 +712,7 @@ impl ExcludeSet {
         let mut gitignore_digest: Option<String> = None;
         let mut gitignore_lines: Vec<String> = Vec::new();
         let mut extra: Vec<String> = Vec::new();
+        let mut prefixes: Vec<String> = Vec::new();
 
         for line in lines {
             if line.is_empty() {
@@ -552,6 +734,7 @@ impl ExcludeSet {
                     }
                 }
                 "extra" => extra.push(value.to_string()),
+                "prefix" => prefixes.push(value.to_string()),
                 other => bail!(
                     "unknown exclusion policy key {other:?} — this index was written by a \
                      newer sagasu. Re-run `sagasu index <root>` with this build, or upgrade."
@@ -559,7 +742,16 @@ impl ExcludeSet {
             }
         }
 
-        let set = Self::new(&extra, no_default).with_hidden(hidden);
+        let mut set = Self::new(&extra, no_default).with_hidden(hidden);
+        // The stored prefix lines are the whole story about prefixes. In
+        // particular, a `v1` policy written before prefixes existed decodes
+        // with an **empty** list: the crawl it describes did not prune `/proc`,
+        // and applying this build's defaults to it would make the delta side
+        // scan a different set than the crawl did — exactly the inconsistency
+        // this encoding exists to prevent. `v1` keeps its `v1` meaning, and a
+        // reader never has to guess what "defaults" meant when the policy was
+        // written (issue #43).
+        set.prefixes = prefixes;
         if gitignore {
             set.with_gitignore_lines(&gitignore_lines, gitignore_digest)
         } else {
@@ -569,6 +761,26 @@ impl ExcludeSet {
 }
 
 // ── Path relation ───────────────────────────────────────────────────────────
+
+/// Resolve a user-supplied prune prefix to the spelling the walker uses.
+///
+/// The walker's paths descend from a canonicalized root, so a prefix has to be
+/// canonical too or it silently matches nothing — the crawl would print the
+/// rule as in force and index the subtree anyway (measured on a symlinked
+/// root, issue #43). The Windows verbatim
+/// prefix is stripped for the same reason `strip_verbatim` exists elsewhere —
+/// `canonicalize` returns `\\?\C:\…` there and the walker's paths do not carry
+/// it.
+///
+/// Falls back to the input unchanged when the path cannot be resolved: a rule
+/// about a place that does not exist yet is not a reason to fail the crawl.
+/// `ExcludeSet::unresolvable_prefixes` is what makes that case visible.
+fn canonical_prefix(prefix: &str) -> String {
+    match std::fs::canonicalize(Path::new(prefix)) {
+        Ok(p) => strip_verbatim(&p.to_string_lossy()),
+        Err(_) => prefix.to_string(),
+    }
+}
 
 /// Drop the Windows extended-length prefix (`\\?\`, `\\?\UNC\`).
 ///
@@ -583,6 +795,46 @@ fn strip_verbatim(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Whether `path` is at or below the absolute prefix `prefix`, compared as
+/// paths rather than strings.
+///
+/// Whole components, not a string prefix: `/sys` must not match `/system`,
+/// and the components must line up from the root. Trailing separators on
+/// either side are ignored, and the Windows extended-length prefix (`\\?\`)
+/// is stripped before comparing — the same spellings [`relative_slash_path`]
+/// reconciles (issue #43).
+///
+/// Case folding follows the filesystem the rule will run on: ASCII
+/// case-insensitive on Windows (NTFS is case-insensitive, and the precedent
+/// is `delta::path_under`), exact on Unix.
+pub(crate) fn prefix_matches(path: &Path, prefix: &str) -> bool {
+    prefix_matches_with_case(path, prefix, cfg!(windows))
+}
+
+/// The comparison core of [`prefix_matches`], with the case fold explicit.
+///
+/// Split out so the comparison is exercised by the unit tests on any host,
+/// even though only Windows passes `true` — the same split
+/// `delta::path_under` makes.
+fn prefix_matches_with_case(path: &Path, prefix: &str, fold_case: bool) -> bool {
+    let path_s = strip_verbatim(&path.to_string_lossy());
+    let prefix_s = strip_verbatim(prefix);
+    let eq = |a: &str, b: &str| {
+        if fold_case {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let path_comps: Vec<&str> = path_s.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
+    let prefix_comps: Vec<&str> = prefix_s.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
+    prefix_comps.len() <= path_comps.len()
+        && path_comps[..prefix_comps.len()]
+            .iter()
+            .zip(&prefix_comps)
+            .all(|(a, b)| eq(a, b))
 }
 
 /// `path` expressed relative to `root` with `/` separators, or `None` when the
@@ -731,6 +983,14 @@ pub struct CrawlSummary {
     /// Files skipped because a directory above them matched the root
     /// `.gitignore`. Always 0 unless the crawl opted into reading one.
     pub skipped_gitignore: u64,
+    /// Directories the walker **pruned**: at or below an excluded path prefix
+    /// (a pseudo-filesystem or a user's `--exclude-prefix`). Counted per
+    /// pruned directory, not per file inside it — the walker never descends,
+    /// so the per-file count does not exist, and that is the point of the
+    /// rule (issue #43). Each pruned directory is also counted in
+    /// [`CrawlSummary::scanned`], so `scanned = indexed + skipped + errors`
+    /// holds for this rule as for the others.
+    pub skipped_prefix: u64,
     /// Entries the walker could not read: a directory it could not open, or a
     /// file whose metadata it could not stat.
     ///
@@ -755,10 +1015,13 @@ pub struct CrawlSummary {
 }
 
 impl CrawlSummary {
-    /// Every file the walker saw and then dropped *by a rule*, across all three
+    /// Every file the walker saw and then dropped *by a rule*, across all
     /// reasons. Read failures are [`CrawlSummary::errors`], not this.
     pub fn skipped_total(&self) -> u64 {
-        self.skipped.values().sum::<u64>() + self.skipped_hidden + self.skipped_gitignore
+        self.skipped.values().sum::<u64>()
+            + self.skipped_hidden
+            + self.skipped_gitignore
+            + self.skipped_prefix
     }
 }
 
@@ -848,11 +1111,40 @@ pub struct HashSummary {
 /// caller is responsible for checking `summary.indexed == 0` and issuing a
 /// warning / non-zero exit.
 pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
+    // Build the policy from the config: built-in names + built-in prefixes
+    // (unless `--no-default-excludes`), the opt-ins, and the user's names.
+    // The user's `--exclude-prefix` additions travel through
+    // [`crawl_with_excludes`], because `CrawlConfig` deliberately carries no
+    // prefixes of its own (issue #43).
     let root = config
         .root
         .canonicalize()
         .with_context(|| format!("root not found: {}", config.root.display()))?;
+    let excludes = ExcludeSet::new(&config.exclude, config.no_default_excludes)
+        .with_hidden(config.hidden)
+        .with_gitignore(&root, config.use_gitignore)?;
+    crawl_with_excludes(config, root, excludes)
+}
 
+/// Run a metadata crawl of `config.root` under a **pre-assembled** exclusion
+/// policy.
+///
+/// The seam the CLI uses to hand in a policy built from flags [`CrawlConfig`]
+/// does not carry (`--exclude-prefix`); [`crawl`] builds its own policy from
+/// the config and delegates here. The policy travels whole — what the crawl
+/// prunes is exactly what gets encoded into `meta.exclude_policy` and what
+/// every search-time delta query replays.
+///
+/// # Errors
+///
+/// Same contract as [`crawl`]. The policy is re-validated here even when the
+/// caller already did: the guarantee "a policy that cannot be replayed is
+/// refused before anything is written" holds for every entry point.
+pub fn crawl_with_excludes(
+    config: CrawlConfig,
+    root: PathBuf,
+    excludes: ExcludeSet,
+) -> Result<CrawlSummary> {
     let store = Store::open(&config.db_path)?;
     store.ensure_schema_version()?;
 
@@ -862,12 +1154,6 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
 
-    // Build the effective exclude list. A `.gitignore` that cannot be read is a
-    // hard error here: it was asked for explicitly, and a crawl that quietly
-    // ignored the request would report a file count for a different corpus.
-    let excludes = ExcludeSet::new(&config.exclude, config.no_default_excludes)
-        .with_hidden(config.hidden)
-        .with_gitignore(&root, config.use_gitignore)?;
     // Before anything is written: a policy that cannot be replayed would make
     // this crawl report success and every later query fail.
     excludes.validate()?;
@@ -898,6 +1184,7 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
     let skip_map = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
     let skipped_hidden = Arc::new(AtomicU64::new(0));
     let skipped_gitignore = Arc::new(AtomicU64::new(0));
+    let skipped_prefix = Arc::new(AtomicU64::new(0));
     let errors = Arc::new(ErrorLog::default());
     let scanned = Arc::new(AtomicU64::new(0));
 
@@ -913,6 +1200,7 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
     let skip_map_ref = skip_map.clone();
     let hidden_ref = skipped_hidden.clone();
     let gitignore_ref = skipped_gitignore.clone();
+    let prefix_ref = skipped_prefix.clone();
     let errors_ref = errors.clone();
     let scanned_ref = scanned.clone();
     let root_ref = root.clone();
@@ -963,6 +1251,7 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                 let skip_map = skip_map_ref.clone();
                 let hidden_count = hidden_ref.clone();
                 let gitignore_count = gitignore_ref.clone();
+                let prefix_count = prefix_ref.clone();
                 let errors = errors_ref.clone();
                 let scanned = scanned_ref.clone();
                 let root = root_ref.clone();
@@ -990,6 +1279,24 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                         }
                     };
 
+                    // Prune, don't filter: a directory at or below an excluded
+                    // prefix (a pseudo-filesystem like /proc) must never be
+                    // descended into. Returning Skip here tells the walker not
+                    // to enqueue the directory's children — "index nothing
+                    // under here" is not enough, because the cost and the
+                    // hazard are in the walking itself, and in what a later
+                    // `sagasu fulltext` pass would open. The check runs for
+                    // every entry (a user prefix may name a file, too).
+                    if excludes.prefix_matched(entry.path()) {
+                        // The entry the walker was handed is counted as
+                        // scanned — the same way every other skipped entry
+                        // is — so `scanned = indexed + skipped + errors`
+                        // holds for this rule as for the others.
+                        scanned.fetch_add(1, Ordering::Relaxed);
+                        prefix_count.fetch_add(1, Ordering::Relaxed);
+                        return WalkState::Skip;
+                    }
+
                     if !entry.file_type().is_some_and(|t| t.is_file()) {
                         return WalkState::Continue;
                     }
@@ -1016,6 +1323,12 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                         Some(ExcludeReason::Name(name)) => {
                             let mut sm = skip_map.lock().unwrap();
                             *sm.entry(name).or_insert(0) += 1;
+                            return WalkState::Skip;
+                        }
+                        // `Prefix` never reaches this match in the crawl: the
+                        // prune above already claimed the entry.
+                        Some(ExcludeReason::Prefix) => {
+                            prefix_count.fetch_add(1, Ordering::Relaxed);
                             return WalkState::Skip;
                         }
                         Some(ExcludeReason::OsHidden) => {
@@ -1185,6 +1498,7 @@ pub fn crawl(config: CrawlConfig) -> Result<CrawlSummary> {
                 skipped,
                 skipped_hidden: skipped_hidden.load(Ordering::Relaxed),
                 skipped_gitignore: skipped_gitignore.load(Ordering::Relaxed),
+                skipped_prefix: skipped_prefix.load(Ordering::Relaxed),
                 errors: error_count,
                 error_samples,
                 added,
@@ -1346,10 +1660,17 @@ mod tests {
     fn a_policy_we_cannot_read_is_an_error_not_a_shrug() {
         // Falling back to the defaults would give the delta path a different
         // exclusion set than the crawl used, without saying so.
-        assert!(ExcludeSet::decode("v2\n").is_err());
-        assert!(ExcludeSet::decode("v1\nhidden=maybe\n").is_err());
-        assert!(ExcludeSet::decode("v1\nnonsense\n").is_err());
-        assert!(ExcludeSet::decode("v1\nfuture_key=1\n").is_err());
+        //
+        // The refused version has to be one this build does not know: v1 and
+        // v2 are both readable now (v2 added `prefix=`, issue #43), so the
+        // "written by a newer sagasu" case is v3.
+        assert!(ExcludeSet::decode("v3\n").is_err());
+        assert!(ExcludeSet::decode("\n").is_err());
+        assert!(ExcludeSet::decode("v2\nhidden=maybe\n").is_err());
+        assert!(ExcludeSet::decode("v2\nnonsense\n").is_err());
+        assert!(ExcludeSet::decode("v2\nfuture_key=1\n").is_err());
+        // …and the older shape is still read, not refused.
+        assert!(ExcludeSet::decode("v1\ndefaults=1\nhidden=include\ngitignore=0\n").is_ok());
     }
 
     #[test]
@@ -1654,5 +1975,203 @@ mod scope_tests {
         let mut sorted = samples.clone();
         sorted.sort();
         assert_eq!(samples, sorted);
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    // ── The rule itself: component-wise path comparison (issue #43) ──────────
+
+    #[test]
+    fn a_prefix_matches_whole_path_components_not_string_prefixes() {
+        let m = |path: &str, prefix: &str| prefix_matches(Path::new(path), prefix);
+
+        // The directory itself, and everything at or below it.
+        assert!(m("/proc", "/proc"));
+        assert!(m("/proc/self/status", "/proc"));
+        assert!(m("/sys/kernel/osrelease", "/sys"));
+
+        // The trap this issue is named for: a string prefix would swallow
+        // `/system` and `/proc2`; a path comparison must not.
+        assert!(!m("/system", "/sys"));
+        assert!(!m("/systemd/journal", "/sys"));
+        assert!(!m("/proc2", "/proc"));
+        assert!(!m("/var/proc", "/proc"));
+
+        // A prefix longer than the path is not a match either way round.
+        assert!(!m("/proc", "/proc/self"));
+
+        // Trailing separators on either side are ignored.
+        assert!(m("/proc/self/", "/proc/"));
+        assert!(m("/proc", "/proc/"));
+        assert!(m("/proc/self", "/proc/"));
+
+        // A relative prefix matches nothing absolute (and `validate` refuses
+        // it at crawl time — this is the behaviour it would otherwise have).
+        assert!(!m("/tmp/proc/x", "proc"));
+
+        // The Windows extended-length spelling relates to the plain one, the
+        // same way `relative_slash_path` reconciles the two.
+        assert!(m(r"\\?\C:\Windows\System32\drivers\etc\hosts", r"C:\Windows"));
+        assert!(m(r"C:\Windows\System32", r"\\?\C:\Windows"));
+        assert!(!m(r"C:\Windows2\x", r"C:\Windows"));
+    }
+
+    #[test]
+    fn case_folding_follows_the_platform() {
+        // The comparison core is exercised on any host with the fold flag set
+        // explicitly, even though only Windows passes `true` (the same split
+        // `delta::path_under` makes).
+        assert!(prefix_matches_with_case(Path::new("/PROC/SELF/status"), "/proc", true));
+        assert!(!prefix_matches_with_case(Path::new("/PROC/SELF/status"), "/proc", false));
+        assert!(prefix_matches_with_case(Path::new(r"C:\WINDOWS\System32"), r"c:\windows", true));
+    }
+
+    // ── Defaults: pseudo-filesystems only, never OS directories ──────────────
+
+    #[test]
+    fn the_default_prefixes_are_the_pseudo_filesystems_only() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(DEFAULT_PREFIX_EXCLUDES, &["/proc", "/sys", "/dev", "/run"]);
+        #[cfg(target_os = "macos")]
+        assert_eq!(DEFAULT_PREFIX_EXCLUDES, &["/dev"]);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert!(DEFAULT_PREFIX_EXCLUDES.is_empty());
+
+        // A set built with defaults on carries them; `--no-default-excludes`
+        // drops them along with the name list. The user's own prefix survives
+        // `no_default` — it is an addition, not a default.
+        assert_eq!(
+            ExcludeSet::new(&[], false).prefixes().len(),
+            DEFAULT_PREFIX_EXCLUDES.len()
+        );
+        assert!(ExcludeSet::new(&[], true).prefixes().is_empty());
+        assert!(ExcludeSet::new(&[], true).names().is_empty());
+        let user = ExcludeSet::new(&[], true).with_prefixes(&["/data/telemetry".to_string()]);
+        assert_eq!(user.prefixes(), &["/data/telemetry".to_string()]);
+    }
+
+    #[test]
+    fn the_default_prefixes_actually_prune() {
+        // The defaults are not decorative: on Linux a set with defaults on
+        // prunes the pseudo-filesystems, and one with defaults off does not.
+        let defaults = ExcludeSet::new(&[], false);
+        #[cfg(target_os = "linux")]
+        {
+            assert!(defaults.prefix_matched(Path::new("/proc/self/status")));
+            assert!(defaults.prefix_matched(Path::new("/sys/kernel/osrelease")));
+            assert!(defaults.prefix_matched(Path::new("/dev/sda")));
+            assert!(defaults.prefix_matched(Path::new("/run/user/1000/x")));
+            // The component boundary holds for the defaults too: `/sys` must
+            // not swallow `/systemd`.
+            assert!(!defaults.prefix_matched(Path::new("/systemd/journal")));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(defaults.prefix_matched(Path::new("/dev/disk0")));
+            // macOS has no /proc; nothing else is a default there.
+            assert!(!defaults.prefix_matched(Path::new("/proc/self/status")));
+        }
+        assert!(!ExcludeSet::new(&[], true).prefix_matched(Path::new("/proc/self/status")));
+        // OS directories stay findable on every platform: no default matches
+        // C:\Windows or Library/Caches, even where the components line up.
+        assert!(!defaults.prefix_matched(Path::new("/Library/Caches/com.apple/foo")));
+        assert!(!defaults.prefix_matched(Path::new("/Windows/System32/drivers/etc/hosts")));
+    }
+
+    // ── Compatibility: `v1` keeps its meaning (issue #43) ────────────────────
+
+    #[test]
+    fn a_v1_policy_decodes_with_an_empty_prefix_list() {
+        // The literal encoding the current main build writes. The index it
+        // came from did not prune /proc; applying this build's defaults to it
+        // would make the delta side scan a different set than the crawl did —
+        // the exact inconsistency the encoding exists to prevent.
+        let set = ExcludeSet::decode("v1\ndefaults=1\nhidden=include\ngitignore=0\n").unwrap();
+        assert!(set.prefixes().is_empty(), "v1 must decode prefix-free: {:?}", set.prefixes());
+        // The new defaults must not leak in through the back door either.
+        assert_eq!(set.reason_for_path(Path::new("/proc/self/status"), Path::new("/")), None);
+        assert_eq!(set.reason_for_path(Path::new("/sys/kernel/osrelease"), Path::new("/")), None);
+        // What `v1` meant, it still means.
+        assert!(set.contains("node_modules"));
+        assert_eq!(set.hidden_policy(), HiddenPolicy::Include);
+
+        // Re-encoding writes the current version — v1 is a shape this build
+        // reads, not one it writes. The prefix list stays empty, so no
+        // `prefix=` line appears and the crawl's original meaning survives the
+        // round trip.
+        assert_eq!(
+            set.encode(),
+            "v2\ndefaults=1\nhidden=include\ngitignore=0\n"
+        );
+    }
+
+    #[test]
+    fn the_prefix_list_round_trips_and_is_written_explicitly() {
+        // Defaults on: every effective prefix appears as its own line, so a
+        // reader never needs to know what this build's defaults happened to be.
+        let original = ExcludeSet::new(&[], false);
+        let encoded = original.encode();
+        assert!(encoded.starts_with("v2\n"), "{encoded}");
+        for default in DEFAULT_PREFIX_EXCLUDES {
+            assert!(encoded.contains(&format!("prefix={default}\n")), "{encoded}");
+        }
+        let decoded = ExcludeSet::decode(&encoded).unwrap();
+        assert_eq!(decoded.prefixes(), original.prefixes());
+        assert_eq!(decoded.encode(), encoded);
+
+        // A user prefix rides along and survives the round trip unchanged.
+        let with_user = ExcludeSet::new(&[], false)
+            .with_prefixes(&["/var/lib/telemetry".to_string()]);
+        let decoded = ExcludeSet::decode(&with_user.encode()).unwrap();
+        assert_eq!(decoded.prefixes(), with_user.prefixes());
+        assert_eq!(decoded.encode(), with_user.encode());
+        // And a `no_default` policy carries exactly the user's prefixes.
+        let user_only = ExcludeSet::new(&[], true).with_prefixes(&["/data".to_string()]);
+        let decoded = ExcludeSet::decode(&user_only.encode()).unwrap();
+        assert_eq!(decoded.prefixes(), &["/data".to_string()]);
+    }
+
+    // ── Validation: a prefix must survive the encoding and mean something ────
+
+    #[test]
+    fn a_prefix_that_cannot_be_replayed_is_refused() {
+        // Same contract as the name list: a `\n` would break the policy line
+        // and make every later query fail to parse; an empty prefix would
+        // match the crawl root itself and prune everything.
+        for bad in ["/tmp/a\nb", "/tmp/a\r", ""] {
+            let err = ExcludeSet::new(&[], false)
+                .with_prefixes(&[bad.to_string()])
+                .validate()
+                .unwrap_err();
+            assert!(
+                !format!("{err:#}").is_empty(),
+                "{bad:?}: validate() must refuse"
+            );
+        }
+        // A relative prefix can never match an absolute walker path: refused
+        // rather than silently doing nothing.
+        let err = ExcludeSet::new(&[], false)
+            .with_prefixes(&["tmp/proc".to_string()])
+            .validate()
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("absolute"), "{err:#}");
+        // The name list is untouched by all of this.
+        assert!(ExcludeSet::new(&["build".to_string()], false).validate().is_ok());
+        // "Absolute" is platform-defined: `/tmp/ok` has no prefix on Windows,
+        // so `Path::is_absolute` is false there and `validate()` would refuse
+        // it for the same reason it refuses `tmp/proc`. Ask each platform for
+        // a shape it actually calls absolute.
+        let ok_prefix = if cfg!(windows) {
+            r"C:\tmp\ok".to_string()
+        } else {
+            "/tmp/ok".to_string()
+        };
+        assert!(ExcludeSet::new(&[], false)
+            .with_prefixes(std::slice::from_ref(&ok_prefix))
+            .validate()
+            .is_ok());
     }
 }

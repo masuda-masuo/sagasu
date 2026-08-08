@@ -140,6 +140,9 @@ fn text_policy(policy: &TextPolicy) -> Value {
 fn exclusion(excludes: &ExcludeSet) -> Value {
     json!({
         "names": excludes.names(),
+        // The pruned path prefixes, defaults included — the whole list, as
+        // the crawl wrote it into the policy (issue #43).
+        "prefixes": excludes.prefixes(),
         "hidden": excludes.hidden_policy().as_str(),
         "gitignore": {
             "applied": excludes.uses_gitignore(),
@@ -338,6 +341,8 @@ pub(crate) fn index(
             "skipped_total": summary_data.skipped_total(),
             "skipped_hidden": summary_data.skipped_hidden,
             "skipped_gitignore": summary_data.skipped_gitignore,
+            // Pruned directories (per directory, not per file inside it).
+            "skipped_prefix": summary_data.skipped_prefix,
             "unreadable": summary_data.errors,
             "unreadable_samples": summary_data.error_samples,
             "elapsed_secs": summary_data.elapsed_secs,

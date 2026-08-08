@@ -58,4 +58,6 @@ pub use store::Store;
 pub use tagindex::{TagConfig, TagSummary};
 pub use tagrules::RuleSet;
 pub use tags::{Tag, TagSet, TagSource};
-pub use walk::{crawl, hash_backfill, CrawlConfig, CrawlSummary, ExcludeSet, HashSummary};
+pub use walk::{
+    crawl, crawl_with_excludes, hash_backfill, CrawlConfig, CrawlSummary, ExcludeSet, HashSummary,
+};
