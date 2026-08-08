@@ -322,16 +322,25 @@ pub fn find(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshOut
     timing.index_ms = ms(t_index);
 
     let t_merge = Instant::now();
-    let changed = ctx.path_set();
+    let changed = ctx.existence();
     let mut dropped_changed = 0usize;
     let mut dropped_deleted = 0usize;
     let index_candidates = rows.len();
 
     let mut indexed: Vec<FreshHit> = Vec::with_capacity(rows.len());
     for row in &rows {
-        if changed.contains(row.path.as_str()) {
-            dropped_changed += 1;
-            continue;
+        match changed.get(row.path.as_str()).copied() {
+            // The delta says the file is gone — a deletion, not a change,
+            // whichever source reported it.
+            Some(false) => {
+                dropped_deleted += 1;
+                continue;
+            }
+            Some(true) => {
+                dropped_changed += 1;
+                continue;
+            }
+            None => {}
         }
         if !Path::new(&row.path).exists() {
             dropped_deleted += 1;
@@ -449,7 +458,7 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
 
     // ── Merge ───────────────────────────────────────────────────────────────
     let t_merge = Instant::now();
-    let changed = ctx.path_set();
+    let changed = ctx.existence();
     let mut dropped_changed = 0usize;
     let mut dropped_deleted = 0usize;
     let index_candidates = indexed.hits.len();
@@ -457,9 +466,18 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
     let mut from_index: Vec<FreshHit> = Vec::with_capacity(indexed.hits.len());
     for hit in &indexed.hits {
         let path = hit.display_path();
-        if changed.contains(path) {
-            dropped_changed += 1;
-            continue;
+        match changed.get(path).copied() {
+            // The delta says the file is gone — a deletion, not a change,
+            // whichever source reported it.
+            Some(false) => {
+                dropped_deleted += 1;
+                continue;
+            }
+            Some(true) => {
+                dropped_changed += 1;
+                continue;
+            }
+            None => {}
         }
         // `deleted` is what SQLite knows; `exists` is what the filesystem knows
         // right now. A file deleted since the last crawl is only visible in the
@@ -646,8 +664,16 @@ impl DeltaContext {
             .unwrap_or(&[])
     }
 
-    fn path_set(&self) -> HashSet<&str> {
-        self.set.as_ref().map(|s| s.path_set()).unwrap_or_default()
+    /// Delta paths mapped to their current existence, so the merge can tell a
+    /// changed file from a deleted one when both arrive as delta entries. A
+    /// walk only ever reports files it can still stat, but the USN journal
+    /// reports deletions as entries with `exists == false` — classifying by
+    /// set membership alone would count those as "changed".
+    fn existence(&self) -> std::collections::HashMap<&str, bool> {
+        self.entries()
+            .iter()
+            .map(|e| (e.path.as_str(), e.exists))
+            .collect()
     }
 
     fn report(&self) -> Option<DeltaReport> {

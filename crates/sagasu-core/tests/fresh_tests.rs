@@ -279,15 +279,26 @@ fn metadata_search_drops_a_file_deleted_after_indexing() {
     // afterwards (ctime trap: any utimensat/chmod bumps ctime, and the unix
     // source reads `ctime > marker` as changed). Its pre-crawl timestamps are
     // already safely below the marker — the marker is recorded after those
-    // writes complete — so `delta.entries == 0` below stays strict.
+    // writes complete — so on the mtime path `delta.entries == 0` below stays
+    // strict.
     fs::remove_file(&gone).unwrap();
 
     let outcome = fresh::find(&find_config(&db, "report"), None).unwrap();
     assert_eq!(names(&outcome), vec!["keep_report.md".to_string()]);
     assert_eq!(outcome.dropped_deleted, 1);
-    // Deletion is caught by the merge's existence check, not by the delta walk:
-    // an mtime walk cannot see a file that is no longer there.
-    assert_eq!(outcome.delta.as_ref().unwrap().entries, 0);
+    // The deletion must reach the answer whichever source ran. An mtime walk
+    // cannot see a file that is no longer there, so `dropped_deleted` comes
+    // from the merge's existence check and the delta set is empty. The USN
+    // journal *does* record the deletion, so its delta set legitimately holds
+    // one entry and `dropped_deleted` comes from that entry instead — the
+    // strict empty-set assertion therefore applies to the mtime kind only,
+    // mirroring how `usn_is_the_default_on_windows_with_mtime_fallback` in
+    // delta.rs tolerates both sources.
+    match &outcome.delta {
+        Some(d) if d.kind == DeltaSourceKind::Mtime => assert_eq!(d.entries, 0),
+        Some(d) => assert_eq!(d.entries, 1, "{}", delta_note(&outcome)),
+        None => {}
+    }
 }
 
 #[test]

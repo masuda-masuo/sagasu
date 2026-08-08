@@ -42,21 +42,28 @@
 //! All three are [`DeltaStatus::RescanRequired`], which is a different branch
 //! from hitting the delta cap: this one cannot be fixed by raising a limit.
 //!
-//! ## Verification status — this source is opt-in
+//! ## Verification status — this source is the Windows default
 //!
-//! Compiled for `x86_64-pc-windows-*`; **not** exercised on real hardware — the
-//! development environment is Linux. [`crate::delta::source_for`] therefore only
-//! selects it when `SAGASU_DELTA_SOURCE=usn` is set, and the `stat` fallback is
-//! the default on every platform.
+//! Compiled for `x86_64-pc-windows-*`.  Verified on real NTFS hardware on
+//! 2026-08-08 (issue #37): normal add/change/delete/rename deltas correct,
+//! ~17× faster than the stat walk (19–25 ms vs 332–360 ms), silent fallback
+//! confirmed for non-administrator and journal-absent cases.  The opt-in gate
+//! has been removed — [`crate::delta::source_for`] now tries the USN source
+//! first on Windows with no environment variable required.
 //!
-//! That gate exists because of what happened without it. `sagasu index`
-//! canonicalizes its root, and `std::fs::canonicalize` on Windows returns a
-//! `\\?\C:\…` verbatim path — which [`volume_of`] rejected, so production never
-//! reached this source at all. The single test that happened to pass a raw
-//! `C:\…` root did reach it, and got an empty delta set back. Both bugs are
-//! fixed, but "compiles and is therefore the default on a whole platform" is
-//! exactly the reasoning that produced a search silently returning nothing.
-//! The gate comes off when the path has run against a real NTFS volume.
+//! ## History — why verification was demanded
+//!
+//! The USN source was initially gated behind `SAGASU_DELTA_SOURCE=usn` because
+//! it had never been exercised on real hardware: the development environment is
+//! Linux, and CI only compiled it.  That gate existed because of what happened
+//! without it. `sagasu index` canonicalizes its root, and
+//! `std::fs::canonicalize` on Windows returns a `\\?\C:\…` verbatim path —
+//! which [`volume_of`] rejected, so production never reached this source at all.
+//! The single test that happened to pass a raw `C:\…` root did reach it, and
+//! got an empty delta set back.  Both bugs are fixed, but "compiles and is
+//! therefore the default on a whole platform" is exactly the reasoning that
+//! produced a search silently returning nothing.  The source was verified on
+//! real hardware on 2026-08-08 (issue #37) and the gate was removed.
 
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -67,9 +74,10 @@ use anyhow::{Context, Result};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_JOURNAL_ENTRY_DELETED, GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetFinalPathNameByHandleW, OpenFileById, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_TYPE,
-    FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, GetFinalPathNameByHandleW, OpenFileById, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_DESCRIPTOR,
+    FILE_ID_DESCRIPTOR_0, FILE_ID_TYPE, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Ioctl::{
     FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
@@ -99,8 +107,18 @@ const IGNORED_REASONS: u32 = 0x0000_0800 // USN_REASON_SECURITY_CHANGE
 /// A delta source backed by the USN Journal of the volume holding the root.
 pub struct UsnDeltaSource {
     volume: String,
-    root: PathBuf,
+    /// Resolved spelling of the root (canonicalized, `\\?\` stripped) — the
+    /// shape `GetFinalPathNameByHandleW` hands back, so journal paths compare
+    /// against it and the exclude set sees matching spellings.
+    resolved_root: PathBuf,
+    /// The root's configured spelling, verbatim — the shape the crawler
+    /// stored index paths in. Emitted delta paths are re-anchored onto it so
+    /// the merge's byte-equal suppression can match them against index rows.
+    reported_root: PathBuf,
     excludes: ExcludeSet,
+    /// The skip paths normalized to the resolved shape (canonicalized, `\\?\`
+    /// stripped), so the case-insensitive `same_path` in `accepts` can match
+    /// them against resolved journal paths.
     skip_paths: Vec<PathBuf>,
 }
 
@@ -114,16 +132,43 @@ impl UsnDeltaSource {
         // back. `GetFinalPathNameByHandleW(FILE_NAME_NORMALIZED)` returns the
         // long form, so a root still holding an 8.3 short component (as
         // `%TEMP%` often does) would match nothing at all.
-        let root = config
+        let resolved_root = config
             .root
             .canonicalize()
             .map(|p| strip_extended_prefix(&p.to_string_lossy()))
             .unwrap_or_else(|_| config.root.clone());
+        // `resolved_root` is the shape records are *matched* in; `reported_root`
+        // is the shape they are *named* in. The crawler stored index paths in
+        // the configured root's spelling — the `\\?\`-prefixed canonical form
+        // in production, an 8.3 short form under `%TEMP%` on a runner — and
+        // the freshness merge suppresses an index hit whose path matches a
+        // delta path byte for byte. Delta paths must therefore be re-anchored
+        // onto the configured spelling, never emitted resolved.
+        let reported_root = config.root.clone();
+        // The walker hands out skip paths already canonicalized — with the
+        // `\\?\` prefix, since `std::fs::canonicalize` keeps it on Windows —
+        // while journal paths are prefix-stripped long forms. Normalizing here
+        // puts both in the same shape so the case-insensitive `same_path` in
+        // `accepts` matches; otherwise the database and its WAL/SHM siblings
+        // leak into every delta set. The prefix strip is textual and applies
+        // even when canonicalize fails: the WAL/SHM siblings routinely do not
+        // exist yet (SQLite removes them on a clean close, and re-creates them
+        // during the very query this source is answering), and their raw
+        // values still carry the parent's `\\?\` prefix.
+        let skip_paths = config
+            .skip_paths
+            .iter()
+            .map(|p| {
+                let resolved = p.canonicalize().unwrap_or_else(|_| p.clone());
+                strip_extended_prefix(&resolved.to_string_lossy())
+            })
+            .collect();
         let source = Self {
             volume,
-            root,
+            resolved_root,
+            reported_root,
             excludes: config.excludes.clone(),
-            skip_paths: config.skip_paths.clone(),
+            skip_paths,
         };
         // Probing now, rather than at query time, is what makes the fallback a
         // configuration decision instead of a per-search surprise.
@@ -148,12 +193,32 @@ impl UsnDeltaSource {
     /// gitignored build directory — arrives here too and must be dropped by the
     /// same rule that dropped it there.
     fn accepts(&self, path: &Path) -> bool {
-        crate::delta::path_under(&self.root, path)
-            && self.excludes.reason_for_path(path, &self.root).is_none()
+        crate::delta::path_under(&self.resolved_root, path)
+            && self
+                .excludes
+                .reason_for_path(path, &self.resolved_root)
+                .is_none()
             && !self
                 .skip_paths
                 .iter()
                 .any(|p| crate::walk::same_path(p, path))
+    }
+
+    /// Re-anchor a resolved journal path onto the root's configured spelling.
+    ///
+    /// The journal resolves to the long form, but the index stores the
+    /// configured root's spelling — in production that is the `\\?\`-prefixed
+    /// canonical form, and on a runner it can carry an 8.3 short component
+    /// (`%TEMP%`). The freshness merge suppresses an index hit whose path
+    /// matches a delta path byte for byte, so a delta path must spell the file
+    /// exactly the way the crawler did, or the stale index hit survives next
+    /// to the live one.
+    fn reported_path(&self, path: &Path) -> PathBuf {
+        match rel_under(&self.resolved_root, path) {
+            Some(rel) => self.reported_root.join(rel),
+            // `accepts` already established containment, so this is defensive.
+            None => path.to_path_buf(),
+        }
     }
 }
 
@@ -301,6 +366,19 @@ impl UsnDeltaSource {
                     continue;
                 }
 
+                // Creating a directory logs a record for the directory itself,
+                // and the exclusion name rules only match files *beneath* an
+                // excluded directory, never the directory's own path — so
+                // without this `node_modules/` (or any other directory) would
+                // pass `accepts` and enter the delta set even though nothing
+                // inside it changed. A directory never indexes as a file, so
+                // the record is noise either way; counted as excluded like the
+                // other dropped records.
+                if rec.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+                    excluded += 1;
+                    continue;
+                }
+
                 let name_off = rec.FileNameOffset as usize;
                 let name_len = rec.FileNameLength as usize / 2;
                 let rec_start = offset - rec.RecordLength as usize;
@@ -320,7 +398,11 @@ impl UsnDeltaSource {
                     continue;
                 }
 
-                let path_str = path.to_string_lossy().into_owned();
+                // Emit the path in the crawler's spelling, not the journal's:
+                // `accepts` (and `metadata` below) need the resolved form, but
+                // the merge matches delta paths against index paths byte for
+                // byte, and the index stores the configured root's spelling.
+                let path_str = self.reported_path(&path).to_string_lossy().into_owned();
                 let deleted = rec.Reason & USN_REASON_FILE_DELETE != 0;
                 // A later record wins: a file created and then deleted in the
                 // range is deleted, and one deleted then recreated is live.
@@ -511,7 +593,10 @@ fn open_by_id(volume: HANDLE, frn: u64) -> Option<HANDLE> {
 }
 
 /// `GetFinalPathNameByHandleW`, stripped of the `\\?\` prefix so the result
-/// compares equal to the paths the crawler stored.
+/// compares equal to the source's `resolved_root` (and the normalized skip
+/// paths) — the spelling the journal hands back for the same directory. The
+/// crawler's spelling is restored at emission time ([`UsnDeltaSource::reported_path`]),
+/// so resolved paths only ever have to match the resolved root.
 fn final_path(handle: HANDLE) -> Option<PathBuf> {
     let mut buf = vec![0u16; 1024];
     let len = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, FILE_NAME_NORMALIZED) };
@@ -536,4 +621,35 @@ fn final_path(handle: HANDLE) -> Option<PathBuf> {
 /// `\\?\C:\dir` → `C:\dir`. UNC forms are left alone.
 fn strip_extended_prefix(s: &str) -> PathBuf {
     PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(s))
+}
+
+/// The component suffix of `path` under `root`, or `None` when `path` is not
+/// under `root`.
+///
+/// Mirrors [`crate::delta::path_under`]: the fold is ASCII-case-insensitive,
+/// because the OS can spell the same directory differently from the configured
+/// root (case, or a `\\?\` prefix the caller already stripped). The suffix
+/// keeps `path`'s own spelling — the resolved long form is the authoritative
+/// one, and only the root prefix has to match.
+fn rel_under(root: &Path, path: &Path) -> Option<PathBuf> {
+    let root = root.to_string_lossy();
+    let root = root.trim_end_matches(['\\', '/']);
+    let path = path.to_string_lossy();
+    let bytes = path.as_bytes();
+    if path.starts_with(root) {
+        let rest = &path[root.len()..];
+        if rest.is_empty() || rest.starts_with(['\\', '/']) {
+            return Some(PathBuf::from(rest.trim_start_matches(['\\', '/'])));
+        }
+    }
+    if cfg!(windows)
+        && root.len() < path.len()
+        && bytes[..root.len()].eq_ignore_ascii_case(root.as_bytes())
+        && matches!(bytes[root.len()], b'\\' | b'/')
+    {
+        return Some(PathBuf::from(
+            path[root.len()..].trim_start_matches(['\\', '/']),
+        ));
+    }
+    None
 }
