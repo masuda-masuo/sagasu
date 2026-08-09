@@ -1,0 +1,17 @@
+[package]
+name = "sagasu-ui"
+version = "0.1.0"
+edition = "2021"
+description = "sagasu UI backend: the webview-boundary DTOs and command functions the M4 Tauri shell wraps"
+
+[dependencies]
+anyhow = { workspace = true }
+# The whole reason this crate exists: `Serialize` lives here rather than on the
+# core types (docs/cli.md §8). No `tauri` dependency — see the crate docs.
+serde = { workspace = true }
+sagasu-core = { path = "../sagasu-core" }
+
+[dev-dependencies]
+# Only the tests encode; the crate itself hands typed values to whatever
+# serializer the webview boundary uses.
+serde_json = { workspace = true }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sagasu-core", "crates/sagasu-cli"]
+members = ["crates/sagasu-core", "crates/sagasu-cli", "crates/sagasu-ui"]
 exclude = ["prototypes", "bench"]
 
 [workspace.dependencies]
