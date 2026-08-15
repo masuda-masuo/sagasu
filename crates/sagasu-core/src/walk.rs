@@ -152,6 +152,7 @@ pub fn hidden_from_attributes(attributes: u32) -> bool {
 /// attribute and this reads it; Unix has none, so this is always `false` there
 /// — including for dot-names (issue #14).
 #[cfg(windows)]
+#[inline]
 pub fn is_os_hidden(meta: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     hidden_from_attributes(meta.file_attributes())
@@ -161,6 +162,7 @@ pub fn is_os_hidden(meta: &std::fs::Metadata) -> bool {
 /// Unix, which has no hidden attribute. See the Windows sibling for why the
 /// leading dot is not consulted.
 #[cfg(not(windows))]
+#[inline]
 pub fn is_os_hidden(_meta: &std::fs::Metadata) -> bool {
     false
 }
