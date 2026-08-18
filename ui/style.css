@@ -1,0 +1,392 @@
+/* sagasu browse screen — M4 step 3. Plain static CSS, no framework. */
+
+:root {
+  --bg: #faf9f7;
+  --panel: #ffffff;
+  --ink: #1f2328;
+  --muted: #6b7280;
+  --line: #e2e0db;
+  --accent: #1d4ed8;
+  --accent-ink: #ffffff;
+  --chip-bg: #eef2ff;
+  --chip-line: #c7d2fe;
+  --recommend-bg: #f0f9ff;
+  --recommend-line: #7dd3fc;
+  --drop-bg: #fef2f2;
+  --drop-line: #fecaca;
+  --drop-ink: #7f1d1d;
+  --notice-bg: #fffbeb;
+  --notice-line: #fde68a;
+  --notice-ink: #78350f;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+.muted {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+/* ---- header ---- */
+
+.page-head {
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  padding: 14px 24px;
+}
+
+.title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.page-head h1 {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: 0.01em;
+}
+
+.mock-tag {
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 999px;
+  padding: 1px 10px;
+}
+
+.snapshot {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* ---- panels ---- */
+
+main {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 20px 24px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 18px;
+}
+
+.panel h2 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.note {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* ---- selection crumbs ---- */
+
+#crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.crumb {
+  font: inherit;
+  font-size: 13px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 12px;
+  cursor: pointer;
+  color: var(--accent);
+}
+
+.crumb + .crumb::before {
+  content: "›";
+  color: var(--muted);
+  margin-right: 6px;
+}
+
+.crumb:hover:not(:disabled) {
+  border-color: var(--chip-line);
+  background: var(--chip-bg);
+}
+
+.crumb:disabled {
+  cursor: default;
+  background: var(--chip-bg);
+  border-color: var(--chip-line);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* ---- counts ---- */
+
+.counts-headline {
+  font-weight: 600;
+}
+
+/* ---- group label ---- */
+
+.group-label {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: baseline;
+}
+
+.label-term {
+  white-space: nowrap;
+}
+
+.label-tag {
+  font-family: var(--mono);
+  font-weight: 600;
+}
+
+.label-count {
+  color: var(--muted);
+  font-size: 13px;
+  margin-left: 4px;
+}
+
+/* ---- chips (axis values, universal tags) ---- */
+
+.chip {
+  font: inherit;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  background: var(--chip-bg);
+  border: 1px solid var(--chip-line);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+  color: var(--ink);
+}
+
+.chip:hover {
+  border-color: var(--accent);
+}
+
+.chip-value {
+  font-family: var(--mono);
+  font-weight: 600;
+}
+
+.chip-count {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.chip-static {
+  cursor: default;
+  background: var(--panel);
+  border-style: dashed;
+}
+
+.chip-static:hover {
+  border-color: var(--chip-line);
+}
+
+/* ---- recommended next step: its own card, not an axis row ---- */
+
+#recommended {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.recommended-card {
+  font: inherit;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  background: var(--recommend-bg);
+  border: 2px solid var(--recommend-line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  cursor: pointer;
+}
+
+.recommended-card:hover {
+  border-color: var(--accent);
+}
+
+.recommended-tag {
+  font-family: var(--mono);
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.recommended-meta {
+  font-size: 14px;
+}
+
+.recommended-bits {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* ---- axes ---- */
+
+.axis {
+  margin: 10px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.axis-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+
+.axis-ns {
+  font-family: var(--mono);
+  font-weight: 700;
+  min-width: 6ch;
+}
+
+.axis-meta {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.axis-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.axis .note {
+  margin: 6px 0 0;
+}
+
+/* ---- preview table ---- */
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+#preview-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+
+#preview-table th,
+#preview-table td {
+  text-align: left;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+#preview-table th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+#preview-table td.num {
+  text-align: right;
+}
+
+#preview-table th.num {
+  text-align: right;
+}
+
+#preview-table td.path {
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#preview-table td.hex {
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- dropped: a warning, not a table row ---- */
+
+.panel-dropped {
+  background: var(--drop-bg);
+  border-color: var(--drop-line);
+}
+
+.panel-dropped h2 {
+  color: var(--drop-ink);
+}
+
+.dropped-row {
+  margin: 4px 0;
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+}
+
+/* ---- notice: holes in the mock, said out loud ---- */
+
+.panel-notice {
+  background: var(--notice-bg);
+  border-color: var(--notice-line);
+}
+
+.notice-title {
+  font-weight: 700;
+  color: var(--notice-ink);
+  margin: 0 0 4px;
+}
+
+.panel-notice p {
+  margin: 4px 0;
+}
+
+/* ---- footer ---- */
+
+.page-foot {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 0 24px 32px;
+  color: var(--muted);
+  font-size: 12px;
+}

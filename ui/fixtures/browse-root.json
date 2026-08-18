@@ -1,0 +1,377 @@
+{
+  "selected": [],
+  "matched": 108,
+  "corpus": 108,
+  "label": [
+    {
+      "tag": {
+        "tag": "format:text",
+        "namespace": "format",
+        "value": "text"
+      },
+      "weight": 0.6913479974281105,
+      "files": 107,
+      "corpus_files": 107
+    },
+    {
+      "tag": {
+        "tag": "kind:code",
+        "namespace": "kind",
+        "value": "code"
+      },
+      "weight": 0.5924114516149522,
+      "files": 66,
+      "corpus_files": 66
+    },
+    {
+      "tag": {
+        "tag": "ext:rs",
+        "namespace": "ext",
+        "value": "rs"
+      },
+      "weight": 0.5720107873228657,
+      "files": 60,
+      "corpus_files": 60
+    },
+    {
+      "tag": {
+        "tag": "path:crates",
+        "namespace": "path",
+        "value": "crates"
+      },
+      "weight": 0.5099064298425482,
+      "files": 45,
+      "corpus_files": 45
+    },
+    {
+      "tag": {
+        "tag": "path:sagasu",
+        "namespace": "path",
+        "value": "sagasu"
+      },
+      "weight": 0.5099064298425482,
+      "files": 45,
+      "corpus_files": 45
+    }
+  ],
+  "label_vocabulary": 52,
+  "universal": [],
+  "axes": [
+    {
+      "namespace": "path",
+      "score": 2.879851728419678,
+      "coverage": 0.9722222222222222,
+      "files": 105,
+      "distinct": 33,
+      "values": [
+        {
+          "tag": {
+            "tag": "path:crates",
+            "namespace": "path",
+            "value": "crates"
+          },
+          "files": 45,
+          "share": 0.4166666666666667
+        },
+        {
+          "tag": {
+            "tag": "path:sagasu",
+            "namespace": "path",
+            "value": "sagasu"
+          },
+          "files": 45,
+          "share": 0.4166666666666667
+        },
+        {
+          "tag": {
+            "tag": "path:src",
+            "namespace": "path",
+            "value": "src"
+          },
+          "files": 41,
+          "share": 0.37962962962962965
+        },
+        {
+          "tag": {
+            "tag": "path:core",
+            "namespace": "path",
+            "value": "core"
+          },
+          "files": 32,
+          "share": 0.2962962962962963
+        },
+        {
+          "tag": {
+            "tag": "path:sagasu-core",
+            "namespace": "path",
+            "value": "sagasu-core"
+          },
+          "files": 30,
+          "share": 0.2777777777777778
+        },
+        {
+          "tag": {
+            "tag": "path:prototypes",
+            "namespace": "path",
+            "value": "prototypes"
+          },
+          "files": 29,
+          "share": 0.26851851851851855
+        },
+        {
+          "tag": {
+            "tag": "path:proto",
+            "namespace": "path",
+            "value": "proto"
+          },
+          "files": 23,
+          "share": 0.21296296296296297
+        },
+        {
+          "tag": {
+            "tag": "path:bench",
+            "namespace": "path",
+            "value": "bench"
+          },
+          "files": 15,
+          "share": 0.1388888888888889
+        }
+      ],
+      "tail_assignments": 127
+    },
+    {
+      "namespace": "ext",
+      "score": 2.0677057945319657,
+      "coverage": 0.9814814814814815,
+      "files": 106,
+      "distinct": 11,
+      "values": [
+        {
+          "tag": {
+            "tag": "ext:rs",
+            "namespace": "ext",
+            "value": "rs"
+          },
+          "files": 60,
+          "share": 0.5555555555555556
+        },
+        {
+          "tag": {
+            "tag": "ext:toml",
+            "namespace": "ext",
+            "value": "toml"
+          },
+          "files": 21,
+          "share": 0.19444444444444445
+        },
+        {
+          "tag": {
+            "tag": "ext:md",
+            "namespace": "ext",
+            "value": "md"
+          },
+          "files": 11,
+          "share": 0.10185185185185185
+        },
+        {
+          "tag": {
+            "tag": "ext:json",
+            "namespace": "ext",
+            "value": "json"
+          },
+          "files": 4,
+          "share": 0.037037037037037035
+        },
+        {
+          "tag": {
+            "tag": "ext:lock",
+            "namespace": "ext",
+            "value": "lock"
+          },
+          "files": 3,
+          "share": 0.027777777777777776
+        },
+        {
+          "tag": {
+            "tag": "ext:html",
+            "namespace": "ext",
+            "value": "html"
+          },
+          "files": 2,
+          "share": 0.018518518518518517
+        },
+        {
+          "tag": {
+            "tag": "ext:css",
+            "namespace": "ext",
+            "value": "css"
+          },
+          "files": 1,
+          "share": 0.009259259259259259
+        },
+        {
+          "tag": {
+            "tag": "ext:ico",
+            "namespace": "ext",
+            "value": "ico"
+          },
+          "files": 1,
+          "share": 0.009259259259259259
+        }
+      ],
+      "tail_assignments": 3
+    },
+    {
+      "namespace": "kind",
+      "score": 1.3935317927002642,
+      "coverage": 1.0,
+      "files": 108,
+      "distinct": 4,
+      "values": [
+        {
+          "tag": {
+            "tag": "kind:code",
+            "namespace": "kind",
+            "value": "code"
+          },
+          "files": 66,
+          "share": 0.6111111111111112
+        },
+        {
+          "tag": {
+            "tag": "kind:config",
+            "namespace": "kind",
+            "value": "config"
+          },
+          "files": 25,
+          "share": 0.23148148148148148
+        },
+        {
+          "tag": {
+            "tag": "kind:text",
+            "namespace": "kind",
+            "value": "text"
+          },
+          "files": 16,
+          "share": 0.14814814814814814
+        },
+        {
+          "tag": {
+            "tag": "kind:image",
+            "namespace": "kind",
+            "value": "image"
+          },
+          "files": 1,
+          "share": 0.009259259259259259
+        }
+      ],
+      "tail_assignments": 0
+    },
+    {
+      "namespace": "pattern",
+      "score": 0.13303964861069895,
+      "coverage": 0.018518518518518517,
+      "files": 2,
+      "distinct": 1,
+      "values": [
+        {
+          "tag": {
+            "tag": "pattern:dotfile",
+            "namespace": "pattern",
+            "value": "dotfile"
+          },
+          "files": 2,
+          "share": 0.018518518518518517
+        }
+      ],
+      "tail_assignments": 0
+    }
+  ],
+  "axes_total": 6,
+  "axes_refining": 6,
+  "recommended": {
+    "namespace": "ext",
+    "tag": {
+      "tag": "ext:rs",
+      "namespace": "ext",
+      "value": "rs"
+    },
+    "files": 60,
+    "share": 0.5555555555555556,
+    "bits": 0.9910760598382222
+  },
+  "preview": [
+    {
+      "file_id": 1,
+      "path": "/tmp/sagasu-fixtures.WFctGU/corpus/prototypes/proto-gui-core/Cargo.toml",
+      "ext": "toml",
+      "size": 357,
+      "mtime_ns": "1787053195857088987",
+      "ctime_ns": "1787054506421128546",
+      "magic": "5b7061636b6167655d0a6e616d65203d202270726f746f2d6775692d636f7265220a76657273696f6e203d2022302e312e30220a65646974696f6e203d202232303231220a0a5b6c69625d0a63726174652d74797065203d205b22726c6962225d0a0a5b646570656e64656e636965735d0a616e79686f77203d207b20776f726b7370616365203d2074727565207d0a69676e6f7265203d2022302e34220a74616e74697679203d2022302e3236220a6c696e64657261203d202235220a6c696e646572612d74616e74697679203d207b2076657273696f6e203d2022352e30222c206665617475726573203d205b22656d6265642d697061646963225d207d0a7365726465203d207b2076657273696f6e203d202231222c206665617475726573203d205b22646572697665225d207d0a73657264655f6a736f6e203d202231220a5b6465762d646570656e64656e636965735d0a74656d7066696c65203d202233220a",
+      "blake3": null,
+      "fs_id": "00000000000000860000000000018d07",
+      "last_seen_scan": 1,
+      "deleted_at": null
+    },
+    {
+      "file_id": 2,
+      "path": "/tmp/sagasu-fixtures.WFctGU/corpus/prototypes/proto-crawl/build.rs",
+      "ext": "rs",
+      "size": 300,
+      "mtime_ns": "1787053195857088987",
+      "ctime_ns": "1787054506421128546",
+      "magic": "2f2f20536565202e2e2f6275696c642d636f6d6d6f6e2e727320666f72207768617420746869732061637475616c6c7920646f657320616e6420776879206974277320737472756374757265642074686973207761792e0a696e636c7564652128222e2e2f6275696c642d636f6d6d6f6e2e727322293b0a0a666e206d61696e2829207b0a20202020656d6265645f77696e646f77735f7265736f75726365280a2020202020202020227361676173752070726f746f2d637261776c222c0a2020202020202020227361676173752070726f746f2d637261776c202d20706172616c6c656c2066696c6573797374656d20637261776c207468726f7567687075742070726f746f74797065222c0a2020202020202020226173496e766f6b6572222c0a20202020293b0a7d0a",
+      "blake3": null,
+      "fs_id": "00000000000000860000000000018cf7",
+      "last_seen_scan": 1,
+      "deleted_at": null
+    },
+    {
+      "file_id": 3,
+      "path": "/tmp/sagasu-fixtures.WFctGU/corpus/prototypes/README.md",
+      "ext": "md",
+      "size": 10019,
+      "mtime_ns": "1787053195857088987",
+      "ctime_ns": "1787054506421128546",
+      "magic": "232070726f746f74797065730a0ae68a80e8a193e383aae382b9e382afe381aee9ab98e38184e8a681e7b4a0e38292e5808be588a5e381abe6a49ce8a8bce38199e3828be4bdbfe38184e68da8e381a6e38397e383ade38388e382bfe382a4e38397e7bea4e38082e69cace4bd93e5ae9fe8a385e381a8e381afe78bace7ab8be38197e3819f20436172676f20e383afe383bce382afe382b9e3839ae383bce382b9e38082e38193e38193e381a7e381aee8a888e6b8ace7b590e69e9ce381af20697373756520233728e38399e383b3e38381e59fbae79ba429e381aee79baee6a899e580a4e8a8ade5ae9ae381abe98284e6b581e38199e3828be380820a0a2a2ae6a49ce8a8bce381afe38199e381b9e381a6e6b1bae79d80e6b888e381bf2a2a28e4b88be8a898e3808ce7a2bae8aa8de38197e3819fe38184e4bbaee8aaace3808de58f82e785a729e38082e69cace795aae5ae9fe8a385e381af20606372617465732f7361676173752d636f726560202b20606372617465732f7361676173752d636c696020e381abe38182e3828ae38081e38193e381aee38387e382a3e383ace382afe38388e383aae381af2a2ae5bd93e69982e381aee8a888e6b8ace38292e5868de78fbee38199e3828be3819fe38281e381aee8a898e98cb22a2ae381a8e38197e381a6e6ae8be38197e381a6e38182e3828be38082e38397e3",
+      "blake3": null,
+      "fs_id": "00000000000000860000000000018cf3",
+      "last_seen_scan": 1,
+      "deleted_at": null
+    },
+    {
+      "file_id": 4,
+      "path": "/tmp/sagasu-fixtures.WFctGU/corpus/prototypes/proto-crawl/Cargo.toml",
+      "ext": "toml",
+      "size": 288,
+      "mtime_ns": "1787053195857088987",
+      "ctime_ns": "1787054506421128546",
+      "magic": "5b7061636b6167655d0a6e616d65203d202270726f746f2d637261776c220a76657273696f6e203d2022302e312e30220a65646974696f6e203d202232303231220a0a5b646570656e64656e636965735d0a636c6170203d207b20776f726b7370616365203d2074727565207d0a616e79686f77203d207b20776f726b7370616365203d2074727565207d0a69676e6f7265203d2022302e34220a727573716c697465203d207b2076657273696f6e203d2022302e3332222c206665617475726573203d205b2262756e646c6564225d207d0a626c616b6533203d202231220a0a5b7461726765742e276366672877696e646f777329272e6275696c642d646570656e64656e636965735d0a77696e7265736f75726365203d2022302e31220a",
+      "blake3": null,
+      "fs_id": "00000000000000860000000000018cf6",
+      "last_seen_scan": 1,
+      "deleted_at": null
+    },
+    {
+      "file_id": 5,
+      "path": "/tmp/sagasu-fixtures.WFctGU/corpus/prototypes/proto-gui-core/src/lib.rs",
+      "ext": "rs",
+      "size": 36319,
+      "mtime_ns": "1787053195857088987",
+      "ctime_ns": "1787054506421128546",
+      "magic": "2f2f212070726f746f2d6775692d636f72653a206d6561737572656d656e742d696e737472756d656e74206c69627261727920666f72204d3220696e6372656d656e74616c207365617263682e0a2f2f210a2f2f21205468697320637261746520636f6e7461696e7320414c4c207365617263682f6d657267652f7374617473206c6f67696320616e642069732066756c6c79206275696c6461626c65206f6e0a2f2f21204c696e757820776974686f757420616e79204755492073797374656d206c69627261726965732e20546865205461757269207368656c6c20286070726f746f2d677569602920697320610a2f2f21207468696e2063616c6c657220746861742064656c6567617465732065766572797468696e6720746f20746869732063726174652e0a0a757365207374643a3a636f6c6c656374696f6e733a3a7b486173685365742c2056656344657175657d3b0a757365207374643a3a706174683a3a7b506174682c20506174684275667d3b0a757365207374643a3a73796e633a3a6d7073633b0a757365207374643a3a74696d653a3a7b496e7374616e742c20554e49585f45504f43487d3b0a0a75736520616e79686f773a3a7b6261696c2c20436f6e746578742c20526573756c747d3b0a7573652069676e6f72653a3a57616c6b4275696c6465723b0a7573652073657264653a3a7b4465736572",
+      "blake3": null,
+      "fs_id": "00000000000000860000000000018d09",
+      "last_seen_scan": 1,
+      "deleted_at": null
+    }
+  ],
+  "dropped": [],
+  "snapshot": {
+    "tag_scan_generation": 1,
+    "scan_generation": 1,
+    "built": true,
+    "behind": 0
+  }
+}

@@ -1,0 +1,307 @@
+{
+  "selected": [
+    {
+      "tag": "kind:code",
+      "namespace": "kind",
+      "value": "code"
+    }
+  ],
+  "matched": 66,
+  "corpus": 108,
+  "label": [
+    {
+      "tag": {
+        "tag": "ext:rs",
+        "namespace": "ext",
+        "value": "rs"
+      },
+      "weight": 0.936017651982871,
+      "files": 60,
+      "corpus_files": 60
+    },
+    {
+      "tag": {
+        "tag": "path:src",
+        "namespace": "path",
+        "value": "src"
+      },
+      "weight": 0.8015961183164729,
+      "files": 41,
+      "corpus_files": 41
+    },
+    {
+      "tag": {
+        "tag": "path:crates",
+        "namespace": "path",
+        "value": "crates"
+      },
+      "weight": 0.7787661837595281,
+      "files": 42,
+      "corpus_files": 45
+    },
+    {
+      "tag": {
+        "tag": "path:sagasu",
+        "namespace": "path",
+        "value": "sagasu"
+      },
+      "weight": 0.7787661837595281,
+      "files": 42,
+      "corpus_files": 45
+    },
+    {
+      "tag": {
+        "tag": "format:text",
+        "namespace": "format",
+        "value": "text"
+      },
+      "weight": 0.6978091936657564,
+      "files": 66,
+      "corpus_files": 107
+    }
+  ],
+  "label_vocabulary": 35,
+  "universal": [
+    {
+      "tag": "format:text",
+      "namespace": "format",
+      "value": "text"
+    }
+  ],
+  "axes": [
+    {
+      "namespace": "path",
+      "score": 2.9591499530811483,
+      "coverage": 1.0,
+      "files": 66,
+      "distinct": 28,
+      "values": [
+        {
+          "tag": {
+            "tag": "path:crates",
+            "namespace": "path",
+            "value": "crates"
+          },
+          "files": 42,
+          "share": 0.6363636363636364
+        },
+        {
+          "tag": {
+            "tag": "path:sagasu",
+            "namespace": "path",
+            "value": "sagasu"
+          },
+          "files": 42,
+          "share": 0.6363636363636364
+        },
+        {
+          "tag": {
+            "tag": "path:src",
+            "namespace": "path",
+            "value": "src"
+          },
+          "files": 41,
+          "share": 0.6212121212121212
+        },
+        {
+          "tag": {
+            "tag": "path:core",
+            "namespace": "path",
+            "value": "core"
+          },
+          "files": 30,
+          "share": 0.45454545454545453
+        },
+        {
+          "tag": {
+            "tag": "path:sagasu-core",
+            "namespace": "path",
+            "value": "sagasu-core"
+          },
+          "files": 29,
+          "share": 0.4393939393939394
+        },
+        {
+          "tag": {
+            "tag": "path:prototypes",
+            "namespace": "path",
+            "value": "prototypes"
+          },
+          "files": 15,
+          "share": 0.22727272727272727
+        },
+        {
+          "tag": {
+            "tag": "path:proto",
+            "namespace": "path",
+            "value": "proto"
+          },
+          "files": 14,
+          "share": 0.21212121212121213
+        },
+        {
+          "tag": {
+            "tag": "path:tests",
+            "namespace": "path",
+            "value": "tests"
+          },
+          "files": 12,
+          "share": 0.18181818181818182
+        }
+      ],
+      "tail_assignments": 73
+    },
+    {
+      "namespace": "ext",
+      "score": 0.6441905475931335,
+      "coverage": 1.0,
+      "files": 66,
+      "distinct": 6,
+      "values": [
+        {
+          "tag": {
+            "tag": "ext:rs",
+            "namespace": "ext",
+            "value": "rs"
+          },
+          "files": 60,
+          "share": 0.9090909090909091
+        },
+        {
+          "tag": {
+            "tag": "ext:html",
+            "namespace": "ext",
+            "value": "html"
+          },
+          "files": 2,
+          "share": 0.030303030303030304
+        },
+        {
+          "tag": {
+            "tag": "ext:css",
+            "namespace": "ext",
+            "value": "css"
+          },
+          "files": 1,
+          "share": 0.015151515151515152
+        },
+        {
+          "tag": {
+            "tag": "ext:js",
+            "namespace": "ext",
+            "value": "js"
+          },
+          "files": 1,
+          "share": 0.015151515151515152
+        },
+        {
+          "tag": {
+            "tag": "ext:mjs",
+            "namespace": "ext",
+            "value": "mjs"
+          },
+          "files": 1,
+          "share": 0.015151515151515152
+        },
+        {
+          "tag": {
+            "tag": "ext:sh",
+            "namespace": "ext",
+            "value": "sh"
+          },
+          "files": 1,
+          "share": 0.015151515151515152
+        }
+      ],
+      "tail_assignments": 0
+    }
+  ],
+  "axes_total": 4,
+  "axes_refining": 2,
+  "recommended": {
+    "namespace": "path",
+    "tag": {
+      "tag": "path:core",
+      "namespace": "path",
+      "value": "core"
+    },
+    "files": 30,
+    "share": 0.45454545454545453,
+    "bits": 0.9940302114769565
+  },
+  "preview": [
+    {
+      "file_id": 5,
+      "path": "/tmp/sagasu-fixtures.WFctGU/corpus/prototypes/proto-gui-core/src/lib.rs",
+      "ext": "rs",
+      "size": 36319,
+      "mtime_ns": "1787053195857088987",
+      "ctime_ns": "1787054506421128546",
+      "magic": "2f2f212070726f746f2d6775692d636f72653a206d6561737572656d656e742d696e737472756d656e74206c69627261727920666f72204d3220696e6372656d656e74616c207365617263682e0a2f2f210a2f2f21205468697320637261746520636f6e7461696e7320414c4c207365617263682f6d657267652f7374617473206c6f67696320616e642069732066756c6c79206275696c6461626c65206f6e0a2f2f21204c696e757820776974686f757420616e79204755492073797374656d206c69627261726965732e20546865205461757269207368656c6c20286070726f746f2d677569602920697320610a2f2f21207468696e2063616c6c657220746861742064656c6567617465732065766572797468696e6720746f20746869732063726174652e0a0a757365207374643a3a636f6c6c656374696f6e733a3a7b486173685365742c2056656344657175657d3b0a757365207374643a3a706174683a3a7b506174682c20506174684275667d3b0a757365207374643a3a73796e633a3a6d7073633b0a757365207374643a3a74696d653a3a7b496e7374616e742c20554e49585f45504f43487d3b0a0a75736520616e79686f773a3a7b6261696c2c20436f6e746578742c20526573756c747d3b0a7573652069676e6f72653a3a57616c6b4275696c6465723b0a7573652073657264653a3a7b4465736572",
+      "blake3": null,
+      "fs_id": "00000000000000860000000000018d09",
+      "last_seen_scan": 1,
+      "deleted_at": null
+    },
+    {
+      "file_id": 8,
+      "path": "/tmp/sagasu-fixtures.WFctGU/corpus/prototypes/proto-usn/build.rs",
+      "ext": "rs",
+      "size": 906,
+      "mtime_ns": "1787053195857088987",
+      "ctime_ns": "1787054506425132380",
+      "magic": "2f2f20536565202e2e2f6275696c642d636f6d6d6f6e2e727320666f72207768617420746869732061637475616c6c7920646f657320616e6420776879206974277320737472756374757265642074686973207761792e0a696e636c7564652128222e2e2f6275696c642d636f6d6d6f6e2e727322293b0a0a666e206d61696e2829207b0a202020202f2f2070726f746f2d75736e2773206f6e6c792066756e6374696f6e202d2d20465343544c5f51554552595f55534e5f4a4f55524e414c202f20465343544c5f524541445f55534e5f4a4f55524e414c206f6e0a202020202f2f206120766f6c756d652068616e646c65202d2d2072657175697265732061646d696e6973747261746f722072696768747320756e636f6e646974696f6e616c6c792e205468657265206973206e6f0a202020202f2f20726564756365642d70726976696c656765206d6f6465206f66207468697320746f6f6c20746f2070726573657276652062792073746179696e67206173496e766f6b65723a2065766572792072756e0a202020202f2f20656974686572206861732061646d696e206f72206661696c732061742043726561746546696c65572f446576696365496f436f6e74726f6c2e207265717569726541646d696e6973747261746f720a202020202f2f206c6574732057696e646f777320656c6576617465207669612055",
+      "blake3": null,
+      "fs_id": "00000000000000860000000000018d17",
+      "last_seen_scan": 1,
+      "deleted_at": null
+    },
+    {
+      "file_id": 10,
+      "path": "/tmp/sagasu-fixtures.WFctGU/corpus/prototypes/proto-crawl/src/main.rs",
+      "ext": "rs",
+      "size": 8131,
+      "mtime_ns": "1787053195857088987",
+      "ctime_ns": "1787054506421128546",
+      "magic": "2f2f212070726f746f2d637261776c3a204d3020e381aee9809fe5baa6e383aae382b9e382afe6a49ce8a8bce380820a2f2f21206069676e6f72656020e381aee4b8a6e58897e8b5b0e69fbbe381a7e383a1e382bfe38387e383bce382bf282be4bbbbe6848fe381a720424c414b453329e38292e58f8ee99b86e38197e3808153514c69746520e381abe4b880e68bace68a95e585a5e38199e3828be380820a2f2f2120e8a888e6b8ace5afbee8b1a13a20e8b5b0e69fbbe382b9e383abe383bce38397e38383e38388e38081e3838fe38383e382b7e383a5e381aee382b3e382b9e38388e3808153514c69746520e68a95e585a5e9809fe5baa6e380820a0a757365207374643a3a706174683a3a506174684275663b0a757365207374643a3a73796e633a3a61746f6d69633a3a7b41746f6d69635536342c204f72646572696e677d3b0a757365207374643a3a73796e633a3a7b6d7073632c204172637d3b0a757365207374643a3a74696d653a3a7b496e7374616e742c20554e49585f45504f43487d3b0a0a75736520616e79686f773a3a7b436f6e746578742c20526573756c747d3b0a75736520636c61703a3a5061727365723b0a7573652069676e6f72653a3a7b57616c6b4275696c6465722c2057616c6b53746174657d3b0a75736520727573716c6974653a3a436f6e6e656374696f6e3b0a0a2f2f2f20e6",
+      "blake3": null,
+      "fs_id": "00000000000000860000000000018cf9",
+      "last_seen_scan": 1,
+      "deleted_at": null
+    },
+    {
+      "file_id": 12,
+      "path": "/tmp/sagasu-fixtures.WFctGU/corpus/prototypes/proto-fulltext/build.rs",
+      "ext": "rs",
+      "size": 312,
+      "mtime_ns": "1787053195857088987",
+      "ctime_ns": "1787054506421128546",
+      "magic": "2f2f20536565202e2e2f6275696c642d636f6d6d6f6e2e727320666f72207768617420746869732061637475616c6c7920646f657320616e6420776879206974277320737472756374757265642074686973207761792e0a696e636c7564652128222e2e2f6275696c642d636f6d6d6f6e2e727322293b0a0a666e206d61696e2829207b0a20202020656d6265645f77696e646f77735f7265736f75726365280a2020202020202020227361676173752070726f746f2d66756c6c74657874222c0a2020202020202020227361676173752070726f746f2d66756c6c74657874202d2074616e746976792f4c696e646572612066756c6c2d7465787420696e64657820616e64207365617263682070726f746f74797065222c0a2020202020202020226173496e766f6b6572222c0a20202020293b0a7d0a",
+      "blake3": null,
+      "fs_id": "00000000000000860000000000018d03",
+      "last_seen_scan": 1,
+      "deleted_at": null
+    }
+  ],
+  "dropped": [
+    {
+      "file_id": 2,
+      "path": "/tmp/sagasu-fixtures.WFctGU/corpus/prototypes/proto-crawl/build.rs",
+      "ext": "rs",
+      "size": 300,
+      "mtime_ns": "1787053195857088987",
+      "ctime_ns": "1787054506421128546",
+      "magic": "2f2f20536565202e2e2f6275696c642d636f6d6d6f6e2e727320666f72207768617420746869732061637475616c6c7920646f657320616e6420776879206974277320737472756374757265642074686973207761792e0a696e636c7564652128222e2e2f6275696c642d636f6d6d6f6e2e727322293b0a0a666e206d61696e2829207b0a20202020656d6265645f77696e646f77735f7265736f75726365280a2020202020202020227361676173752070726f746f2d637261776c222c0a2020202020202020227361676173752070726f746f2d637261776c202d20706172616c6c656c2066696c6573797374656d20637261776c207468726f7567687075742070726f746f74797065222c0a2020202020202020226173496e766f6b6572222c0a20202020293b0a7d0a",
+      "blake3": null,
+      "fs_id": "00000000000000860000000000018cf7",
+      "last_seen_scan": 1,
+      "deleted_at": null
+    }
+  ],
+  "snapshot": {
+    "tag_scan_generation": 1,
+    "scan_generation": 1,
+    "built": true,
+    "behind": 0
+  }
+}

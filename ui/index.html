@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sagasu — browse</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="page-head">
+  <div class="title-row">
+    <h1>sagasu <span class="muted">browse</span></h1>
+    <span class="mock-tag" title="step 3 of M4: this page is fed by committed fixtures, not by a backend">mock · fixtures</span>
+  </div>
+  <p id="snapshot" class="snapshot"></p>
+</header>
+
+<main>
+  <!-- The current selection and what it matches. -->
+  <section class="panel" id="selection-panel">
+    <h2>selection</h2>
+    <nav id="crumbs" aria-label="selection"></nav>
+    <p id="counts"></p>
+  </section>
+
+  <!-- The machine-generated name of the group. -->
+  <section class="panel" id="label-panel">
+    <h2>group label</h2>
+    <p id="label" class="group-label"></p>
+  </section>
+
+  <!-- Tags every file in the group carries. Not steps. -->
+  <section class="panel" id="universal-panel">
+    <h2>shared</h2>
+    <p id="universal"></p>
+  </section>
+
+  <!-- The single value worth taking next — deliberately not the top row of
+       the top axis (docs/browse.md §2-1), so it is rendered as its own
+       element, not as another axis row. -->
+  <section class="panel panel-recommended" id="recommended-panel">
+    <h2>recommended next step</h2>
+    <div id="recommended"></div>
+  </section>
+
+  <!-- The ranked axes and their values. -->
+  <section class="panel" id="axes-panel">
+    <h2>axes</h2>
+    <p id="axes-summary"></p>
+    <div id="axes"></div>
+  </section>
+
+  <!-- A few files of the group, existence-checked. -->
+  <section class="panel" id="preview-panel">
+    <h2>files</h2>
+    <p id="preview-summary"></p>
+    <div class="table-scroll">
+      <table id="preview-table">
+        <thead>
+          <tr>
+            <th class="num">id</th>
+            <th>path</th>
+            <th>ext</th>
+            <th class="num">size</th>
+            <th class="num">mtime (ns)</th>
+            <th class="num">ctime (ns)</th>
+            <th class="hex">magic</th>
+            <th class="hex">blake3</th>
+            <th class="hex">fs_id</th>
+          </tr>
+        </thead>
+        <tbody id="preview-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Previewed rows whose paths no longer exist. A UI cannot read stderr,
+       so this is where the staleness is shown instead (sagasu-ui dto docs). -->
+  <section class="panel panel-dropped" id="dropped-panel" hidden>
+    <h2>dropped</h2>
+    <div id="dropped"></div>
+  </section>
+
+  <!-- Holes in the mock, said out loud: a selection with no fixture, or a
+       fixture that could not be loaded. Never an empty result set. -->
+  <section class="panel panel-notice" id="notice-panel" hidden>
+    <div id="notice"></div>
+  </section>
+</main>
+
+<footer class="page-foot">
+  <p>
+    <span class="mono">ui/</span> is the M4 step 3 frontend: static files only, no build step.
+    Every data read happens in <span class="mono">app.js → loadBrowseView()</span>, the single
+    function the step 2 Tauri shell replaces with an <span class="mono">invoke()</span> call.
+    See <span class="mono">ui/README.md</span>.
+  </p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
