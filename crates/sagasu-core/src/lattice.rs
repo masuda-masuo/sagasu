@@ -373,4 +373,125 @@ mod tests {
         assert_eq!(stats.dropped(), 1);
         assert_eq!(stats.longest(), "waytoolongtoken".len());
     }
+
+    /// Evidence test for the upstream lindera fix (lindera PR #872,
+    /// "fix(segmenter): bound sentence length for delimiter-free input",
+    /// merge commit `3dad45330d7a4cf3b585cd5c31f21d4cd82bb1fd`, merged
+    /// 2026-08-08, shipped in lindera >= 5.0.2).
+    ///
+    /// Before the fix, the segmenter treated an entire delimiter-free stretch
+    /// (none of `\n` `\t` `。` `、`) as ONE sentence, so a long katakana run
+    /// tokenized as a single unknown-word token of the run's full byte length —
+    /// far past `MAX_TOKEN_LEN` (65,530), which tantivy silently drops, so the
+    /// document tail vanished from the index. That is the failure mode
+    /// [`bound_lattice_runs`] + [`LongTokenGuard`] exist to mask (issue #52).
+    ///
+    /// This body is 12 units of (30,000 × `ヲ` + `x`) = 1,080,012 bytes,
+    /// delimiter-free and mixed-script. Each 90,000-byte katakana run would
+    /// have come back as one ≥90,000-byte token on lindera 5.0.1, failing the
+    /// assertion below; on >= 5.0.2 the segmenter's internal sentence bound
+    /// caps every emitted token (measured 32,769 bytes max on 5.3.0), so the
+    /// test passes — the regression sentinel that lets the orchestrator later
+    /// decide whether the local mitigation can be retired.
+    ///
+    /// Discriminating power was verified by lock-swap, not asserted: with
+    /// `Cargo.lock` restored to the pre-fix world (`git show HEAD:Cargo.lock`,
+    /// all lindera crates at 5.0.1) this test FAILS, and with the bumped lock
+    /// it passes (2026-08-22). To re-run that check, swap the lockfile the same
+    /// way and use `cargo test --locked`.
+    ///
+    /// The raw path is exercised here: NO [`bound_lattice_runs`] pre-split, just
+    /// the segmenter/tokenizer exactly as lindera hands it to us.
+    #[test]
+    fn upstream_fix_bounds_delimiter_free_run_without_pre_split() {
+        use lindera::dictionary::{load_embedded_dictionary, DictionaryKind};
+        use lindera::mode::Mode;
+        use lindera::segmenter::Segmenter;
+        use lindera_tantivy::tokenizer::LinderaTokenizer;
+        use tantivy::tokenizer::{MAX_TOKEN_LEN, Tokenizer};
+
+        // 30,000 katakana chars (90,000 bytes) per run — well past MAX_TOKEN_LEN
+        // as a single unknown-word token — joined by a single ASCII `x` for the
+        // mixed-script shape. No sentence delimiters anywhere.
+        let unit = format!("{}x", "ヲ".repeat(30_000));
+        let body: String = unit.repeat(12);
+        assert!(
+            body.len() >= 1_000_000,
+            "constructed body unexpectedly small: {} bytes",
+            body.len()
+        );
+        assert!(
+            !body.contains(['\n', '\t', '。', '、']),
+            "body must stay delimiter-free to reproduce the unbounded-sentence shape"
+        );
+
+        let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC)
+            .expect("embedded IPADIC dictionary must load");
+        let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
+        let mut tokenizer = LinderaTokenizer::from_segmenter(segmenter);
+
+        // Raw lindera path: no `bound_lattice_runs` pre-split.
+        let mut stream = tokenizer.token_stream(&body);
+        let mut longest = 0usize;
+        while stream.advance() {
+            let len = stream.token().text.len();
+            assert!(
+                len < MAX_TOKEN_LEN,
+                "lindera emitted a {len}-byte token (>= MAX_TOKEN_LEN {MAX_TOKEN_LEN}); \
+                 the upstream sentence bound is not in effect"
+            );
+            longest = longest.max(len);
+        }
+        assert!(longest > 0, "expected at least one token from the body");
+    }
+
+    /// The local mitigation stays wired and the guard stays quiet on the SAME
+    /// input: after [`bound_lattice_runs`] pre-splits the body, the production
+    /// analyzer (LinderaTokenizer + LowerCaser + [`LongTokenGuard`]) must drop
+    /// zero tokens. This holds both before and after the upstream fix, and it
+    /// confirms the guard is still *counting* (drops == 0) rather than having
+    /// gone silently dormant.
+    #[test]
+    fn production_path_guard_stays_quiet_with_pre_split() {
+        use lindera::dictionary::{load_embedded_dictionary, DictionaryKind};
+        use lindera::mode::Mode;
+        use lindera::segmenter::Segmenter;
+        use lindera_tantivy::tokenizer::LinderaTokenizer;
+        use tantivy::tokenizer::{LowerCaser, MAX_TOKEN_LEN, TextAnalyzer};
+
+        let unit = "あいうえおabcde";
+        let repeats = 1_048_576 / unit.len();
+        let body: String = std::iter::repeat(unit).take(repeats).collect();
+
+        // The exact production pre-split (issue #52 mitigation, unchanged).
+        let bounded = match bound_lattice_runs(&body, MAX_LATTICE_RUN_BYTES) {
+            Some((b, _)) => b,
+            None => body.clone(),
+        };
+        assert_ne!(
+            bounded.len(),
+            body.len(),
+            "the pre-split should have introduced breaks in this delimiter-free body"
+        );
+
+        let stats = Arc::new(TokenStats::default());
+        let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC)
+            .expect("embedded IPADIC dictionary must load");
+        let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
+        let mut analyzer = TextAnalyzer::builder(LinderaTokenizer::from_segmenter(segmenter))
+            .filter(LowerCaser)
+            .filter(LongTokenGuard::new(MAX_TOKEN_LEN, Arc::clone(&stats)))
+            .build();
+
+        let mut stream = analyzer.token_stream(&bounded);
+        while stream.advance() {}
+
+        assert_eq!(
+            stats.dropped(),
+            0,
+            "LongTokenGuard dropped {} tokens on the bounded body; \
+             the mitigation must keep it at zero",
+            stats.dropped()
+        );
+    }
 }
