@@ -938,7 +938,7 @@ POSIX シェルクォートを掛ける。`TOKEN_SEPARATORS` に空白が入っ�
 | M1 | tantivy + Lindera 全文索引 | 索引構築速度・クエリ速度・日本語精度 — issue #2 で実装済み |
 | M2 | 検索時差分マージ(USN / mtime フォールバック) | 鮮度透過化の成立(コア価値) — §5-1 で実装済み |
 | M3 | ルールタグ + ファセットドリルダウン CLI | 「意味から探せる」体験の成立 — タグは §6-1(issue #4)、ドリルダウンは §6-3(issue #5)で実装済み |
-| M4 | Tauri UI | 可視化・ドリルダウン UI — **3 step に分割**(下記)。step 1 は issue #68 で実装済み、step 2/3 は未着手 |
+| M4 | Tauri UI | 可視化・ドリルダウン UI — **3 step に分割**(下記)。step 1 は issue #68 で実装済み、step 3 は issue #72(`ui/`)で実装済み、残るのは step 2 のみ |
 
 **M0〜M3 は実装済みで、残るは M4 のみ**(2026-08-09 時点)。設計の最大リスク
 (速度と鮮度)は M0〜M2 の実測で消えている。CLI は 9 サブコマンドで、体系の正本は
@@ -952,7 +952,7 @@ Linux サンドボックス(実装・検証の常用環境)ではビルドすら
 |---|---|---|
 | 1 | ヘッドレス UI バックエンド `crates/sagasu-ui` — webview 境界の DTO(`Serialize` はここに置き、コアの型には生やさない: `docs/cli.md` §8)、preview 行の存在確認、`browse_view(&Store, &BrowseQueryDto) -> BrowseViewDto` | 通常の `cargo test`(全プラットフォーム) — issue #68 で実装済み |
 | 2 | Tauri シェル `src-tauri` — step 1 の関数を `#[tauri::command]` で包むだけ | **Windows 実機 / Windows CI**(Linux サンドボックス不可) |
-| 3 | フロントエンド(HTML/JS) | 同上 |
+| 3 | フロントエンド(HTML/JS) — issue #72 で実装済み(`ui/`) | 同上 |
 
 狙いは step 2 を**ロジックの無い薄い包み**に留めること。判断(DTO の形、存在確認、
 既定値、エラー文言)が全部 step 1 にあれば、日常的に検証できない層に残るのは配線

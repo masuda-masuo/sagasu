@@ -6,11 +6,11 @@
 
 ## 状態
 
-PoC 段階。M0〜M3 は実装済み(並列クロール + SQLite メタデータ索引 / tantivy + Lindera 全文索引 / 検索時差分マージ / ルールタグ + ファセットドリルダウン)。PDF・Office の本文抽出と埋め込みメタデータタグ、機械可読出力 `--json`、`sagasu.toml` への設定統合も入っている。M4 の Tauri UI は未着手。[docs/design.md](docs/design.md) が設計の正本。
+PoC 段階。M0〜M3 は実装済み(並列クロール + SQLite メタデータ索引 / tantivy + Lindera 全文索引 / 検索時差分マージ / ルールタグ + ファセットドリルダウン)。PDF・Office の本文抽出と埋め込みメタデータタグ、機械可読出力 `--json`、`sagasu.toml` への設定統合も入っている。M4 は 3 step に分割し、step 1(`crates/sagasu-ui` ヘッドレス UI バックエンド)と step 3(`ui/` 静的ブラウズ画面)は実装済み。残るのは step 2 の Tauri シェルのみ。[docs/design.md](docs/design.md) が設計の正本。
 
 ## 使い方
 
-ワークスペースは `crates/sagasu-core`(ロジック)と `crates/sagasu-cli`(バイナリ `sagasu`)の2クレート。
+ワークスペースは `crates/sagasu-core`(ロジック)、`crates/sagasu-cli`(バイナリ `sagasu`)、`crates/sagasu-ui`(UI バックエンド: DTO と `browse_view`)の 3 クレート。
 
 ```sh
 cargo build --workspace --release
@@ -43,6 +43,7 @@ cargo build --workspace --release
 | [docs/index_scope.md](docs/index_scope.md) | 何を索引し何を除外するか(既定の除外規則、本文抽出の対象判定) |
 | [docs/tag_rules.md](docs/tag_rules.md) | タグの名前空間とユーザー定義ルール |
 | [docs/browse.md](docs/browse.md) | ファセットドリルダウンの式・実測・到達シナリオ |
+| [ui/README.md](ui/README.md) | step 3 静的ブラウズ画面の開き方とフィクスチャ再生成手順 |
 | [docs/schema_v0.md](docs/schema_v0.md) | SQLite スキーマ v0 |
 | [bench/README.md](bench/README.md) | 計測ハーネス(合成ツリー生成 + 外形計測) |
 
