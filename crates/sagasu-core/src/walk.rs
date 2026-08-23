@@ -92,6 +92,27 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".cargo", // see special-case logic below
 ];
 
+/// Directory basenames excluded by default on this platform **only** (issue #75).
+///
+/// On Windows `AppData` is a 44%-of-the-corpus directory of machine-generated
+/// shadow copies: a crawl that indexes it drowns the user's real documents, and
+/// the delta/query side replays the same shadowing, so `find Database` ranks
+/// the real `OneDrive/…/Database.kdbx` 20th of 20, below 19 `AppData/…` rows.
+/// The cross-platform list above is build artefacts and caches and stays as it
+/// is; this is a second, platform-conditional list, mirroring how
+/// [`DEFAULT_PREFIX_EXCLUDES`] is already `cfg`-split per OS.
+///
+/// Scoping is the whole `AppData` tree, not the three sub-paths named in the
+/// issue (`AppData\Local\Packages`, `…\EBWebView`, `…\Windows\Recent`): the
+/// measurement says the noise is the whole tree, and the rare user who wants it
+/// back has the single-name opt-out (`--no-exclude AppData`) instead of having
+/// to re-add the whole list by hand. On every target other than Windows this is
+/// empty, so the default set is byte-for-byte unchanged off Windows.
+#[cfg(windows)]
+pub const PLATFORM_DEFAULT_EXCLUDES: &[&str] = &["AppData"];
+#[cfg(not(windows))]
+pub const PLATFORM_DEFAULT_EXCLUDES: &[&str] = &[];
+
 /// Absolute path prefixes the walker must **not descend into**, by default.
 ///
 /// These are the pseudo-filesystems, and only them. Walking `/proc` / `/sys` /
@@ -250,6 +271,19 @@ pub struct ExcludeSet {
     /// under them (issue #43).
     prefixes: Vec<String>,
     no_default: bool,
+    /// Whether [`ExcludeSet::encode`] writes every effective directory name out
+    /// explicitly as a `name=` line (issue #75).
+    ///
+    /// `true` for any set this build assembles — the crawl's own decision, after
+    /// `DEFAULT_EXCLUDES` + `PLATFORM_DEFAULT_EXCLUDES` + `--exclude` −
+    /// `--no-exclude` have been composed — so a later query replays the *very
+    /// same* set and never has to consult what this build's defaults happened to
+    /// be. `false` for a set decoded from an older policy that did not carry its
+    /// names: there `encode` must reproduce the *old* `v2` shape (no `name=`
+    /// lines) so the round trip is byte-exact, and the names are reconstructed
+    /// from `defaults=` instead. See the decode contract for why an old policy
+    /// must not gain this build's platform-conditional names.
+    explicit_names: bool,
     hidden: HiddenPolicy,
     /// Compiled root `.gitignore`, when the crawl opted into reading one.
     /// `Arc` because [`ExcludeSet`] is cloned once per walker thread.
@@ -277,31 +311,66 @@ pub struct ExcludeSet {
     gitignore_digest: Option<String>,
 }
 
+/// Compose the effective directory-name exclusion list in one place, so the
+/// crawl, the CLI and the tests cannot disagree about it (issue #75).
+///
+/// `defaults` is the platform-composed built-in list (`DEFAULT_EXCLUDES` ++
+/// `PLATFORM_DEFAULT_EXCLUDES`); `no_exclude` drops names from it (case-insensitive),
+/// and `extra` appends the user's `--exclude` additions (deduplicated, also
+/// case-insensitive, matching every other name comparison in the module). Keeping
+/// this the single composition point is what makes the `--no-exclude` opt-out and
+/// the Windows `AppData` default agree with the persisted policy by construction.
+fn compose_names(defaults: &[&str], extra: &[String], no_exclude: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = defaults.iter().map(|s| (*s).to_string()).collect();
+    names.retain(|n| !no_exclude.iter().any(|d| d.eq_ignore_ascii_case(n)));
+    for e in extra {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(e)) {
+            names.push(e.clone());
+        }
+    }
+    names
+}
+
 impl ExcludeSet {
     /// Build the set from the built-in list plus `extra`. `no_default` drops the
     /// built-in list **and** the default prefixes, leaving only `extra` and
     /// whatever [`ExcludeSet::with_prefixes`] adds.
+    ///
+    /// The effective name list is composed in one place — [`compose_names`] —
+    /// from `DEFAULT_EXCLUDES` (cross-platform build artefacts/caches),
+    /// `PLATFORM_DEFAULT_EXCLUDES` (this OS's extra defaults, e.g. Windows
+    /// `AppData`), the user's `--exclude` additions in `extra`, and the
+    /// `--no-exclude` drops — so the crawl, the CLI and the tests all agree by
+    /// construction. See [`ExcludeSet::with_no_excludes`].
     pub fn new(extra: &[String], no_default: bool) -> Self {
-        let mut names: Vec<String> = if no_default {
-            Vec::new()
+        // `--no-default-excludes` drops the built-in name list **and** the
+        // default path prefixes, but the caller-supplied `--exclude` names must
+        // survive: they are the user's own additions, not part of the defaults,
+        // so they stay excluded (issue #75 rework 1). This matches the pre-#75
+        // behaviour, where the `for e in extra` loop appended the user's names
+        // to `names` in *both* the `no_default` and the default branches — under
+        // `--no-default-excludes` the built-in names were gone but the user's
+        // `--exclude` names were not.
+        let (names, prefixes, extra) = if no_default {
+            (extra.to_vec(), Vec::new(), extra.to_vec())
         } else {
-            DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect()
-        };
-        for e in extra {
-            if !names.iter().any(|n| n.eq_ignore_ascii_case(e)) {
-                names.push(e.clone());
+            let mut defaults: Vec<&str> = DEFAULT_EXCLUDES.to_vec();
+            for p in PLATFORM_DEFAULT_EXCLUDES {
+                defaults.push(p);
             }
-        }
-        let prefixes: Vec<String> = if no_default {
-            Vec::new()
-        } else {
-            DEFAULT_PREFIX_EXCLUDES.iter().map(|s| s.to_string()).collect()
+            let names = compose_names(&defaults, extra, &[]);
+            let prefixes: Vec<String> = DEFAULT_PREFIX_EXCLUDES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            (names, prefixes, extra.to_vec())
         };
         Self {
             names,
-            extra: extra.to_vec(),
+            extra,
             prefixes,
             no_default,
+            explicit_names: true,
             hidden: HiddenPolicy::default(),
             gitignore: None,
             gitignore_lines: Vec::new(),
@@ -344,6 +413,39 @@ impl ExcludeSet {
     pub fn with_hidden(mut self, hidden: HiddenPolicy) -> Self {
         self.hidden = hidden;
         self
+    }
+
+    /// Drop one (or more) default-excluded directory basenames from this set,
+    /// case-insensitive like every other name comparison here (issue #75).
+    ///
+    /// This is the single-name opt-out: `--no-exclude AppData` re-indexes a
+    /// user's `AppData` while the rest of the defaults (`node_modules`, `.git`,
+    /// …) stay in force — unlike `--no-default-excludes`, which drops the whole
+    /// list. The name is removed from the effective set, so [`ExcludeSet::encode`]
+    /// carries the smaller result explicitly and a later query replays the same
+    /// set; the crawl side and the delta/query side never diverge.
+    ///
+    /// A name given to both `--exclude` and `--no-exclude` is a contradiction.
+    /// A silent winner would be worse than a refusal (one flag would quietly
+    /// undo the other, and the user would not know which won), so it is
+    /// reported as an error here, before anything is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the name when it is both added (`--exclude`) and
+    /// dropped (`--no-exclude`). A name that matches no default and no `--exclude`
+    /// is simply a no-op: it was not excluded to begin with.
+    pub fn with_no_excludes(mut self, no_exclude: &[String]) -> Result<Self> {
+        for drop in no_exclude {
+            if self.extra.iter().any(|e| e.eq_ignore_ascii_case(drop)) {
+                bail!(
+                    "exclude name {drop:?} is given to both --exclude and --no-exclude. \
+                     A name cannot be both added to and dropped from the default set."
+                );
+            }
+            self.names.retain(|n| !n.eq_ignore_ascii_case(drop));
+        }
+        Ok(self)
     }
 
     /// Reject anything that cannot survive [`ExcludeSet::encode`].
@@ -645,10 +747,11 @@ impl ExcludeSet {
     /// the rules it was built with; a search must not depend on a file that may
     /// have been edited, deleted or broken since.
     pub fn encode(&self) -> String {
-        // v2 carries `prefix=` (issue #43). The bump is what this type's own
-        // decode contract promises for "a release that adds a rule to the
-        // policy": an older binary meeting v2 then fails with "written by a
-        // newer sagasu" instead of the less legible "unknown key prefix".
+        // v2 carries `prefix=` (issue #43) and, since issue #75, `name=`. The
+        // bump is what this type's own decode contract promises for "a release
+        // that adds a rule to the policy": an older binary meeting a `name=`
+        // key it does not understand fails here **on purpose** with "written by
+        // a newer sagasu" rather than silently applying a different set.
         let mut out = String::from("v2\n");
         out.push_str(&format!("defaults={}\n", u8::from(!self.no_default)));
         out.push_str(&format!("hidden={}\n", self.hidden.as_str()));
@@ -675,6 +778,21 @@ impl ExcludeSet {
             out.push_str(prefix);
             out.push('\n');
         }
+        // Every effective directory *name*, defaults included, written out
+        // explicitly (issue #75) — exactly as prefixes already are. A reader
+        // must not need to know what this build's defaults happened to be:
+        // an `AppData` added to the Windows default must not retroactively
+        // change what an already-built index replays on the delta/query side.
+        // `defaults=` above is readability only; when `explicit_names` is
+        // false (a set decoded from an older policy) no `name=` line is
+        // written, so the round trip reproduces the old `v2` text byte-for-byte.
+        if self.explicit_names {
+            for name in &self.names {
+                out.push_str("name=");
+                out.push_str(name);
+                out.push('\n');
+            }
+        }
         out
     }
 
@@ -700,7 +818,10 @@ impl ExcludeSet {
             // empty prefix list, and this build's *new* defaults are
             // deliberately not injected: that index was crawled without them,
             // and a delta query has to replay the set the crawl actually used,
-            // not the set this build would choose today.
+            // not the set this build would choose today. v2 may additionally
+            // carry `name=` lines (issue #75); when it does not, the set is
+            // reconstructed from the cross-platform `DEFAULT_EXCLUDES` so an older
+            // index keeps its exact original meaning, never this build's defaults.
             Some("v1") | Some("v2") => {}
             other => bail!(
                 "unsupported exclusion policy format {other:?} — this index was written by a \
@@ -715,6 +836,8 @@ impl ExcludeSet {
         let mut gitignore_lines: Vec<String> = Vec::new();
         let mut extra: Vec<String> = Vec::new();
         let mut prefixes: Vec<String> = Vec::new();
+        let mut explicit_names: Vec<String> = Vec::new();
+        let mut saw_name = false;
 
         for line in lines {
             if line.is_empty() {
@@ -737,6 +860,10 @@ impl ExcludeSet {
                 }
                 "extra" => extra.push(value.to_string()),
                 "prefix" => prefixes.push(value.to_string()),
+                "name" => {
+                    saw_name = true;
+                    explicit_names.push(value.to_string());
+                }
                 other => bail!(
                     "unknown exclusion policy key {other:?} — this index was written by a \
                      newer sagasu. Re-run `sagasu index <root>` with this build, or upgrade."
@@ -744,7 +871,37 @@ impl ExcludeSet {
             }
         }
 
-        let mut set = Self::new(&extra, no_default).with_hidden(hidden);
+        // A policy that carries its names explicitly (this build, issue #75) is
+        // rebuilt from those names alone — never from this build's defaults, which
+        // would silently change what an already-built index replays. An older
+        // policy (written before names were explicit) keeps its old meaning: it
+        // decodes to the cross-platform default set it was crawled with, plus its
+        // `extra` additions, and must NOT gain the platform-conditional names this
+        // build adds (e.g. Windows `AppData`) — that index was crawled without
+        // them. The `defaults=` line is readability only and is never an input to
+        // reconstruction when names are explicit.
+        let (names, explicit) = if saw_name {
+            (explicit_names, true)
+        } else {
+            let base: Vec<&str> = if no_default {
+                Vec::new()
+            } else {
+                DEFAULT_EXCLUDES.to_vec()
+            };
+            (compose_names(&base, &extra, &[]), false)
+        };
+
+        let mut set = Self {
+            names,
+            extra: extra.to_vec(),
+            prefixes: Vec::new(),
+            no_default,
+            explicit_names: explicit,
+            hidden,
+            gitignore: None,
+            gitignore_lines: Vec::new(),
+            gitignore_digest: None,
+        };
         // The stored prefix lines are the whole story about prefixes. In
         // particular, a `v1` policy written before prefixes existed decodes
         // with an **empty** list: the crawl it describes did not prune `/proc`,
@@ -830,8 +987,14 @@ fn prefix_matches_with_case(path: &Path, prefix: &str, fold_case: bool) -> bool 
             a == b
         }
     };
-    let path_comps: Vec<&str> = path_s.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
-    let prefix_comps: Vec<&str> = prefix_s.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
+    let path_comps: Vec<&str> = path_s
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty())
+        .collect();
+    let prefix_comps: Vec<&str> = prefix_s
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty())
+        .collect();
     prefix_comps.len() <= path_comps.len()
         && path_comps[..prefix_comps.len()]
             .iter()
@@ -1716,6 +1879,189 @@ mod tests {
     }
 }
 
+// ── issue #75: names carried explicitly, the Windows default, the single-name opt-out ──
+
+#[cfg(test)]
+mod issue75_tests {
+    use super::*;
+
+    #[test]
+    fn policy_round_trips_defaults_only() {
+        let original = ExcludeSet::new(&[], false);
+        let decoded = ExcludeSet::decode(&original.encode()).unwrap();
+        assert_eq!(decoded.names(), original.names());
+        assert!(decoded.encode() == original.encode());
+    }
+
+    #[test]
+    fn policy_round_trips_with_extra_excludes() {
+        let original = ExcludeSet::new(&["scratch".to_string(), "tmp".to_string()], false);
+        let decoded = ExcludeSet::decode(&original.encode()).unwrap();
+        assert_eq!(decoded.names(), original.names());
+        assert!(decoded.contains("scratch"));
+        assert!(decoded.contains("tmp"));
+    }
+
+    #[test]
+    fn policy_round_trips_with_a_dropped_default() {
+        let original = ExcludeSet::new(&[], false)
+            .with_no_excludes(&["node_modules".to_string()])
+            .unwrap();
+        assert!(!original.contains("node_modules"));
+        assert!(original.contains("target"));
+        let decoded = ExcludeSet::decode(&original.encode()).unwrap();
+        // Reconstructs from the written names, not this build's defaults.
+        assert_eq!(decoded.names(), original.names());
+        assert!(!decoded.contains("node_modules"));
+        assert!(decoded.contains("target"));
+        assert!(decoded.encode() == original.encode());
+    }
+
+    #[test]
+    fn policy_round_trips_with_no_default_excludes() {
+        let original = ExcludeSet::new(&[], true);
+        assert!(original.names().is_empty());
+        let decoded = ExcludeSet::decode(&original.encode()).unwrap();
+        assert_eq!(decoded.names(), original.names());
+        assert!(decoded.encode() == original.encode());
+    }
+
+    #[test]
+    fn no_default_excludes_keeps_the_users_own_exclude_name() {
+        // `--no-default-excludes` drops only the built-in names and the default
+        // prefixes; a name the caller added with `--exclude` must still be
+        // excluded and must survive the policy round trip (issue #75 rework 1).
+        let original = ExcludeSet::new(&["build".to_string()], true);
+        // The user's name is present and there are no built-in names.
+        assert!(original.contains("build"));
+        assert_eq!(original.names().len(), 1, "only the user's name survives");
+        assert!(original.prefixes().is_empty(), "default prefixes dropped");
+        // It is also recorded as an `extra=` line so encode emits it.
+        let encoded = original.encode();
+        assert!(
+            encoded.contains("extra=build\n"),
+            "extra= line must be written"
+        );
+        assert!(
+            encoded.contains("name=build\n"),
+            "name= line must be written"
+        );
+        assert!(!encoded.contains("defaults=1\n"), "defaults must be 0");
+
+        let decoded = ExcludeSet::decode(&encoded).unwrap();
+        assert_eq!(decoded.names(), original.names());
+        assert!(decoded.contains("build"));
+        // The `extra=` line is replayed too: the persisted policy carries the
+        // user's name as an extra, so a later `--no-default-excludes` + `--exclude`
+        // policy is not silently narrowed.
+        assert!(
+            decoded.encode().contains("extra=build\n"),
+            "decoded policy must still carry extra=build"
+        );
+        assert!(decoded.encode() == encoded);
+    }
+
+    #[test]
+    fn old_v2_policy_with_defaults_zero_and_extra_decodes_to_single_name() {
+        // An old-format (pre-#75-explicit-names) policy that carries
+        // `defaults=0` plus `extra=build` must decode to exactly {build} and
+        // nothing else — the user's name survives, no built-in sneaks in.
+        let encoded = "v2\ndefaults=0\nhidden=include\ngitignore=0\nextra=build\n";
+        let set = ExcludeSet::decode(encoded).unwrap();
+        assert!(set.contains("build"));
+        assert_eq!(set.names().len(), 1, "only the user's name");
+        assert!(
+            set.names().iter().any(|n| n.eq_ignore_ascii_case("build")),
+            "the user's extra name is the only name"
+        );
+        // No default ever creeps back in.
+        assert!(!set.contains("node_modules"));
+    }
+
+    #[test]
+    fn an_old_v2_policy_decodes_to_the_cross_platform_defaults() {
+        // A policy written before names were made explicit (issue #75). It must
+        // decode to the cross-platform default set it was crawled with — NOT to
+        // whatever this build would choose today, which on Windows would add
+        // AppData that the original crawl never excluded.
+        let encoded = "v2\ndefaults=1\nhidden=include\ngitignore=0\n";
+        let set = ExcludeSet::decode(encoded).unwrap();
+        let expected: Vec<String> = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(set.names().to_vec(), expected);
+        // The single most important property: an old policy must not gain AppData.
+        assert!(
+            !set.contains("AppData"),
+            "an old policy must not gain AppData on Windows"
+        );
+    }
+
+    #[test]
+    fn exclude_and_no_exclude_the_same_name_is_an_error() {
+        let err = ExcludeSet::new(&["build".to_string()], false)
+            .with_no_excludes(&["build".to_string()])
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("both --exclude and --no-exclude"), "{msg}");
+    }
+
+    #[test]
+    fn exclude_and_no_exclude_conflict_still_errors_with_no_default() {
+        // The conflict is checked against the caller-supplied `extra` names, not
+        // the built-ins. Under `--no-default-excludes` the built-in list is gone
+        // but `extra` must survive, so the same name given to both flags is
+        // still a contradiction and must still be rejected (issue #75 rework 1).
+        let err = ExcludeSet::new(&["build".to_string()], true)
+            .with_no_excludes(&["build".to_string()])
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("both --exclude and --no-exclude"), "{msg}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn appdata_is_in_the_default_windows_set() {
+        let set = ExcludeSet::new(&[], false);
+        assert!(
+            set.contains("AppData"),
+            "Windows default must exclude AppData"
+        );
+        assert!(
+            set.names()
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("AppData")),
+            "AppData must travel as its own name"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn appdata_is_not_in_the_default_set_off_windows() {
+        // Off Windows the default set is unchanged (issue #75).
+        let set = ExcludeSet::new(&[], false);
+        assert!(
+            !set.contains("AppData"),
+            "off Windows the default set is unchanged"
+        );
+        let expected: Vec<String> = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(set.names().to_vec(), expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_exclude_appdata_reindexes_it_while_others_stay() {
+        let set = ExcludeSet::new(&[], false)
+            .with_no_excludes(&["AppData".to_string()])
+            .unwrap();
+        assert!(
+            !set.contains("AppData"),
+            "AppData opt-out must re-include it"
+        );
+        assert!(set.contains("node_modules"), "other defaults must stay");
+        let decoded = ExcludeSet::decode(&set.encode()).unwrap();
+        assert_eq!(decoded.names(), set.names());
+    }
+}
+
 #[cfg(test)]
 mod scope_tests {
     use super::*;
@@ -2016,7 +2362,10 @@ mod prefix_tests {
 
         // The Windows extended-length spelling relates to the plain one, the
         // same way `relative_slash_path` reconciles the two.
-        assert!(m(r"\\?\C:\Windows\System32\drivers\etc\hosts", r"C:\Windows"));
+        assert!(m(
+            r"\\?\C:\Windows\System32\drivers\etc\hosts",
+            r"C:\Windows"
+        ));
         assert!(m(r"C:\Windows\System32", r"\\?\C:\Windows"));
         assert!(!m(r"C:\Windows2\x", r"C:\Windows"));
     }
@@ -2026,9 +2375,21 @@ mod prefix_tests {
         // The comparison core is exercised on any host with the fold flag set
         // explicitly, even though only Windows passes `true` (the same split
         // `delta::path_under` makes).
-        assert!(prefix_matches_with_case(Path::new("/PROC/SELF/status"), "/proc", true));
-        assert!(!prefix_matches_with_case(Path::new("/PROC/SELF/status"), "/proc", false));
-        assert!(prefix_matches_with_case(Path::new(r"C:\WINDOWS\System32"), r"c:\windows", true));
+        assert!(prefix_matches_with_case(
+            Path::new("/PROC/SELF/status"),
+            "/proc",
+            true
+        ));
+        assert!(!prefix_matches_with_case(
+            Path::new("/PROC/SELF/status"),
+            "/proc",
+            false
+        ));
+        assert!(prefix_matches_with_case(
+            Path::new(r"C:\WINDOWS\System32"),
+            r"c:\windows",
+            true
+        ));
     }
 
     // ── Defaults: pseudo-filesystems only, never OS directories ──────────────
@@ -2092,10 +2453,20 @@ mod prefix_tests {
         // would make the delta side scan a different set than the crawl did —
         // the exact inconsistency the encoding exists to prevent.
         let set = ExcludeSet::decode("v1\ndefaults=1\nhidden=include\ngitignore=0\n").unwrap();
-        assert!(set.prefixes().is_empty(), "v1 must decode prefix-free: {:?}", set.prefixes());
+        assert!(
+            set.prefixes().is_empty(),
+            "v1 must decode prefix-free: {:?}",
+            set.prefixes()
+        );
         // The new defaults must not leak in through the back door either.
-        assert_eq!(set.reason_for_path(Path::new("/proc/self/status"), Path::new("/")), None);
-        assert_eq!(set.reason_for_path(Path::new("/sys/kernel/osrelease"), Path::new("/")), None);
+        assert_eq!(
+            set.reason_for_path(Path::new("/proc/self/status"), Path::new("/")),
+            None
+        );
+        assert_eq!(
+            set.reason_for_path(Path::new("/sys/kernel/osrelease"), Path::new("/")),
+            None
+        );
         // What `v1` meant, it still means.
         assert!(set.contains("node_modules"));
         assert_eq!(set.hidden_policy(), HiddenPolicy::Include);
@@ -2118,15 +2489,18 @@ mod prefix_tests {
         let encoded = original.encode();
         assert!(encoded.starts_with("v2\n"), "{encoded}");
         for default in DEFAULT_PREFIX_EXCLUDES {
-            assert!(encoded.contains(&format!("prefix={default}\n")), "{encoded}");
+            assert!(
+                encoded.contains(&format!("prefix={default}\n")),
+                "{encoded}"
+            );
         }
         let decoded = ExcludeSet::decode(&encoded).unwrap();
         assert_eq!(decoded.prefixes(), original.prefixes());
         assert_eq!(decoded.encode(), encoded);
 
         // A user prefix rides along and survives the round trip unchanged.
-        let with_user = ExcludeSet::new(&[], false)
-            .with_prefixes(&["/var/lib/telemetry".to_string()]);
+        let with_user =
+            ExcludeSet::new(&[], false).with_prefixes(&["/var/lib/telemetry".to_string()]);
         let decoded = ExcludeSet::decode(&with_user.encode()).unwrap();
         assert_eq!(decoded.prefixes(), with_user.prefixes());
         assert_eq!(decoded.encode(), with_user.encode());
@@ -2161,7 +2535,9 @@ mod prefix_tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("absolute"), "{err:#}");
         // The name list is untouched by all of this.
-        assert!(ExcludeSet::new(&["build".to_string()], false).validate().is_ok());
+        assert!(ExcludeSet::new(&["build".to_string()], false)
+            .validate()
+            .is_ok());
         // "Absolute" is platform-defined: `/tmp/ok` has no prefix on Windows,
         // so `Path::is_absolute` is false there and `validate()` would refuse
         // it for the same reason it refuses `tmp/proc`. Ask each platform for

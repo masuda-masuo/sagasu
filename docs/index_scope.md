@@ -57,6 +57,20 @@ node_modules  target  __pycache__  .git  .hg  .svn  .venv  venv  .cache  .npm
 は開発者のマシンで意味のあるテキストが実際に置かれている場所であって、
 「隠す」ためのものではない。
 
+### 1-2-2. プラットフォーム固有の既定名 (Windows: AppData) と単一名の除外 (issue #75)
+
+Windows では `AppData` も既定で除外する。実測(2026-08-22, `C:\Users\absol` で 369,109 件中):
+`AppData` 単体で 162,509 件(44 %)。ユーザーの実ドキュメントは約 440 件(0.1 %)で、
+`find Database` は本来の `OneDrive/…/Database.kdbx` を 20 件中 20 番目に下げ、19 件の
+`AppData/…/EBWebView/…` の下に隠した。このノイズは木全体なので、決め打ちは
+`AppData/Local/Packages` 等の 3 サブパスではなく **`AppData` 全体**へのスコープとする。
+Linux / macOS ではこのリストは空であり、既定セットは変わらない。
+
+`--exclude` と同じく大文字小文字を無視する単一名の除外も追加した:
+`--no-exclude AppData` は `AppData` だけを索引に戻し、他の既定 (`node_modules` `.git` …) は
+そのまま残る。`--no-exclude` と `--exclude` に同じ名前を両方渡すと、どちらが勝つか分からない
+のでエラーにする。`--no-default-excludes` がリスト全体を落とすのに対し、これは「1 つだけ外す」ためのもの。
+
 ### 1-2-1. パス接頭辞: 擬似ファイルシステムには降りない (issue #43)
 
 名前ルールは**フィルタ** — 除外ディレクトリの中まで歩いて、ファイルごとに数える。
@@ -78,7 +92,7 @@ Linux の既定は擬似ファイルシステムだけ:
 **Windows / macOS の OS ディレクトリは既定で除外しない**(`C:\Windows`、
 `Program Files`、`Library/Caches`)。`C:\Windows` には 175k 件の普通のファイルがあり、
 ドライバ INF やサービス設定を探している人には検索対象そのもの。実測コストは 16 秒。
-この issue が Windows / macOS に提供するのは**仕組み**であって政策ではない:
+この issue が Windows / macOS に提供するのは**仕組み**であって政策ではない。ただし Windows に限り、issue #75 (§1-2-2) で `AppData` という**名前の政策**を既定で追加した。`C:\Windows` 等の OS ディレクトリを既定除外しない方針自体は変わらない。
 
 ```
 $ sagasu index C:\ --db index.db --exclude-prefix C:\Windows\Temp
@@ -204,6 +218,14 @@ $ sagasu status --db index.db
 「除外規則を復元できなかったので索引以降の変更はマージしていない」と警告する。
 未知のキーやバージョンを黙って無視しない(近似した除外セットで答える方が悪い)
 一方で、新しい版の索引を古いバイナリで開いても検索が死なないのはこのため。
+
+**名前も明示に書き出す (issue #75)。** 前述の通り prefix は `prefix=` 行として書き出していたが、
+ディレクトリ**名**は `defaults=1` という「このビルドの既定」への参照だった。しかし既定に
+`AppData` を加えるような変更をすると、その番号で作られた古い index を読む差分側が知らずに
+別の集合を再生してしまう。そこで各 name も `name=` 行として書き出す。`decode` は `name=` 行が
+あるときはそれだけから集合を再構成し、このビルドの既定を一切参照しない。`name=` 行のない古い
+policy は従来通りクロスプラットフォームの `DEFAULT_EXCLUDES` から復元される —— つまり古い index は
+このビルドが新しく加えた `AppData` を**得ない**。未知のバージョン・キーは引き続きエラー。
 
 `sagasu status` はその規則を出す:
 
