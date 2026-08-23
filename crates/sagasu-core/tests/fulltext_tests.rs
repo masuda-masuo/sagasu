@@ -1055,16 +1055,19 @@ fn delimiter_free_body(words: usize, needle: &str, needle_at_pct: usize) -> Stri
 
 /// The regression for issue #52.
 ///
-/// A ~1 MB document with no sentence delimiter saturates Lindera's Viterbi
-/// lattice partway through; from that point on the segmenter returns the whole
-/// remainder as a single token, tantivy drops it for exceeding `MAX_TOKEN_LEN`,
-/// and the tail of the document disappears from the index without a word of
-/// explanation. Before the mitigation this assertion finds zero hits for a word
-/// that is unambiguously in the file.
+/// A ~1 MB document with no sentence delimiter used to saturate Lindera's
+/// Viterbi lattice; from that point on the segmenter returned the whole
+/// remainder as a single token, tantivy dropped it for exceeding
+/// `MAX_TOKEN_LEN`, and the tail of the document disappeared from the index
+/// without a word of explanation. lindera 5.3.0 now bounds the sentence length
+/// internally, so the tail must remain searchable through the production
+/// analyzer (LinderaTokenizer + LowerCaser + `LongTokenGuard`) with no
+/// pre-tokenization split, and the guard must drop zero tokens.
 ///
-/// The size is not padding. The break is at roughly 135,000 lattice nodes, so a
-/// smaller document does not reproduce it at all — 700 KB of the same text
-/// tokenizes perfectly. This is the smallest shape that fails.
+/// The size is not padding. The failure used to appear around 135,000 lattice
+/// nodes, so a smaller document does not reproduce it at all — 700 KB of the
+/// same text tokenizes perfectly. This is the smallest shape that exercises the
+/// unbounded-run path.
 #[test]
 fn tail_of_a_delimiter_free_document_stays_searchable() {
     let (data, db, index) = tmp_dirs("lattice_tail");
@@ -1086,16 +1089,8 @@ fn tail_of_a_delimiter_free_document_stays_searchable() {
     let summary = index_all(&data, &db, &index);
     assert_eq!(summary.indexed, 1, "{summary:?}");
 
-    // The mitigation fired, and it is reported rather than silent.
-    assert_eq!(summary.lattice_split_docs, 1, "{summary:?}");
-    assert!(summary.lattice_breaks >= 30, "{summary:?}");
-    assert_eq!(
-        summary.lattice_split_samples.len(),
-        1,
-        "the split document is named in the summary: {summary:?}"
-    );
-
-    // Nothing reached the size at which tantivy would drop it.
+    // No token reached the size at which tantivy would drop it — the upstream
+    // sentence bound keeps the production analyzer quiet.
     assert_eq!(summary.dropped_long_tokens, 0, "{summary:?}");
     assert!(
         summary.longest_token_bytes < 1024,
@@ -1121,9 +1116,9 @@ fn tail_of_a_delimiter_free_document_stays_searchable() {
     assert_eq!(outcome.hits.len(), 1);
 }
 
-/// The mitigation is inert on ordinary text: prose has a newline well inside
-/// 32 KiB, so nothing is rewritten and the stored body is byte-for-byte the
-/// file. A counter that ticks on normal corpora would be worse than no counter.
+/// The extracted body is indexed byte-for-byte with no rewriting (the
+/// pre-tokenization split was retired once lindera 5.3.0 bounded the sentence
+/// length upstream), so ordinary prose still indexes and stays searchable.
 #[test]
 fn ordinary_documents_are_not_rewritten() {
     let (data, db, index) = tmp_dirs("lattice_inert");
@@ -1137,9 +1132,6 @@ fn ordinary_documents_are_not_rewritten() {
 
     let summary = index_all(&data, &db, &index);
     assert_eq!(summary.indexed, 2, "{summary:?}");
-    assert_eq!(summary.lattice_split_docs, 0, "{summary:?}");
-    assert_eq!(summary.lattice_breaks, 0, "{summary:?}");
-    assert!(summary.lattice_split_samples.is_empty(), "{summary:?}");
     assert_eq!(summary.dropped_long_tokens, 0, "{summary:?}");
 
     assert_eq!(search(&index, "設計").hits.len(), 1);

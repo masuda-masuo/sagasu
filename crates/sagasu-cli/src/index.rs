@@ -483,28 +483,9 @@ fn print_fulltext_summary(summary: &fulltext::FulltextSummary, config: &Fulltext
         }
     }
 
-    // Documents whose body had to be broken up so Lindera's Viterbi lattice
-    // stayed bounded (issue #52). Reported rather than silent because it is the
-    // one case where the indexed text is not byte-for-byte the file, and
-    // because a document in this list is a document that used to lose its tail.
-    if summary.lattice_split_docs > 0 {
-        println!(
-            "long lines   : {} document(s) split into {} segment breaks",
-            summary.lattice_split_docs,
-            summary.lattice_breaks
-        );
-        for (path, breaks) in &summary.lattice_split_samples {
-            println!("    {path}: {breaks} break(s)");
-        }
-        let more = summary.lattice_split_docs as usize - summary.lattice_split_samples.len();
-        if more > 0 {
-            println!("    (… and {more} more)");
-        }
-    }
-
-    // Should never fire: the split above makes an over-long token unreachable.
-    // tantivy drops these with a `warn!` nobody sees, which is what let issue
-    // #52 hide; if the count is ever non-zero, say so loudly.
+    // Should never fire: the upstream sentence bound keeps an over-long token
+    // unreachable. tantivy drops these with a `warn!` nobody sees, which is what
+    // let issue #52 hide; if the count is ever non-zero, say so loudly.
     if summary.dropped_long_tokens > 0 {
         println!(
             "dropped terms: {} token(s) exceeded tantivy's limit and were not \

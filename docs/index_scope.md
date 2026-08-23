@@ -361,7 +361,9 @@ skipped      : 11
 
 抽出に失敗したファイルがあれば `document extraction failed` の行と、
 その下に**パスと理由**が先頭数件だけ並ぶ(`(… and N more)` 付き)。
-索引前に格子を分割した文書があれば `long lines :` の行が出る(design.md §4-2-2)。
+トークナイズは lindera 5.3.0 が文長を内部で抑えるので、索引前の書き換えは行わない
+(design.md §4-2-2)。上流の退行は `sagasu fulltext` の `dropped terms:` 行
+(`dropped_long_tokens` / `longest_token_bytes`、常に 0 のはず)に現れる。
 
 `by extension` は「11件落ちた」を**次の一手**に変える行。`.mjs: 41` と出れば
 足すべき引数がそのまま読める。
