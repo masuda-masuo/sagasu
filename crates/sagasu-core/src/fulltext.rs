@@ -567,21 +567,34 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
 }
 
 /// Context still available when tantivy's writer has already discarded the cause.
+/// The probe attempts to create a temporary file in the index directory; if that
+/// fails we surface the underlying I/O error so the field session can distinguish
+/// a sharing violation from handle exhaustion, permissions, or disk-full on
+/// Windows without attaching a debugger.
 fn add_document_failure_context(path: &str, docs_so_far: u64, index_dir: &Path) -> String {
-    let writable = if index_dir_is_writable(index_dir) {
-        "writable"
-    } else {
-        "not writable"
-    };
-    format!(
-        "failed to add {path} to the full-text index \
-         (documents added so far: {docs_so_far}; index directory {} is {writable})",
-        index_dir.display()
-    )
+    match index_dir_is_writable(index_dir) {
+        Ok(()) => {
+            format!(
+                "failed to add {path} to the full-text index \
+                 (documents added so far: {docs_so_far}; index directory {} is writable)",
+                index_dir.display()
+            )
+        }
+        // `io::Error`'s Display already ends with `(os error N)` for an OS error, so the
+        // number arrives without being appended by hand. On Windows that number is what
+        // names the cause: 32 = ERROR_SHARING_VIOLATION (another process holds a handle),
+        // 4 = ERROR_TOO_MANY_OPEN_FILES, 5 = ERROR_ACCESS_DENIED, 112 = ERROR_DISK_FULL.
+        Err(e) => format!(
+            "failed to add {path} to the full-text index \
+             (documents added so far: {docs_so_far}; index directory {} is not writable: {e})",
+            index_dir.display()
+        ),
+    }
 }
 
 /// Cheap probe: can a new file be created in `dir` right now?
-fn index_dir_is_writable(dir: &Path) -> bool {
+/// Returns the I/O error on failure so the caller can include the cause.
+fn index_dir_is_writable(dir: &Path) -> Result<(), std::io::Error> {
     let probe = dir.join(".sagasu-write-probe");
     match std::fs::OpenOptions::new()
         .write(true)
@@ -591,9 +604,9 @@ fn index_dir_is_writable(dir: &Path) -> bool {
     {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
-            true
+            Ok(())
         }
-        Err(_) => false,
+        Err(e) => Err(e),
     }
 }
 
@@ -1288,5 +1301,22 @@ mod tests {
         let ctx = add_document_failure_context("file.txt", 0, &missing);
         assert!(ctx.contains("documents added so far: 0"), "{ctx}");
         assert!(ctx.contains("is not writable"), "{ctx}");
+    }
+
+    #[test]
+    fn add_document_failure_names_the_underlying_io_error() {
+        // A non-existent directory is a portable way to make the probe fail.
+        let missing = std::env::temp_dir().join("sagasu-no-such-ft-dir-for-error-test");
+        let _ = std::fs::remove_dir_all(&missing);
+        let ctx = add_document_failure_context("file.txt", 42, &missing);
+        // The message must include the error description, not just "not writable".
+        assert!(ctx.contains("documents added so far: 42"), "{ctx}");
+        assert!(ctx.contains("is not writable"), "{ctx}");
+        // On Linux this will be "No such file or directory (os error 2)" or similar.
+        // The key assertion: the raw OS error code is present in the message.
+        assert!(
+            ctx.contains("os error"),
+            "message should include raw OS error code: {ctx}"
+        );
     }
 }
