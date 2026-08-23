@@ -388,6 +388,7 @@ struct ExtractOpts {
     max_size: u64,
     text_policy: text::TextPolicy,
     no_sniff: bool,
+    index_dir: PathBuf,
 }
 
 /// Build (or rebuild) the full-text index from the live files of the metadata
@@ -445,6 +446,7 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
         max_size: config.max_size,
         text_policy: config.text_policy.clone(),
         no_sniff: config.no_sniff,
+        index_dir: config.index_dir.clone(),
     };
     let counters = Counters::default();
     // First fatal error from any worker. The worker abandons its chunk; the
@@ -564,6 +566,37 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
     })
 }
 
+/// Context still available when tantivy's writer has already discarded the cause.
+fn add_document_failure_context(path: &str, docs_so_far: u64, index_dir: &Path) -> String {
+    let writable = if index_dir_is_writable(index_dir) {
+        "writable"
+    } else {
+        "not writable"
+    };
+    format!(
+        "failed to add {path} to the full-text index \
+         (documents added so far: {docs_so_far}; index directory {} is {writable})",
+        index_dir.display()
+    )
+}
+
+/// Cheap probe: can a new file be created in `dir` right now?
+fn index_dir_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(".sagasu-write-probe");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Decide whether one metadata row gets a document, and add it if so.
 ///
 /// Returns `Err` only for failures that should abort the whole build (tantivy
@@ -666,7 +699,19 @@ fn extract_and_add(
             fields.mtime_ns => row.mtime_ns,
             fields.body    => body,
         ))
-        .with_context(|| format!("failed to add {} to the full-text index", row.path))?;
+        .with_context(|| {
+            // tantivy discards the original cause once a worker thread has
+            // died; "io::Error most likely" is its guess. The documents-so-far
+            // count and whether the index directory is still writable are the
+            // context still available here. Do not retry: the writer is dead.
+            add_document_failure_context(
+                &row.path,
+                counters.by_ext.load(Ordering::Relaxed)
+                    + counters.by_sniff.load(Ordering::Relaxed)
+                    + counters.by_extract.load(Ordering::Relaxed),
+                &opts.index_dir,
+            )
+        })?;
 
     match accepted {
         Accepted::Ext => counters.by_ext.fetch_add(1, Ordering::Relaxed),
@@ -1222,5 +1267,26 @@ mod tests {
             seen[r.idx()] = true;
         }
         assert!(seen.iter().all(|&b| b));
+    }
+
+    #[test]
+    fn add_document_failure_names_docs_so_far_and_writable_dir() {
+        let dir = std::env::temp_dir();
+        let ctx = add_document_failure_context("file.txt", 12, &dir);
+        assert!(
+            ctx.contains("failed to add file.txt to the full-text index"),
+            "{ctx}"
+        );
+        assert!(ctx.contains("documents added so far: 12"), "{ctx}");
+        assert!(ctx.contains("is writable"), "{ctx}");
+    }
+
+    #[test]
+    fn add_document_failure_names_an_unwritable_index_dir() {
+        let missing = std::env::temp_dir().join("sagasu-no-such-ft-dir");
+        let _ = std::fs::remove_dir_all(&missing);
+        let ctx = add_document_failure_context("file.txt", 0, &missing);
+        assert!(ctx.contains("documents added so far: 0"), "{ctx}");
+        assert!(ctx.contains("is not writable"), "{ctx}");
     }
 }

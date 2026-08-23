@@ -55,6 +55,7 @@ sagasu status           索引の鮮度・規模のレポート             (読
 
 依存の向きは `index → {hash, fulltext, tag}` で、`fulltext` と `tag` は
 ファイルシステムを再走査せず索引の行を読む。読み側は全部 `--db` から入る。
+書き 4 コマンドは同じデータベースへの同時実行を拒否する（issue #77、§2-3）。
 
 ### 2-1. 共通引数
 
@@ -62,6 +63,7 @@ sagasu status           索引の鮮度・規模のレポート             (読
 |---|---|---|
 | `--db <PATH>` | 全 9 個 | `index.db` |
 | `--json` | 全 9 個 (§4 で新設) | off |
+| `--force` | `index` / `hash` / `fulltext` / `tag` | off |
 | `--config <PATH>` | `fulltext` / `search` / `tag` / `tags` (§5 で新設) | `./sagasu.toml`(あれば) |
 | `--no-fresh` | `search` / `find` / `tags` / `browse` | off (= 鮮度マージ・プローブ有効) |
 | `--delta-limit <N>` | `--no-fresh` と同じ 4 個 | `delta::DEFAULT_DELTA_LIMIT` |
@@ -78,17 +80,32 @@ browse の行が「結果」ではなく「グループの中身のプレビュ�
 `index`: `--exclude`(repeatable) / `--exclude-prefix <PATH>`(repeatable、絶対パス。
 下に降りない prune。issue #43 の擬似ファイルシステム既定は Linux では
 `/proc` `/sys` `/dev` `/run`。Windows / macOS の OS ディレクトリは既定対象外) /
-`--no-default-excludes` / `--skip-hidden` / `--use-gitignore` / `--threads`
-`hash`: `--max-size`(既定 4 MiB)
+`--no-default-excludes` / `--skip-hidden` / `--use-gitignore` / `--threads` / `--force`
+`hash`: `--max-size`(既定 4 MiB) / `--force`
 `fulltext`: `--index-dir` / `--max-size`(既定 2 MiB) / `--ext`(repeatable) /
-`--no-sniff` / `--threads` / `--heap-mb`
+`--no-sniff` / `--threads` / `--heap-mb` / `--force`
 `search`: `--index-dir` / `--no-db` / `--snippet-chars` / `--ext`
 `tag`: `--no-read-magic` / `--magic-max-size` / `--no-read-embedded` /
-`--embedded-max-size`
+`--embedded-max-size` / `--force`
 `tags`: `--file <PATH>`(1 ファイルの説明モード)
 `browse`: `--axes` / `--values` / `--label-terms`
 `status`: `--check-journal`(既定 off) / `--journal-warn-hours <N>`(既定 24。`--check-journal`
 と併用時のみ意味がある)
+
+### 2-3. 書き込みコマンドの排他（issue #77）
+
+`index` / `hash` / `fulltext` / `tag` は同じデータベースに対して同時に動かない。
+起動時に `meta` へ稼働中のコマンド名・プロセス id・開始時刻を記録し、終了時
+（成功でも失敗でも）に消す。2 本目の書き込みコマンドは走査・タグ付け・本文抽出に
+入る前に拒否し、記録されているコマンド・pid・開始時刻をメッセージに出す。
+通常の導線は `index → tag → fulltext` の順次実行。
+
+読み取りコマンド（`search` / `find` / `tags` / `browse` / `status`）はこの記録を
+見ない。WAL の下では書き込み中でも読める、という挙動は維持する。
+
+クラッシュや Ctrl-C では記録が残る。pid の生存確認も時間切れも無い
+（32 分の `tag` を「死んだ」と誤判定しないため）。残った記録は `--force` で
+上書きする。それが回収経路。
 
 ---
 
