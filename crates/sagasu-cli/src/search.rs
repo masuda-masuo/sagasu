@@ -100,6 +100,7 @@ pub fn cmd_search(args: SearchArgs, mode: Output) -> Result<Outcome> {
         max_size: fulltext::DEFAULT_MAX_SIZE,
         text_policy: crate::index::load_config(args.config.as_deref(), &args.ext)?
             .into_text_policy(),
+        find_candidate_cap: fresh::DEFAULT_FIND_CANDIDATE_CAP,
     };
 
     // One query per process: a cache would only ever miss. `DeltaCache` is for

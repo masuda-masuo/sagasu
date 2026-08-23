@@ -52,7 +52,7 @@ pub use browse::{BrowseQuery, BrowseView, FacetAxis, FacetValue, LabelTerm, Next
 pub use config::{Config, ConfigOrigin};
 pub use delta::{DeltaCache, DeltaSet, DeltaSource, DeltaStatus, ScanMarker};
 pub use docmeta::{BodyFormat, EmbeddedMeta, MetaFormat};
-pub use fresh::{FreshConfig, FreshHit, FreshOutcome};
+pub use fresh::{FindMatchLabel, FindRank, FreshConfig, FreshHit, FreshOutcome};
 pub use fulltext::{FulltextConfig, FulltextSummary, SearchConfig, SearchHit, SearchOutcome};
 pub use store::Store;
 pub use tagindex::{TagConfig, TagSummary};

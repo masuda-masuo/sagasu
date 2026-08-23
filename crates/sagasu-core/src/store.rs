@@ -532,8 +532,8 @@ impl Store {
     /// Live rows whose path contains `needle`, case-insensitively.
     ///
     /// This is the metadata half of the search surface: `sagasu find` answers
-    /// from here and the freshness merge overlays the delta set on top. Ordered
-    /// by `file_id` so the result is stable between runs.
+    /// from here and the freshness merge overlays the delta set on top.
+    /// Fetches in `file_id` order up to `limit`; the caller ranks the candidates.
     ///
     /// `%` and `_` in the needle are escaped — a user typing a literal `%` is
     /// searching for a percent sign, not writing SQL.
