@@ -20,19 +20,23 @@
 //!
 //! The mtime fallback cannot see a file that no longer exists — a walk only
 //! reports what is there. So deletion is handled on the *other* side of the
-//! merge: every index hit that survives the changed-set test is checked for
-//! existence before it is returned. That check is bounded by the number of hits
-//! (tens), not by the corpus, and it is what makes the fallback source complete
-//! rather than merely fast. The USN source does report deletions, and they
-//! simply take the same path.
+//! merge: candidate index hits are checked for existence as the page is filled,
+//! stopping when `--limit` is reached. That check is bounded by the page size
+//! (tens), not by the candidate set or corpus, and it is what makes the fallback
+//! source complete rather than merely fast. The USN source does report deletions,
+//! and they simply take the same path.
 //!
 //! ## Ordering: live hits first
 //!
 //! Index hits carry a BM25 score; live hits carry a term-occurrence count from
 //! [`crate::fulltext::LiveTerms`]. Those two numbers are not comparable, so
-//! sorting them into one ranking would be inventing a relevance claim. Instead
-//! live hits are emitted first, ordered by score then by recency:
-//!
+//! sorting them into one ranking would be inventing a relevance claim. (For [`find`],
+//! both sides match with the same path-substring predicate, so a single structural
+//! ordering over them is legitimate and is applied *within* each group; the warning
+//! still stands for [`search`], where BM25 scores and live term counts are not
+//! comparable, and the live-first rule still exists so a file created since the crawl
+//! cannot be ranked off the page.) Instead live hits are emitted first, ordered
+//! by score then by recency:
 //! - it is honest — the two groups are labelled ([`HitOrigin`]) and never
 //!   interleaved on a fabricated common scale;
 //! - a file you just edited is a good bet for what you are looking for;
@@ -65,6 +69,8 @@ use crate::text::{self, ExtVerdict};
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
+pub const DEFAULT_FIND_CANDIDATE_CAP: usize = 10_000;
+
 /// Configuration for a freshness-merged search.
 #[derive(Debug, Clone)]
 pub struct FreshConfig {
@@ -78,6 +84,8 @@ pub struct FreshConfig {
     pub query: String,
     /// Maximum number of merged hits.
     pub limit: usize,
+    /// Cap on candidate matches fetched from the store before ranking ([`find`] only).
+    pub find_candidate_cap: usize,
     /// Cap on the delta set; above it the answer is reported as stale.
     pub delta_limit: usize,
     /// Skip the delta query entirely and answer from the index alone. The
@@ -106,6 +114,7 @@ impl FreshConfig {
             index_dir: None,
             query: query.into(),
             limit: 10,
+            find_candidate_cap: DEFAULT_FIND_CANDIDATE_CAP,
             delta_limit: delta::DEFAULT_DELTA_LIMIT,
             no_delta: false,
             snippet_chars: 160,
@@ -137,6 +146,91 @@ impl HitOrigin {
     }
 }
 
+/// Match quality tier for `sagasu find`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FindMatchLabel {
+    /// Basename equals the needle, or basename without final extension equals the needle.
+    NameExact,
+    /// Basename starts with the needle (and is not Exact).
+    NamePrefix,
+    /// Needle occurs in basename immediately after a non-alphanumeric char (and is not Exact/Prefix).
+    NameWord,
+    /// Substring match inside basename.
+    NamePart,
+    /// Match is only in the directory chain.
+    Dir,
+}
+
+impl FindMatchLabel {
+    /// Stable label used in CLI output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FindMatchLabel::NameExact => "name-exact",
+            FindMatchLabel::NamePrefix => "name-prefix",
+            FindMatchLabel::NameWord => "name-word",
+            FindMatchLabel::NamePart => "name-part",
+            FindMatchLabel::Dir => "dir",
+        }
+    }
+}
+
+/// Ordering key for `sagasu find`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FindRank {
+    pub label: FindMatchLabel,
+    pub depth: usize,
+}
+
+/// Decide match rank for a candidate path against a lowercased needle.
+///
+/// Depth is computed by counting path separators ('/' and '\') because backslash
+/// paths from Windows are stored verbatim in the index and `Path::file_name` on
+/// Linux does not treat '\' as a separator.
+pub fn rank(path: &str, needle_lower: &str) -> FindRank {
+    let depth = path.chars().filter(|&c| matches!(c, '/' | '\\')).count();
+    let path_lower = path.to_lowercase();
+    let basename_lower = path_lower
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&path_lower);
+
+    let label = if basename_lower.contains(needle_lower) {
+        if basename_lower == needle_lower {
+            FindMatchLabel::NameExact
+        } else if let Some(pos) = basename_lower.rfind('.') {
+            if pos > 0 && &basename_lower[..pos] == needle_lower {
+                FindMatchLabel::NameExact
+            } else if basename_lower.starts_with(needle_lower) {
+                FindMatchLabel::NamePrefix
+            } else if is_word_match(basename_lower, needle_lower) {
+                FindMatchLabel::NameWord
+            } else {
+                FindMatchLabel::NamePart
+            }
+        } else if basename_lower.starts_with(needle_lower) {
+            FindMatchLabel::NamePrefix
+        } else if is_word_match(basename_lower, needle_lower) {
+            FindMatchLabel::NameWord
+        } else {
+            FindMatchLabel::NamePart
+        }
+    } else {
+        FindMatchLabel::Dir
+    };
+
+    FindRank { label, depth }
+}
+
+fn is_word_match(basename_lower: &str, needle_lower: &str) -> bool {
+    basename_lower.match_indices(needle_lower).any(|(idx, _)| {
+        idx > 0
+            && basename_lower[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_alphanumeric())
+    })
+}
+
 /// One merged result.
 #[derive(Debug, Clone)]
 pub struct FreshHit {
@@ -156,6 +250,8 @@ pub struct FreshHit {
     pub mtime_ns: Option<i64>,
     /// One-line excerpt ([`search`] only).
     pub snippet: String,
+    /// Structural rank key ([`find`] only).
+    pub rank: Option<FindRank>,
 }
 
 /// Why an answer may be missing changes.
@@ -253,10 +349,13 @@ pub struct FreshOutcome {
     /// Index hits examined before merging.
     pub index_candidates: usize,
     /// Index hits dropped because the delta set says they changed (the live
-    /// side replaces them).
+    /// side replaces them), counted among the candidates examined while filling the page.
     pub dropped_changed: usize,
-    /// Index hits dropped because the file no longer exists.
+    /// Index hits dropped because the file no longer exists, counted among the
+    /// candidates examined while filling the page.
     pub dropped_deleted: usize,
+    /// Candidate cap when it was hit during candidate fetch ([`find`] only).
+    pub find_candidate_cap: Option<usize>,
     /// Hits contributed by the live grep.
     pub live_hits: usize,
     /// Files the live grep read ([`search`] only).
@@ -319,45 +418,29 @@ pub fn find(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshOut
             size: Some(e.size),
             mtime_ns: Some(e.mtime_ns),
             snippet: String::new(),
+            rank: Some(rank(&e.path, &needle)),
         })
         .collect();
     timing.live_ms = ms(t_live);
 
-    // Over-fetch by the number of live matches: each of them may drop an index
-    // row, and a merged page should still fill up. Deletions can shorten it
-    // further — they are invisible until the existence check below.
-    let over = (config.limit + live.len()) as i64;
+    // Fetch candidate matches up to candidate cap + 1 (extra 1 to detect truncation).
+    let over = (config.find_candidate_cap + 1) as i64;
     let t_index = Instant::now();
-    let rows = store.find_paths_like(&config.query, over)?;
+    let mut rows = store.find_paths_like(&config.query, over)?;
     timing.index_ms = ms(t_index);
+
+    let find_candidate_cap = if rows.len() > config.find_candidate_cap {
+        rows.truncate(config.find_candidate_cap);
+        Some(config.find_candidate_cap)
+    } else {
+        None
+    };
 
     let t_merge = Instant::now();
     let changed = ctx.existence();
     let mut dropped_changed = 0usize;
     let mut dropped_deleted = 0usize;
     let index_candidates = rows.len();
-
-    let mut indexed: Vec<FreshHit> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        match changed.get(row.path.as_str()).copied() {
-            // The delta says the file is gone — a deletion, not a change,
-            // whichever source reported it.
-            Some(false) => {
-                dropped_deleted += 1;
-                continue;
-            }
-            Some(true) => {
-                dropped_changed += 1;
-                continue;
-            }
-            None => {}
-        }
-        if !Path::new(&row.path).exists() {
-            dropped_deleted += 1;
-            continue;
-        }
-        indexed.push(index_hit(row));
-    }
 
     // A live hit that the index also knows about carries the file's stable ID
     // through, so the caller can still join it to tags and history.
@@ -367,7 +450,34 @@ pub fn find(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshOut
         hit.file_id = by_path.get(hit.path.as_str()).map(|r| r.file_id);
     }
 
-    let hits = order_and_truncate(live, indexed, config.limit);
+    let unverified_indexed: Vec<FreshHit> = rows
+        .iter()
+        .map(|row| index_hit(row, Some(rank(&row.path, &needle))))
+        .collect();
+
+    let hits = order_and_truncate(live, unverified_indexed, config.limit, |hit| {
+        match changed.get(hit.path.as_str()).copied() {
+            // The delta says the file is gone — a deletion, not a change,
+            // whichever source reported it.
+            Some(false) => {
+                dropped_deleted += 1;
+                false
+            }
+            Some(true) => {
+                dropped_changed += 1;
+                false
+            }
+            None => {
+                if !Path::new(&hit.path).exists() {
+                    dropped_deleted += 1;
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+    });
+
     timing.merge_ms = ms(t_merge);
     timing.total_ms = timing.index_ms + timing.delta_ms + timing.live_ms + timing.merge_ms;
 
@@ -379,6 +489,7 @@ pub fn find(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshOut
         index_candidates,
         dropped_changed,
         dropped_deleted,
+        find_candidate_cap,
         live_read: 0,
         total_docs: 0,
         // `find` matches on paths and never reads a body, so no extension rule
@@ -458,6 +569,7 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
                     size: Some(entry.size),
                     mtime_ns: Some(entry.mtime_ns),
                     snippet: fulltext::build_snippet(&body, &snippet_terms, config.snippet_chars),
+                    rank: None,
                 })
             } else {
                 None
@@ -521,6 +633,7 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
             size: None,
             mtime_ns: Some(hit.mtime_ns),
             snippet: hit.snippet.clone(),
+            rank: None,
         });
     }
 
@@ -533,7 +646,7 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
         hit.file_id = known.get(hit.path.as_str()).copied().filter(|id| *id >= 0);
     }
 
-    let hits = order_and_truncate(live, from_index, config.limit);
+    let hits = order_and_truncate(live, from_index, config.limit, |_| true);
     timing.merge_ms = ms(t_merge);
     timing.total_ms = timing.index_ms + timing.delta_ms + timing.live_ms + timing.merge_ms;
 
@@ -545,6 +658,7 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
         index_candidates,
         dropped_changed,
         dropped_deleted,
+        find_candidate_cap: None,
         live_read,
         total_docs: indexed.total_docs,
         text_policy,
@@ -771,7 +885,7 @@ fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
 }
 
-fn index_hit(row: &FileRow) -> FreshHit {
+fn index_hit(row: &FileRow, rank: Option<FindRank>) -> FreshHit {
     FreshHit {
         origin: HitOrigin::Index,
         file_id: Some(row.file_id),
@@ -780,6 +894,16 @@ fn index_hit(row: &FileRow) -> FreshHit {
         size: Some(row.size),
         mtime_ns: Some(row.mtime_ns),
         snippet: String::new(),
+        rank,
+    }
+}
+
+fn file_id_cmp(a: Option<i64>, b: Option<i64>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(id_a), Some(id_b)) => id_a.cmp(&id_b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     }
 }
 
@@ -795,22 +919,33 @@ fn index_hit(row: &FileRow) -> FreshHit {
 /// the page — the freshness mechanism would be *replacing* the search rather
 /// than correcting it. When one side runs out the other takes the free slots, so
 /// the usual case (a handful of changed files) is unaffected.
-fn order_and_truncate(
+///
+/// Index hits are admitted through a caller-supplied test (`filter_indexed`) so `find`
+/// can defer its existence check until candidates are actually considered for the page.
+fn order_and_truncate<F>(
     mut live: Vec<FreshHit>,
     mut indexed: Vec<FreshHit>,
     limit: usize,
-) -> Vec<FreshHit> {
+    mut filter_indexed: F,
+) -> Vec<FreshHit>
+where
+    F: FnMut(&FreshHit) -> bool,
+{
     let limit = limit.max(1);
     live.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
+        a.rank
+            .cmp(&b.rank)
+            .then_with(|| b.score.total_cmp(&a.score))
             .then_with(|| b.mtime_ns.cmp(&a.mtime_ns))
             .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| file_id_cmp(a.file_id, b.file_id))
     });
     indexed.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
+        a.rank
+            .cmp(&b.rank)
+            .then_with(|| b.score.total_cmp(&a.score))
             .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| file_id_cmp(a.file_id, b.file_id))
     });
 
     let live_budget = if indexed.is_empty() {
@@ -836,6 +971,9 @@ fn order_and_truncate(
     for hit in indexed {
         if out.len() >= limit {
             break;
+        }
+        if !filter_indexed(&hit) {
+            continue;
         }
         if seen.insert(hit.path.clone()) {
             out.push(hit);

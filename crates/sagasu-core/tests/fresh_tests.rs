@@ -1125,3 +1125,183 @@ fn file_deleted_between_delta_scan_and_read_does_not_panic_and_is_skipped() {
     assert!(!n.contains(&"will_be_deleted.md".to_string()));
     assert!(n.contains(&"keep.md".to_string()));
 }
+
+
+// ── 7. Ranking and candidate cap tests (sagasu #80) ──────────────────────────
+
+#[test]
+fn rank_tier_boundaries() {
+    use sagasu_core::fresh::{rank, FindMatchLabel};
+
+    let needle = "database";
+
+    let exact1 = rank("Database.kdbx", needle);
+    let exact2 = rank("OneDrive/Documents/Database.kdbx", needle);
+    let prefix = rank("Database_backup.kdbx", needle);
+    let word = rank("My_Database.kdbx", needle);
+    let part = rank("MyDatabase.kdbx", needle);
+    let dir = rank("Database/LOG", needle);
+
+    assert_eq!(exact1.label, FindMatchLabel::NameExact);
+    assert_eq!(exact2.label, FindMatchLabel::NameExact);
+    assert_eq!(prefix.label, FindMatchLabel::NamePrefix);
+    assert_eq!(word.label, FindMatchLabel::NameWord);
+    assert_eq!(part.label, FindMatchLabel::NamePart);
+    assert_eq!(dir.label, FindMatchLabel::Dir);
+
+    assert!(exact1 < prefix);
+    assert!(prefix < word);
+    assert!(word < part);
+    assert!(part < dir);
+
+    // Shallower path wins when tier matches
+    assert_eq!(exact1.depth, 0);
+    assert_eq!(exact2.depth, 2);
+    assert!(exact1 < exact2);
+}
+
+#[test]
+fn rank_handles_windows_backslashes() {
+    use sagasu_core::fresh::{rank, FindMatchLabel};
+
+    let needle = "database";
+    let r = rank(r"C:\Users\absol\OneDrive\Documents\Database.kdbx", needle);
+    assert_eq!(r.label, FindMatchLabel::NameExact);
+    assert_eq!(r.depth, 5);
+}
+
+#[test]
+fn find_ranks_exact_basename_over_deep_dir_hits() {
+    let (d, db, _) = tmp_dirs("find_ranking");
+    write_file(
+        &d,
+        "AppData/Local/Packages/x/EBWebView/Default/Database/LOG",
+        "log data",
+    );
+    write_file(&d, "OneDrive/Documents/Database.kdbx", "kdbx data");
+    write_file(&d, "docs/Database.kdbx", "docs kdbx data");
+    crawl(&d, &db);
+
+    let outcome = fresh::find(&find_config(&db, "Database"), None).unwrap();
+    let hits = &outcome.hits;
+    assert_eq!(hits.len(), 3);
+
+    // Shallowest Exact match first
+    assert!(hits[0].path.ends_with("docs/Database.kdbx"));
+    assert_eq!(
+        hits[0].rank.unwrap().label,
+        sagasu_core::fresh::FindMatchLabel::NameExact
+    );
+
+    // Deeper Exact match second
+    assert!(hits[1].path.ends_with("OneDrive/Documents/Database.kdbx"));
+    assert_eq!(
+        hits[1].rank.unwrap().label,
+        sagasu_core::fresh::FindMatchLabel::NameExact
+    );
+
+    // Directory match last
+    assert!(hits[2]
+        .path
+        .ends_with("AppData/Local/Packages/x/EBWebView/Default/Database/LOG"));
+    assert_eq!(
+        hits[2].rank.unwrap().label,
+        sagasu_core::fresh::FindMatchLabel::Dir
+    );
+}
+
+#[test]
+fn find_candidate_cap_limits_fetch_and_reports_cap_hit() {
+    let (d, db, _) = tmp_dirs("find_candidate_cap");
+    write_file(&d, "a_db.txt", "1");
+    write_file(&d, "b_db.txt", "2");
+    write_file(&d, "c_db.txt", "3");
+    write_file(&d, "d_db.txt", "4");
+    write_file(&d, "e_db.txt", "5");
+    crawl(&d, &db);
+
+    let mut config = find_config(&db, "db");
+    config.find_candidate_cap = 2;
+    let outcome = fresh::find(&config, None).unwrap();
+
+    assert_eq!(outcome.find_candidate_cap, Some(2));
+    assert_eq!(outcome.index_candidates, 2);
+
+    config.find_candidate_cap = 10;
+    let outcome_uncapped = fresh::find(&config, None).unwrap();
+    assert_eq!(outcome_uncapped.find_candidate_cap, None);
+    assert_eq!(outcome_uncapped.index_candidates, 5);
+}
+
+#[test]
+fn find_deterministic_ordering_on_identical_runs_with_live_hits() {
+    let (d, db, _) = tmp_dirs("find_deterministic");
+    write_file(&d, "indexed_a_report.md", "a");
+    write_file(&d, "indexed_b_report.md", "b");
+    crawl(&d, &db);
+    let marker_ns = recorded_marker_ns(&db);
+
+    let live1 = write_file(&d, "live_a_report.md", "l1");
+    let live2 = write_file(&d, "live_b_report.md", "l2");
+    stamp_after_marker(&live1, marker_ns);
+    stamp_after_marker(&live2, marker_ns);
+
+    let run1 = fresh::find(&find_config(&db, "report"), None).unwrap();
+    let run2 = fresh::find(&find_config(&db, "report"), None).unwrap();
+
+    let paths1: Vec<String> = run1.hits.iter().map(|h| h.path.clone()).collect();
+    let paths2: Vec<String> = run2.hits.iter().map(|h| h.path.clone()).collect();
+    assert_eq!(paths1, paths2);
+}
+
+#[test]
+fn search_unaffected_by_find_ranking_changes() {
+    let (d, db, ft) = tmp_dirs("search_unaffected");
+    write_file(&d, "doc.md", "test query content\n");
+    crawl(&d, &db);
+    build_ft(&db, &ft);
+
+    let outcome = fresh::search(&search_config(&db, &ft, "query"), None).unwrap();
+    assert_eq!(outcome.find_candidate_cap, None);
+    for hit in &outcome.hits {
+        assert!(hit.rank.is_none());
+    }
+}
+
+#[test]
+fn find_deleted_candidate_in_page_replaced_by_next_best_ranked() {
+    let (d, db, _) = tmp_dirs("find_deletion_replacement");
+    write_file(&d, "a_report.md", "a");
+    write_file(&d, "b_report.md", "b");
+    write_file(&d, "c_report.md", "c");
+    crawl(&d, &db);
+
+    fs::remove_file(d.join("b_report.md")).unwrap();
+
+    let mut config = find_config(&db, "report");
+    config.limit = 2;
+    let outcome = fresh::find(&config, None).unwrap();
+
+    assert_eq!(names(&outcome), vec!["a_report.md".to_string(), "c_report.md".to_string()]);
+    assert_eq!(outcome.hits.len(), 2);
+    assert_eq!(outcome.dropped_deleted, 1);
+}
+
+#[test]
+fn find_existence_check_bounded_by_page_size() {
+    let (d, db, _) = tmp_dirs("find_existence_bounded");
+    for i in 0..50 {
+        write_file(&d, &format!("doc_{:02}_report.md", i), "x");
+    }
+    crawl(&d, &db);
+
+    let mut config = find_config(&db, "report");
+    config.limit = 5;
+    config.find_candidate_cap = 50;
+    let outcome = fresh::find(&config, None).unwrap();
+
+    assert_eq!(outcome.hits.len(), 5);
+    assert_eq!(outcome.index_candidates, 50);
+    assert_eq!(outcome.dropped_deleted, 0);
+    assert_eq!(outcome.dropped_changed, 0);
+}

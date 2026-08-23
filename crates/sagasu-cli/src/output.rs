@@ -234,14 +234,28 @@ pub(crate) fn print_fresh(outcome: &FreshOutcome) {
         "merged  : {} index candidates, {} dropped (changed), {} dropped (deleted)",
         outcome.index_candidates, outcome.dropped_changed, outcome.dropped_deleted,
     );
+    if let Some(cap) = outcome.find_candidate_cap {
+        println!(
+            "candidate cap: hit limit of {cap} candidates; narrow your query for complete ranking"
+        );
+    }
 
     for hit in &outcome.hits {
-        println!(
-            "[{:<5}] {:>8.3}  {}",
-            hit.origin.as_str(),
-            hit.score,
-            hit.path
-        );
+        if let Some(rank) = hit.rank {
+            println!(
+                "[{:<5}] {:>10}  {}",
+                hit.origin.as_str(),
+                rank.label.as_str(),
+                hit.path
+            );
+        } else {
+            println!(
+                "[{:<5}] {:>8.3}  {}",
+                hit.origin.as_str(),
+                hit.score,
+                hit.path
+            );
+        }
         if hit.origin == HitOrigin::Live {
             if let (Some(size), Some(mtime)) = (hit.size, hit.mtime_ns) {
                 println!(
@@ -554,6 +568,7 @@ mod tests {
             index_candidates: 0,
             dropped_changed: 0,
             dropped_deleted: 0,
+            find_candidate_cap: None,
             live_hits: 0,
             live_read: 5,
             total_docs: 10,

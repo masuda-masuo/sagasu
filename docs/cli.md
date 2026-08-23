@@ -176,8 +176,8 @@ PoC 段階なので**破壊的変更はありうる**。そのうえで最低限
 | `summary` | `search` `find` `tags` | `hits` `total`(あれば) `live_hits` `index_hits` |
 | `delta` | `search` `find` `tags` `browse` | `entries` `source` `cached` `scanned` `excluded` `gone` `frn_error_codes` `status` `rescan_reason` `errors` `detects_renames` |
 | `timing` | `search` `find` | `setup_ms` `index_ms` `delta_ms` `live_ms` `merge_ms` `overhead_ms` `total_ms` |
-| `merge` | `search` `find` | `index_candidates` `dropped_changed` `dropped_deleted` |
-| `hit` | `search` `find` | `origin` `file_id` `path` `score` `size` `mtime_ns` `snippet` |
+| `merge` | `search` `find` | `index_candidates` `dropped_changed` `dropped_deleted` `find_candidate_cap` |
+| `hit` | `search` `find` | `origin` `file_id` `path` `label` `score` `size` `mtime_ns` `snippet` |
 | `file` | `tags` `browse` | `file_id` `path` `exists` |
 | `namespace` | `tags` | `namespace` `files` `distinct` |
 | `tag_count` | `tags` | `tag` `files` |

@@ -203,6 +203,7 @@ pub(crate) fn fresh(outcome: &FreshOutcome) {
         "index_candidates": outcome.index_candidates,
         "dropped_changed": outcome.dropped_changed,
         "dropped_deleted": outcome.dropped_deleted,
+        "find_candidate_cap": outcome.find_candidate_cap,
     }));
 
     for hit in &outcome.hits {
@@ -211,6 +212,7 @@ pub(crate) fn fresh(outcome: &FreshOutcome) {
             "origin": hit.origin.as_str(),
             "file_id": hit.file_id,
             "path": hit.path,
+            "label": hit.rank.map(|r| r.label.as_str()),
             "score": hit.score,
             "size": hit.size,
             "mtime_ns": hit.mtime_ns,
@@ -286,6 +288,7 @@ pub(crate) fn search_index_only(query: &str, index_dir: &str, outcome: &SearchOu
             "path": hit.display_path(),
             "indexed_path": hit.indexed_path,
             "deleted": hit.deleted,
+            "label": Value::Null,
             "score": hit.score,
             "size": Value::Null,
             "mtime_ns": hit.mtime_ns,
