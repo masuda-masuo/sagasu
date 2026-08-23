@@ -1173,9 +1173,15 @@ fn rank_handles_windows_backslashes() {
 #[test]
 fn find_ranks_exact_basename_over_deep_dir_hits() {
     let (d, db, _) = tmp_dirs("find_ranking");
+    // The measured case (issue #80) had the deep shadows under `AppData`, but this
+    // fixture must not: `AppData` is in `walk::PLATFORM_DEFAULT_EXCLUDES` on Windows
+    // (issue #75), so a directory named that is dropped by the crawl there and the
+    // test silently loses its directory-chain hit — 2 rows instead of 3, on Windows
+    // only. Any name outside DEFAULT_EXCLUDES + PLATFORM_DEFAULT_EXCLUDES will do;
+    // the tier being exercised does not care what the directory is called.
     write_file(
         &d,
-        "AppData/Local/Packages/x/EBWebView/Default/Database/LOG",
+        "Roaming/Local/Packages/x/EBWebView/Default/Database/LOG",
         "log data",
     );
     write_file(&d, "OneDrive/Documents/Database.kdbx", "kdbx data");
@@ -1186,24 +1192,26 @@ fn find_ranks_exact_basename_over_deep_dir_hits() {
     let hits = &outcome.hits;
     assert_eq!(hits.len(), 3);
 
+    // Paths are stored as the OS produced them, so an assertion spelled with `/`
+    // never matches on Windows. Compare on a normalised copy rather than the row.
+    let slashed = |i: usize| hits[i].path.replace('\\', "/");
+
     // Shallowest Exact match first
-    assert!(hits[0].path.ends_with("docs/Database.kdbx"));
+    assert!(slashed(0).ends_with("docs/Database.kdbx"));
     assert_eq!(
         hits[0].rank.unwrap().label,
         sagasu_core::fresh::FindMatchLabel::NameExact
     );
 
     // Deeper Exact match second
-    assert!(hits[1].path.ends_with("OneDrive/Documents/Database.kdbx"));
+    assert!(slashed(1).ends_with("OneDrive/Documents/Database.kdbx"));
     assert_eq!(
         hits[1].rank.unwrap().label,
         sagasu_core::fresh::FindMatchLabel::NameExact
     );
 
     // Directory match last
-    assert!(hits[2]
-        .path
-        .ends_with("AppData/Local/Packages/x/EBWebView/Default/Database/LOG"));
+    assert!(slashed(2).ends_with("Roaming/Local/Packages/x/EBWebView/Default/Database/LOG"));
     assert_eq!(
         hits[2].rank.unwrap().label,
         sagasu_core::fresh::FindMatchLabel::Dir
