@@ -276,7 +276,7 @@ file_id を集約から除外する必要があり、除外は SQL 側の集約�
 正直な表示に留め、`delta : N changed` と警告で「今どれだけ古いか」を必ず出す。
 増分タグ更新(design.md §6-2 の残論点)が入れば、この論点自体が消える。
 
-## 6. コア API(M4 の Tauri がそのまま叩く形)
+## 6. コア API(M4 は `crates/sagasu-ui` を経由する形)
 
 判断は全部 `sagasu-core::browse` にある。CLI はその印刷機。
 
@@ -317,8 +317,10 @@ CLI 全体の機械可読出力は issue #6 の論点なので、答えを出す
 **その後の経緯(2026-08-07、issue #6 / PR #48)**: `--json` は 9 サブコマンド
 全部に一度に入り、`browse` にも付いた(イベント語彙は `docs/cli.md` §4-4)。
 上の線引きは変わっていない — `--json` は**人間向け出力の機械可読版**であって
-コア API の JSON 版ではなく、M4 は従来どおり `BrowseView` を直接受け取る。
-コアの型に `Serialize` を生やさないことがその実装上の担保(`docs/cli.md` §8)。
+コア API の JSON 版ではなく、M4 は `crates/sagasu-ui` の
+`browse_view(&Store, &BrowseQueryDto) -> BrowseViewDto` を経由する。
+コアの型に `Serialize` を生やさないことがその実装上の担保(`docs/cli.md` §8)で、
+DTO への詰め替えと `preview` の実在確認はその層が担う。
 
 `preview` の実在確認をコアではなく呼び出し側に置いたのも同じ線引きで、
 `browse()` は**データベース以外に触れない**(§3 の決定性が守れる)。
@@ -682,7 +684,7 @@ browse は同じ集合を 3 回読むので、**1 回だけ評価して temp テ
 - **推薦は貪欲で、1 手先しか見ない。** 「2 手で最短」になる経路は探索しない。
   `next :` を追った実測は §7-4(9 手)だが、これが最小手数だとは主張していない
 - **`tag.rs` の分割は見送った。** `sagasu tag`(生成)と `sagasu tags`(読み取り)は
-  同居のまま(475 行)。`browse` を足すにあたって実際に共有が必要だったのは
+  同居のまま(664 行)。`browse` を足すにあたって実際に共有が必要だったのは
   鮮度ブロックだけで、それは `output.rs`(「複数のサブコマンドが必要とする表示」が
   存在理由のモジュール)に移した。読み取り系をさらに切り出すのは、
   共有されない片方を動かすだけの差分になり、レビューの目を薄めるので採らなかった
@@ -694,3 +696,5 @@ browse は同じ集合を 3 回読むので、**1 回だけ評価して temp テ
 - `docs/schema_v0.md` — `tags` / `file_tags` と `meta` のタグ関連キー
 - `crates/sagasu-core/src/browse.rs` — 式と決定性の根拠(rustdoc)
 - `crates/sagasu-core/tests/browse_tests.rs` — 上記の性質を固定しているテスト
+- `crates/sagasu-ui` — §6 の API を呼び出す UI レイヤー(DTO と `browse_view`)
+- `ui/` — §6 の DTO を画面にする step 3 の静的ブラウズ画面(`ui/README.md`)

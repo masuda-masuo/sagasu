@@ -131,7 +131,7 @@ browse の行が「結果」ではなく「グループの中身のプレビュ�
 ## 4. `--json` — 機械可読出力
 
 **対象読者はシェルスクリプト・他ツール・エージェント。** M4 の Tauri UI は
-対象外で、従来どおり `sagasu-core` に直接リンクする(§8)。
+対象外で、`crates/sagasu-ui` を経由してコアに繋がる(§8)。
 
 ### 4-1. 形: 2 系統
 
@@ -496,10 +496,11 @@ PR #41 が `sagasu browse` に `--json` を入れなかった理由は
 「M4 はコアに直接リンクするので 2 本目の契約を作らない」だった。
 **この判断はそのまま維持する。**
 
-- **M4 Tauri UI は `sagasu-core` に直接リンクする**(design.md §3
-  「コアが Rust ならそのまま接続」)。`browse::browse(&Store, &BrowseQuery)
-  -> BrowseView` のような**コア API がそのまま M4 の内部インターフェース**で、
-  JSON を経由しない。ここは変わらない。
+- **M4 Tauri UI は `crates/sagasu-ui` を経由してコアに繋がる**(design.md §3
+  「コアが Rust ならそのまま接続」)。`crates/sagasu-ui` の
+  `browse_view(&Store, &BrowseQueryDto) -> BrowseViewDto` が M4 の内部
+  インターフェースで、JSON を経由しない。ここは変わらない。コアの型に
+  `Serialize` を生やさない不変条件も維持する。
 - **`--json` の読者は別**: シェルスクリプト、他ツール、エージェント。
   プロセス境界の向こう側にいて Rust でリンクできない相手のためのもの。
 - したがって `--json` は「コア API の JSON 版」ではなく「CLI 出力の機械可読版」。
