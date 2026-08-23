@@ -22,18 +22,33 @@ sagasu tags kind:image --db index.db  # そのタグを持つファイル
 | `ext:` | 拡張子(別名を畳む) | `ext:jpg`(`.jpeg` も同じ) |
 | `kind:` | 形式の粗い分類 | `kind:document` `kind:image` `kind:code` |
 | `path:` | ディレクトリ構成要素とその分割トークン | `path:invoices` `path:acme-corp` `path:acme` |
-| `date:` | 名前に含まれる日付パターン | `date:2024` `date:2024-03` |
+| `date:` | 名前に含まれる日付パターン、**および** EXIF / OOXML / PDF の作成日 | `date:2024` `date:2024-03` |
 | `version:` | ファイル名の版数マーカー | `version:v2` `version:final` `version:copy` |
 | `pattern:` | 命名規則 | `pattern:screenshot` `pattern:camera` `pattern:backup` |
 | `anomaly:` | 生成源どうしの矛盾 | `anomaly:format-mismatch` |
+| `author:` | ファイル内部の作成者情報(OOXML `dc:creator`/`cp:lastModifiedBy`、PDF `/Author`、EXIF `Artist`) | `author:山田 太郎` |
+| `title:` | ファイル内部のタイトル(OOXML `dc:title`、PDF `/Title`、EXIF `ImageDescription`) | `title:四半期レポート` |
+| `camera:` | 撮影カメラ(EXIF `Make` + `Model` を空白で連結) | `camera:nikon d750` |
 
-### format と magic バイト
+### format と magic バイト / 埋め込みメタデータ
+
+`sagasu tag` は既定で **2 種類の読み取り** を行う。
+
+1. **先頭 512 バイトの読み取り** (`format:` の素材)  
+   `files.magic` に格納される先頭バイト列を読む。`--no-read-magic` で無効化可能。  
+   この読み取りだけならファイル全体は読まないため `hash` より桁違いに速い。
+
+2. **埋め込みメタデータの読み取り** (`author:` / `title:` / `camera:`、および `date:` の一部)  
+   OOXML 文書プロパティ(`dc:creator`/`cp:lastModifiedBy`/`dc:title`/`dcterms:created`)、
+   PDF 情報辞書(`/Author`/`/Title`/`/CreationDate`)、
+   EXIF(`Artist`/`ImageDescription`/`Make`+`Model`/`DateTimeOriginal`) を解析する。  
+   `--no-read-embedded` で無効化可能。上限は `--embedded-max-size`(既定 64 MiB) で制御する。  
+   **ドキュメントが多いツリーで `tag` パスが遅くなるのはこちらの読み取りが原因** (CLI の `--no-read-embedded` ヘルプに明記)。
 
 `format:` はまず**中身の先頭バイト**から決まり、それが取れないときだけ拡張子から決まる。
 schema v0 の `files.magic`(先頭 512 バイト)がその入力で、この列は `sagasu hash`
 が埋める。ハッシュを走らせていない索引では `sagasu tag` が
-先頭 512 バイトだけを読んで同じ列を埋める(ファイル全体は読まないので `hash` より
-桁違いに速い)。
+先頭 512 バイトだけを読んで同じ列を埋める。
 
 **先頭バイトの読み出しは既定で有効**。`--no-read-magic` で切れるが、切ると
 `format:` は拡張子の言い値になる。既定にしたのは速度差が小さい(63,901ファイルで
@@ -71,7 +86,7 @@ Shift_JIS の `.txt` が「テキストとして sniff できない」のは
 「他では復元できない情報」の逆順:
 
 1. ユーザー定義ルールのタグ(人が書き下した知識。他のどこからも作れない)
-2. その他の非構造タグ(`date:` / `version:` / `pattern:` / `anomaly:`)
+2. その他の非構造タグ(`STRUCTURAL_NAMESPACES` 以外の全ての名前空間: `date:` / `version:` / `pattern:` / `anomaly:` / `author:` / `title:` / `camera:`)
 3. `format:` / `ext:` / `kind:`(1ファイル1個ずつなので枠を食わない)
 4. `path:`(深さに比例して増える唯一の軸で、かつ `sagasu find` で代替できる)
 
