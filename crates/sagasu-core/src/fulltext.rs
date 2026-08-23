@@ -58,7 +58,7 @@ use tantivy::schema::{
 };
 use tantivy::{doc, Index, IndexWriter, TantivyDocument};
 
-use crate::lattice::{self, LongTokenGuard, TokenStats, MAX_LATTICE_RUN_BYTES};
+use crate::lattice::{LongTokenGuard, TokenStats};
 use crate::store::{FileRow, Store};
 use crate::text::{self, ExtVerdict};
 
@@ -240,27 +240,13 @@ pub struct FulltextSummary {
     pub skipped_exts: Vec<(String, u64)>,
     /// Total decoded body bytes fed to the indexer.
     pub text_bytes: u64,
-    /// Documents whose body contained a delimiter-free run longer than
-    /// [`crate::lattice::MAX_LATTICE_RUN_BYTES`] and had `\n` breaks introduced
-    /// before tokenizing (issue #52).
-    ///
-    /// Not a skip and not a failure: these documents *are* indexed, and indexed
-    /// correctly — this is the count of bodies that would otherwise have lost
-    /// their tail. It is reported because the rewrite is the one place where
-    /// what is indexed differs from what is on disk, and a difference the user
-    /// cannot see is the kind this project does not ship.
-    pub lattice_split_docs: u64,
-    /// Total number of breaks introduced across those documents.
-    pub lattice_breaks: u64,
-    /// Up to [`MAX_REPORTED_EXTRACT_ERRORS`] `(path, breaks)` pairs naming the
-    /// documents that were split, in path order.
-    pub lattice_split_samples: Vec<(String, u32)>,
     /// Tokens dropped for exceeding tantivy's `MAX_TOKEN_LEN`.
     ///
-    /// **Expected to be zero.** The run bound above makes an over-long token
-    /// unreachable, so a non-zero count here is a report that the bound has
-    /// stopped holding — the failure of issue #52 happening again, this time
-    /// with a number attached instead of silently.
+    /// **Expected to be zero.** Lindera 5.3.0 bounds the sentence length
+    /// internally, so an over-long token is unreachable, and a non-zero count
+    /// here is a report that the bound has stopped holding — the failure of
+    /// issue #52 happening again, this time with a number attached instead of
+    /// silently.
     pub dropped_long_tokens: u64,
     /// Longest token the analyzer produced, in bytes. Reported alongside the
     /// drop count because "0 dropped" is only reassuring next to how close the
@@ -370,9 +356,6 @@ struct Counters {
     skipped: [AtomicU64; 6],
     skipped_exts: Mutex<BTreeMap<String, u64>>,
     extract_errors: Mutex<Vec<(String, String)>>,
-    lattice_split_docs: AtomicU64,
-    lattice_breaks: AtomicU64,
-    lattice_split_samples: Mutex<Vec<(String, u32)>>,
 }
 
 impl Counters {
@@ -386,18 +369,6 @@ impl Counters {
         self.skip(reason);
         let key = ext.unwrap_or_default().to_string();
         *self.skipped_exts.lock().unwrap().entry(key).or_insert(0) += 1;
-    }
-
-    /// Record a body that had to be broken up before tokenizing, keeping the
-    /// first few paths so the report can name them.
-    fn lattice_split(&self, path: &str, breaks: u32) {
-        self.lattice_split_docs.fetch_add(1, Ordering::Relaxed);
-        self.lattice_breaks
-            .fetch_add(u64::from(breaks), Ordering::Relaxed);
-        let mut samples = self.lattice_split_samples.lock().unwrap();
-        if samples.len() < MAX_REPORTED_EXTRACT_ERRORS {
-            samples.push((path.to_string(), breaks));
-        }
     }
 
     /// Record a document that could not be parsed: counted like any other skip
@@ -576,9 +547,6 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
     let mut extract_errors = counters.extract_errors.lock().unwrap().clone();
     extract_errors.sort();
 
-    let mut lattice_split_samples = counters.lattice_split_samples.lock().unwrap().clone();
-    lattice_split_samples.sort();
-
     Ok(FulltextSummary {
         candidates,
         indexed,
@@ -589,9 +557,6 @@ pub fn build(config: &FulltextConfig) -> Result<FulltextSummary> {
         skipped,
         skipped_exts,
         text_bytes: counters.text_bytes.load(Ordering::Relaxed),
-        lattice_split_docs: counters.lattice_split_docs.load(Ordering::Relaxed),
-        lattice_breaks: counters.lattice_breaks.load(Ordering::Relaxed),
-        lattice_split_samples,
         dropped_long_tokens: token_stats.dropped(),
         longest_token_bytes: token_stats.longest(),
         index_bytes,
@@ -684,25 +649,15 @@ fn extract_and_add(
         .text_bytes
         .fetch_add(body.len() as u64, Ordering::Relaxed);
 
-    // Bound the lattice before Lindera ever sees the body (issue #52). Almost
-    // every document already has a newline within 32 KiB and comes back
-    // untouched; the ones that do not are exactly the ones that would otherwise
-    // have their tail collapsed into one over-long token and dropped.
-    //
-    // The rewritten body is what gets *stored* as well as indexed. Keeping the
-    // two identical is deliberate: the stored body is the source of every
-    // snippet, and a snippet built from text that differs from what matched is
-    // a worse lie than a space rendered as a newline. The rewrite only ever
-    // turns a space into a newline, or — for text with no whitespace in a whole
-    // 32 KiB window — inserts one; `build_snippet` collapses whitespace runs
-    // anyway, so neither is visible in output.
-    let body = match lattice::bound_lattice_runs(&body, MAX_LATTICE_RUN_BYTES) {
-        Some((rewritten, breaks)) => {
-            counters.lattice_split(&row.path, breaks);
-            rewritten
-        }
-        None => body,
-    };
+    // `body` is indexed exactly as extracted: no rewriting happens between
+    // extraction and indexing. The stored body is the source of every snippet,
+    // and a snippet built from text that differs from what matched is a worse
+    // lie than none — so the indexed and stored text is byte-for-byte the
+    // extracted body. The production analyzer (LinderaTokenizer + LowerCaser +
+    // `LongTokenGuard`) keeps an unbounded delimiter-free run from reaching
+    // tantivy: lindera 5.3.0 bounds the sentence length internally, and the
+    // guard counts anything that still slips past, so a regression is reported
+    // rather than silent.
 
     writer
         .add_document(doc!(
