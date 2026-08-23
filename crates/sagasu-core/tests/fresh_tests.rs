@@ -1069,3 +1069,59 @@ fn a_literal_percent_in_a_query_is_not_a_wildcard() {
     let outcome = fresh::find(&find_config(&db, "%_"), None).unwrap();
     assert_eq!(names(&outcome), vec!["100%_done.txt".to_string()]);
 }
+
+// ── 7. Issue #78 tests ───────────────────────────────────────────────────────
+
+#[test]
+fn parallel_live_step_returns_same_hits_and_order_for_changed_files() {
+    let (d, db, ft) = tmp_dirs("parallel_live");
+    write_file(&d, "indexed1.md", "検索のテスト文書1\n");
+    write_file(&d, "indexed2.md", "検索のテスト文書2\n");
+    crawl(&d, &db);
+    build_ft(&db, &ft);
+    let marker_ns = recorded_marker_ns(&db);
+
+    let f1 = write_file(&d, "changed1.md", "検索の新しい文書A\n");
+    let f2 = write_file(&d, "changed2.md", "検索の新しい文書B\n");
+    let f3 = write_file(&d, "changed3.md", "検索の新しい文書C\n");
+    stamp_after_marker(&f1, marker_ns);
+    stamp_after_marker(&f2, marker_ns);
+    stamp_after_marker(&f3, marker_ns);
+
+    let outcome = fresh::search(&search_config(&db, &ft, "検索"), None).unwrap();
+    let n = names(&outcome);
+    assert_eq!(outcome.live_hits, 3);
+    assert_eq!(outcome.live_read, 3);
+    assert!(n.contains(&"changed1.md".to_string()));
+    assert!(n.contains(&"changed2.md".to_string()));
+    assert!(n.contains(&"changed3.md".to_string()));
+    assert_eq!(origin_of(&outcome, "changed1.md"), Some(HitOrigin::Live));
+    assert_eq!(origin_of(&outcome, "changed2.md"), Some(HitOrigin::Live));
+    assert_eq!(origin_of(&outcome, "changed3.md"), Some(HitOrigin::Live));
+}
+
+#[test]
+fn file_deleted_between_delta_scan_and_read_does_not_panic_and_is_skipped() {
+    let (d, db, ft) = tmp_dirs("delete_between_scan_and_read");
+    write_file(&d, "keep.md", "検索の対象文書\n");
+    crawl(&d, &db);
+    build_ft(&db, &ft);
+    let marker_ns = recorded_marker_ns(&db);
+
+    let temp_file = write_file(&d, "will_be_deleted.md", "検索の消える文書\n");
+    stamp_after_marker(&temp_file, marker_ns);
+
+    let cache = DeltaCache::new();
+    // Warm up cache so DeltaSet contains `will_be_deleted.md` with `exists == true`
+    let _ = fresh::search(&search_config(&db, &ft, "検索"), Some(&cache)).unwrap();
+
+    // Now delete the file before the second search reads it
+    fs::remove_file(&temp_file).unwrap();
+
+    // Perform search using the cached delta set
+    let outcome = fresh::search(&search_config(&db, &ft, "検索"), Some(&cache)).unwrap();
+    let n = names(&outcome);
+
+    assert!(!n.contains(&"will_be_deleted.md".to_string()));
+    assert!(n.contains(&"keep.md".to_string()));
+}

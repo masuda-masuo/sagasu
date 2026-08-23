@@ -129,6 +129,20 @@ pub(crate) fn warn_fresh(outcome: &FreshOutcome, report: &mut Report) {
     }
 }
 
+/// Whether the live step dominated the latency enough to warn the user about `--no-fresh`.
+///
+/// Threshold reasoning:
+/// The live step is considered to dominate the answer when it accounts for at least
+/// 50% of total search time (live_ms / total_ms >= 0.5) AND takes at least
+/// 100.0 ms wall-clock time (live_ms >= 100.0).
+/// The 100 ms absolute floor prevents warning users on fast sub-100ms queries where
+/// latency overhead is imperceptible, while the 50% ratio ensures the message only
+/// fires when live re-checking is the primary bottleneck.
+pub(crate) fn should_print_freshness_notice(outcome: &FreshOutcome) -> bool {
+    let t = &outcome.timing;
+    t.total_ms > 0.0 && t.live_ms >= 100.0 && (t.live_ms / t.total_ms) >= 0.5
+}
+
 /// Print the delta report, the hits, and — if the answer may be incomplete —
 /// the stale notice.
 pub(crate) fn print_fresh(outcome: &FreshOutcome) {
@@ -209,6 +223,13 @@ pub(crate) fn print_fresh(outcome: &FreshOutcome) {
         t.total_ms,
         t.setup_ms,
     );
+    if should_print_freshness_notice(outcome) {
+        let rechecked = outcome.live_read;
+        println!(
+            "freshness: re-checking {rechecked} changed file(s) took {:.1}ms — pass `--no-fresh` to skip the re-check at the cost of missing recent edits",
+            t.live_ms
+        );
+    }
     println!(
         "merged  : {} index candidates, {} dropped (changed), {} dropped (deleted)",
         outcome.index_candidates, outcome.dropped_changed, outcome.dropped_deleted,
@@ -522,5 +543,38 @@ mod tests {
         human.warn("zero files indexed");
         assert_eq!(human.warnings().len(), 1);
         assert!(!human.is_json());
+    }
+
+    #[test]
+    fn freshness_reporting_line_stays_silent_on_trivially_fast_search() {
+        let mut outcome = FreshOutcome {
+            hits: Vec::new(),
+            delta: None,
+            stale: None,
+            index_candidates: 0,
+            dropped_changed: 0,
+            dropped_deleted: 0,
+            live_hits: 0,
+            live_read: 5,
+            total_docs: 10,
+            text_policy: sagasu_core::text::TextPolicy::empty(),
+            text_policy_notice: None,
+            timing: sagasu_core::fresh::FreshTiming {
+                setup_ms: 1.0,
+                index_ms: 1.0,
+                delta_ms: 0.5,
+                live_ms: 3.0,
+                merge_ms: 0.5,
+                total_ms: 5.0,
+            },
+        };
+
+        // A 3ms live scan in a 5ms search stays silent
+        assert!(!should_print_freshness_notice(&outcome));
+
+        // When live step is large and dominates (e.g. 500ms in a 700ms search), notice is shown
+        outcome.timing.live_ms = 500.0;
+        outcome.timing.total_ms = 700.0;
+        assert!(should_print_freshness_notice(&outcome));
     }
 }
