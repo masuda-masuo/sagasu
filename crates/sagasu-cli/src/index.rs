@@ -41,6 +41,15 @@ pub struct IndexArgs {
     #[arg(long = "exclude")]
     exclude: Vec<String>,
 
+    /// Drop a single default-excluded directory basename (repeatable,
+    /// case-insensitive), re-indexing it while the rest of the defaults stay in
+    /// force. Unlike `--no-default-excludes`, which drops the whole list, this
+    /// is the surgical opt-out: `--no-exclude AppData` re-indexes a Windows
+    /// user's `AppData` without also re-indexing `node_modules`, `.git`, ….
+    /// Giving the same name to both `--exclude` and `--no-exclude` is an error.
+    #[arg(long = "no-exclude")]
+    no_exclude: Vec<String>,
+
     /// Absolute path prefix to prune from the crawl (repeatable). The walker
     /// does not descend into any path at or below the prefix — unlike
     /// `--exclude` (a directory *name*, filtered per file) this is a prune.
@@ -115,7 +124,7 @@ pub fn cmd_index(args: IndexArgs, mode: Output) -> Result<Outcome> {
     // Built once and used by both renderings. The human one prints it *before*
     // the walk so a wrong root can be interrupted; the machine one carries it
     // in the single object at the end, where the ordering buys nothing.
-    let excludes = scope(&config, &root, &args.exclude_prefix)?;
+    let excludes = scope(&config, &root, &args.exclude_prefix, &args.no_exclude)?;
     if !report.is_json() {
         print_scope(&root, &excludes);
     }
@@ -218,11 +227,17 @@ fn print_crawl_summary(summary: &sagasu_core::CrawlSummary) {
 /// costs a `.gitignore` read; the alternative is reporting the *arguments* and
 /// hoping they describe the same thing the core assembled. It also surfaces a
 /// broken `.gitignore` before the walk instead of after it.
-fn scope(config: &CrawlConfig, root: &Path, prefixes: &[String]) -> Result<ExcludeSet> {
+fn scope(
+    config: &CrawlConfig,
+    root: &Path,
+    prefixes: &[String],
+    no_exclude: &[String],
+) -> Result<ExcludeSet> {
     let excludes = ExcludeSet::new(&config.exclude, config.no_default_excludes)
         .with_hidden(config.hidden)
         .with_gitignore(root, config.use_gitignore)?
-        .with_prefixes(prefixes);
+        .with_prefixes(prefixes)
+        .with_no_excludes(no_exclude)?;
     excludes.validate()?;
 
     // A prune rule about a place that is not there prunes nothing. That is not

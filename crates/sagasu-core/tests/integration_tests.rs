@@ -535,6 +535,95 @@ fn no_default_excludes_indexes_node_modules() {
     assert!(summary.skipped.is_empty());
 }
 
+// 13a. --no-default-excludes keeps a user's own --exclude (issue #75 rework 1).
+// With `--no-default-excludes --exclude <dir>`, files under the default-named
+// `node_modules` are indexed again, but files under the user-named directory
+// are still excluded.
+
+#[test]
+fn no_default_excludes_keeps_user_exclude() {
+    let (d, db) = tmp_dir("no_default_user_excl");
+    write_file(&d, "node_modules/pkg/index.js", "js");
+    write_file(&d, "src/main.rs", "rust");
+    write_file(&d, "build/output.o", "obj");
+
+    let summary = crawl_exclude(&d, &db, vec!["build".to_string()], true);
+    // node_modules is re-included (no defaults), build is still excluded.
+    assert_eq!(
+        summary.indexed, 2,
+        "node_modules and src indexed, build excluded"
+    );
+    let skips: HashMap<_, _> = summary.skipped;
+    assert!(
+        skips.contains_key("build"),
+        "build must still be excluded under --no-default-excludes"
+    );
+    assert!(
+        !skips.contains_key("node_modules"),
+        "node_modules must be re-indexed under --no-default-excludes"
+    );
+}
+
+// 13b. --no-exclude drops one default but keeps the rest (issue #75)
+
+#[test]
+fn no_exclude_drops_one_default_but_keeps_others() {
+    let (d, db) = tmp_dir("no_excl_one");
+    write_file(&d, "node_modules/pkg/index.js", "js");
+    write_file(&d, "target/debug/x", "x");
+    write_file(&d, "src/main.rs", "rust");
+    let root = d.canonicalize().unwrap();
+    let excludes = walk::ExcludeSet::new(&[], false)
+        .with_no_excludes(&["node_modules".to_string()])
+        .unwrap();
+    let summary = walk::crawl_with_excludes(
+        CrawlConfig {
+            root: root.clone(),
+            db_path: db_path(&db),
+            exclude: vec![],
+            no_default_excludes: false,
+            hidden: Default::default(),
+            use_gitignore: false,
+            threads: 1,
+        },
+        root.clone(),
+        excludes,
+    )
+    .unwrap();
+    assert_eq!(summary.indexed, 2, "node_modules + src, target skipped");
+    let skips: HashMap<_, _> = summary.skipped;
+    assert!(
+        !skips.contains_key("node_modules"),
+        "node_modules must be re-included"
+    );
+    assert_eq!(
+        skips.get("target").copied().unwrap_or(0),
+        1,
+        "target must stay excluded"
+    );
+}
+
+// 13c. The Windows AppData default is excluded and counted under its own name.
+
+#[cfg(windows)]
+#[test]
+fn appdata_is_excluded_and_counted_in_skips_on_windows() {
+    let (d, db) = tmp_dir("appdata_def");
+    write_file(&d, "AppData/Local/Packages/x/app.json", "{}");
+    write_file(&d, "Documents/real.txt", "real");
+    let summary = crawl(&d, &db);
+    assert_eq!(
+        summary.indexed, 1,
+        "only Documents/real.txt should be indexed"
+    );
+    let skips: HashMap<_, _> = summary.skipped;
+    assert_eq!(
+        skips.get("appdata").copied().unwrap_or(0),
+        1,
+        "AppData must be counted under its own (lowercased) name"
+    );
+}
+
 // ── 14. Re-index with no changes reports 0 added/changed/renamed/deleted ──
 
 #[test]
@@ -1392,10 +1481,14 @@ fn a_prefix_exclusion_prunes_and_is_replayed_by_the_delta_side() {
     // The walker did not descend: the whole subtree is one skip, attributed to
     // the prefix rule and to no other counter.
     assert_eq!(summary.skipped_prefix, 1);
-    assert!(summary.skipped.is_empty(), "no name rule fired: {:?}", summary.skipped);
+    assert!(
+        summary.skipped.is_empty(),
+        "no name rule fired: {:?}",
+        summary.skipped
+    );
     assert_eq!(summary.indexed, 3); // a.txt, deep/proc/status, sys/kernel/osrelease
-    // The pruned directory itself is the fourth scanned entry — the walker was
-    // handed it, and counting it is what keeps the identity below true.
+                                    // The pruned directory itself is the fourth scanned entry — the walker was
+                                    // handed it, and counting it is what keeps the identity below true.
     assert_eq!(summary.scanned, 4);
     assert_eq!(summary.errors, 0);
     assert_eq!(
@@ -1470,7 +1563,10 @@ fn a_prefix_exclusion_prunes_and_is_replayed_by_the_delta_side() {
         let p = write_file(&d, rel, "created after the crawl");
         filetime::set_file_mtime(
             &p,
-            filetime::FileTime::from_unix_time(stamp.div_euclid(1_000_000_000), stamp.rem_euclid(1_000_000_000) as u32),
+            filetime::FileTime::from_unix_time(
+                stamp.div_euclid(1_000_000_000),
+                stamp.rem_euclid(1_000_000_000) as u32,
+            ),
         )
         .unwrap();
     }
@@ -1484,9 +1580,9 @@ fn a_prefix_exclusion_prunes_and_is_replayed_by_the_delta_side() {
         "the sibling change must be seen: {paths:?}"
     );
     assert!(
-        !paths.iter().any(|p| Path::new(p)
-            .components()
-            .any(|c| c.as_os_str() == "proc")),
+        !paths
+            .iter()
+            .any(|p| Path::new(p).components().any(|c| c.as_os_str() == "proc")),
         "the pruned subtree must stay out of the delta set: {paths:?}"
     );
 }
