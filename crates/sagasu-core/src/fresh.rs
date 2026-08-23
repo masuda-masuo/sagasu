@@ -56,6 +56,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 
 use crate::delta::{self, DeltaCache, DeltaSet, DeltaSourceKind, DeltaStatus, RescanReason};
 use crate::fulltext::{self, SearchConfig};
@@ -439,30 +440,47 @@ pub fn search(config: &FreshConfig, cache: Option<&DeltaCache>) -> Result<FreshO
     // ── Live grep of the delta set ──────────────────────────────────────────
     let t_live = Instant::now();
     let snippet_terms = fulltext::body_query_terms(&indexed.terms);
-    let mut live_read = 0usize;
-    let mut live: Vec<FreshHit> = Vec::new();
-    for entry in ctx.entries() {
-        if !entry.exists {
-            continue;
-        }
-        let Some(body) = read_body(&entry.path, entry.size, config.max_size, &text_policy) else {
-            continue;
-        };
-        live_read += 1;
-        let score = indexed.terms.score(&body);
-        if score == 0 {
-            continue;
-        }
-        live.push(FreshHit {
-            origin: HitOrigin::Live,
-            file_id: None,
-            path: entry.path.clone(),
-            score: score as f32,
-            size: Some(entry.size),
-            mtime_ns: Some(entry.mtime_ns),
-            snippet: fulltext::build_snippet(&body, &snippet_terms, config.snippet_chars),
-        });
-    }
+    let (live_read, mut live): (usize, Vec<FreshHit>) = ctx
+        .entries()
+        .par_iter()
+        .filter_map(|entry| {
+            if !entry.exists {
+                return None;
+            }
+            let body = read_body(&entry.path, entry.size, config.max_size, &text_policy)?;
+            let score = indexed.terms.score(&body);
+            let hit = if score > 0 {
+                Some(FreshHit {
+                    origin: HitOrigin::Live,
+                    file_id: None,
+                    path: entry.path.clone(),
+                    score: score as f32,
+                    size: Some(entry.size),
+                    mtime_ns: Some(entry.mtime_ns),
+                    snippet: fulltext::build_snippet(&body, &snippet_terms, config.snippet_chars),
+                })
+            } else {
+                None
+            };
+            Some((1usize, hit))
+        })
+        .fold(
+            || (0usize, Vec::new()),
+            |(mut read_acc, mut hits_acc), (read_cnt, hit_opt)| {
+                read_acc += read_cnt;
+                if let Some(h) = hit_opt {
+                    hits_acc.push(h);
+                }
+                (read_acc, hits_acc)
+            },
+        )
+        .reduce(
+            || (0usize, Vec::new()),
+            |(read1, mut hits1), (read2, hits2)| {
+                hits1.extend(hits2);
+                (read1 + read2, hits1)
+            },
+        );
     timing.live_ms = ms(t_live);
 
     // ── Merge ───────────────────────────────────────────────────────────────
