@@ -79,9 +79,16 @@ pub struct IndexArgs {
     /// Number of walker threads (0 = auto).
     #[arg(long, default_value_t = 0)]
     threads: usize,
+
+    /// Take over the writer marker left by a crash or by another writing
+    /// command. Without this, a second `index`/`hash`/`fulltext`/`tag` against
+    /// the same database is refused immediately.
+    #[arg(long)]
+    force: bool,
 }
 
 pub fn cmd_index(args: IndexArgs, mode: Output) -> Result<Outcome> {
+    let _writer = sagasu_core::WriterGuard::acquire(&args.db, "index", args.force)?;
     let mut report = Report::new(mode);
     let root = args
         .root
@@ -312,9 +319,16 @@ pub struct HashArgs {
     /// Skip files larger than this (bytes). Default 4 MiB.
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     max_size: u64,
+
+    /// Take over the writer marker left by a crash or by another writing
+    /// command. Without this, a second `index`/`hash`/`fulltext`/`tag` against
+    /// the same database is refused immediately.
+    #[arg(long)]
+    force: bool,
 }
 
 pub fn cmd_hash(args: HashArgs, mode: Output) -> Result<Outcome> {
+    let _writer = sagasu_core::WriterGuard::acquire(&args.db, "hash", args.force)?;
     let report = Report::new(mode);
     let summary = sagasu_core::walk::hash_backfill(&args.db, args.max_size)?;
 
@@ -372,6 +386,12 @@ pub struct FulltextArgs {
     /// tantivy writer memory budget in MiB.
     #[arg(long, default_value_t = (fulltext::DEFAULT_HEAP_BYTES / (1024 * 1024)) as u64)]
     heap_mb: u64,
+
+    /// Take over the writer marker left by a crash or by another writing
+    /// command. Without this, a second `index`/`hash`/`fulltext`/`tag` against
+    /// the same database is refused immediately.
+    #[arg(long)]
+    force: bool,
 }
 
 /// Refuse a flag that issue #6 removed, by name, with the replacement.
@@ -404,6 +424,7 @@ pub(crate) fn load_config(explicit: Option<&Path>, exts: &[String]) -> Result<Co
 
 pub fn cmd_fulltext(args: FulltextArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
+    let _writer = sagasu_core::WriterGuard::acquire(&args.db, "fulltext", args.force)?;
     reject_removed_config_flag("--text-config", args.text_config.as_deref())?;
     let loaded = load_config(args.config.as_deref(), &args.ext)?;
     let origin = loaded.origin().clone();

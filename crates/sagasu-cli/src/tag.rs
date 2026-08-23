@@ -77,11 +77,18 @@ pub struct TagArgs {
     /// than this (bytes).
     #[arg(long, default_value_t = tagindex::DEFAULT_EMBEDDED_MAX_SIZE)]
     embedded_max_size: u64,
+
+    /// Take over the writer marker left by a crash or by another writing
+    /// command. Without this, a second `index`/`hash`/`fulltext`/`tag` against
+    /// the same database is refused immediately.
+    #[arg(long)]
+    force: bool,
 }
 
 /// Run `sagasu tag`.
 pub fn cmd_tag(args: TagArgs, mode: Output) -> Result<Outcome> {
     let mut report = Report::new(mode);
+    let _writer = sagasu_core::WriterGuard::acquire(&args.db, "tag", args.force)?;
     reject_removed_config_flag("--rules", args.rules.as_deref())?;
 
     // Resolved here rather than inside the build so the report can name the

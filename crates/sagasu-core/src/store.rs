@@ -12,12 +12,35 @@
 //!   §6). They join on `file_id`, so a rename does not disturb them.
 
 use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 /// Number of magic bytes (start of file content) stored for file-type detection.
 pub const MAGIC_LEN: usize = 512;
+
+/// SQLite busy timeout applied to every connection, in milliseconds.
+///
+/// With the writer guard in place two writers can no longer overlap at all, so
+/// the only remaining contention is reader-versus-writer, and under WAL that is
+/// brief by construction. Five seconds is therefore a ceiling that should never
+/// actually be reached — and keeping it low matters, because the alternative to
+/// failing is a `find` that sits there silently.
+///
+/// Must be set **before** the `journal_mode` pragma: that pragma takes a brief
+/// exclusive lock, so it is itself one of the calls that can fail with
+/// `SQLITE_BUSY`.
+pub const BUSY_TIMEOUT_MS: u32 = 5_000;
+
+/// `meta` key that records which writing command currently owns the database.
+///
+/// `index`, `hash`, `fulltext` and `tag` set this at startup and clear it on
+/// Drop (success and error). Reading commands never consult it. A crash or
+/// Ctrl-C leaves it behind; `--force` is the recovery path. There is no
+/// pid-liveness check and no time-based expiry — a 32-minute `tag` run is not
+/// "stale".
+pub const WRITER_LOCK_KEY: &str = "writer_lock";
 
 // ── Schema ──────────────────────────────────────────────────────────────────
 
@@ -199,6 +222,9 @@ impl Store {
         let conn = Connection::open(path.as_ref())
             .with_context(|| format!("failed to open database {:?}", path.as_ref()))?;
 
+        // Before journal_mode: that pragma takes a brief exclusive lock, so it
+        // is itself one of the calls that can fail with SQLITE_BUSY.
+        conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS as u64))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // Enable foreign keys for access_history references.
@@ -273,6 +299,18 @@ impl Store {
         self.conn
             .execute("DELETE FROM meta WHERE key = ?1", params![key])?;
         Ok(())
+    }
+
+    /// The writer currently recorded in `meta`, if any.
+    ///
+    /// Reading commands must not call this. It exists so a writing command can
+    /// name the occupant, and so tests can observe the marker without parsing
+    /// the encoded form themselves.
+    pub fn writer_lock(&self) -> Result<Option<WriterLock>> {
+        Ok(self
+            .meta_get(WRITER_LOCK_KEY)?
+            .as_deref()
+            .and_then(WriterLock::decode))
     }
 
     /// Ensure the schema version is set (only writes if missing).
@@ -713,6 +751,157 @@ impl Store {
     }
 }
 
+// ── Writer guard (issue #77) ──────────────────────────────────────────
+
+/// Occupant recorded in [`WRITER_LOCK_KEY`] while a writing command runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterLock {
+    pub command: String,
+    pub pid: u32,
+    pub started: String,
+}
+
+impl WriterLock {
+    fn now(command: &str) -> Self {
+        Self {
+            command: command.to_string(),
+            pid: std::process::id(),
+            started: format_rfc3339(unix_secs()),
+        }
+    }
+
+    fn encode(&self) -> String {
+        format!("{}\t{}\t{}", self.command, self.pid, self.started)
+    }
+
+    fn decode(raw: &str) -> Option<Self> {
+        let mut parts = raw.splitn(3, '\t');
+        let command = parts.next()?.to_string();
+        let pid = parts.next()?.parse().ok()?;
+        let started = parts.next()?.to_string();
+        if command.is_empty() || started.is_empty() {
+            return None;
+        }
+        Some(Self {
+            command,
+            pid,
+            started,
+        })
+    }
+}
+
+/// Exclusive claim on a database for one writing command (`index` / `hash` /
+/// `fulltext` / `tag`).
+///
+/// Acquire at startup; `Drop` releases the marker on both the success and the
+/// error path. Destructors do not run on an unhandled signal, so a crash or
+/// Ctrl-C leaves the marker behind — `--force` is the documented recovery, not
+/// a pid-liveness check or a time-based expiry.
+#[must_use]
+pub struct WriterGuard {
+    store: Store,
+    encoded: String,
+}
+
+impl WriterGuard {
+    /// Record `command` as the writer of the database at `path`.
+    ///
+    /// If a marker is already set and `force` is false, returns an error that
+    /// names the recorded command, pid and start time and tells the user to
+    /// wait or pass `--force`. `force` overwrites the marker regardless.
+    pub fn acquire(path: impl AsRef<Path>, command: &str, force: bool) -> Result<Self> {
+        let mut store = Store::open(path)?;
+        let tx = store
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![WRITER_LOCK_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = existing {
+            if !force {
+                // Dropping `tx` rolls it back; nothing was written.
+                drop(tx);
+                bail!("{}", writer_busy_message(&raw));
+            }
+        }
+        let lock = WriterLock::now(command);
+        let encoded = lock.encode();
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![WRITER_LOCK_KEY, encoded],
+        )?;
+        tx.commit()?;
+        Ok(Self { store, encoded })
+    }
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        // Only clear the marker we ourselves wrote. A later `--force` takeover
+        // overwrites it; dropping the original guard must not erase the new one.
+        match self.store.meta_get(WRITER_LOCK_KEY) {
+            Ok(Some(current)) if current == self.encoded => {
+                let _ = self.store.meta_delete(WRITER_LOCK_KEY);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn writer_busy_message(raw: &str) -> String {
+    if let Some(lock) = WriterLock::decode(raw) {
+        format!(
+            "database is already being written by `{}` (pid {}, started {}). \
+             Wait for that command to finish, or pass --force to take over. \
+             A crash or Ctrl-C leaves this marker behind.",
+            lock.command, lock.pid, lock.started
+        )
+    } else {
+        format!(
+            "database is already being written ({raw}). \
+             Wait for that command to finish, or pass --force to take over. \
+             A crash or Ctrl-C leaves this marker behind."
+        )
+    }
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn format_rfc3339(secs: u64) -> String {
+    let (y, m, d, hh, mm, ss) = unix_to_utc(secs);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Unix seconds → UTC civil time. Howard Hinnant's `civil_from_days`.
+fn unix_to_utc(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let tod = (secs % 86_400) as u32;
+    let hour = tod / 3_600;
+    let min = (tod % 3_600) / 60;
+    let sec = tod % 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i32 + era as i32 * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (y, m as u32, d as u32, hour, min, sec)
+}
+
 // ── In-flight entry (what the walker produces) ─────────────────────────────
 
 /// A file record produced by the walker thread and consumed by the indexer.
@@ -782,4 +971,15 @@ pub(crate) fn row_to_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileR
         last_seen_scan: row.get(9)?,
         deleted_at: row.get(10)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_rfc3339;
+
+    #[test]
+    fn unix_epoch_formats_as_rfc3339_utc() {
+        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339(1_000_000_000), "2001-09-09T01:46:40Z");
+    }
 }

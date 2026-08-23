@@ -54,7 +54,7 @@ pub use delta::{DeltaCache, DeltaSet, DeltaSource, DeltaStatus, ScanMarker};
 pub use docmeta::{BodyFormat, EmbeddedMeta, MetaFormat};
 pub use fresh::{FindMatchLabel, FindRank, FreshConfig, FreshHit, FreshOutcome};
 pub use fulltext::{FulltextConfig, FulltextSummary, SearchConfig, SearchHit, SearchOutcome};
-pub use store::Store;
+pub use store::{Store, WriterGuard};
 pub use tagindex::{TagConfig, TagSummary};
 pub use tagrules::RuleSet;
 pub use tags::{Tag, TagSet, TagSource};
