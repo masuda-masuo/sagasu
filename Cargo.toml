@@ -32,7 +32,7 @@ serde_json = "1"
 # Plain `deflate-flate2` is not enough: it pulls flate2 with no backend
 # selected, which only builds by accident when another dependency happens to
 # choose one (it does not, in the `--no-default-features` build).
-zip = { version = "8", default-features = false, features = [
+zip = { version = "9", default-features = false, features = [
     "deflate-flate2-zlib-rs",
 ] }
 quick-xml = "0.41"
